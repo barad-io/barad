@@ -12,7 +12,8 @@ The script picks the binary for your computer from the same release, checks it a
 Every release is built from its tag by [`release.yml`](.github/workflows/release.yml) and carries a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations). To check a binary yourself:
 
 ```sh
-gh attestation verify "$(command -v barad)" --repo barad-io/barad
+gh attestation verify "$(command -v barad)" --repo barad-io/barad \
+  --signer-workflow barad-io/barad/.github/workflows/release.yml
 ```
 
 ## Using it

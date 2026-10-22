@@ -57,7 +57,8 @@ main() {
 	say "Checksum matches"
 
 	if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-		gh attestation verify "$tmp/$name" --repo "$REPO" >/dev/null ||
+		gh attestation verify "$tmp/$name" --repo "$REPO" \
+			--signer-workflow "$REPO/.github/workflows/release.yml" >/dev/null ||
 			fail "$name has no valid provenance attestation from $REPO"
 		say "Provenance verified: built by $REPO's release workflow"
 	else
