@@ -17,6 +17,7 @@ var (
 	BorderSubtle, BorderDefault                                           color.Color
 	Text, TextSec, TextMuted, TextFaint                                   color.Color
 	Accent, AccentText, AccentSurface, OnAccent                           color.Color
+	Selection                                                             color.Color // text you drag over
 	Agent, AgentSurface, Success, SuccessSurf, Danger, DangerSurf, Violet color.Color
 
 	// Code, tuned to each theme's code well.
@@ -47,6 +48,7 @@ func applyTheme(name string) {
 		CodeKeyword, CodeString, CodeNumber, CodeType, CodeComment, CodePunct = c("#27639c"), c("#267147"), c("#7a5000"), c("#1f6f68"), c("#66625a"), c("#565b62")
 		MarkClaude, MarkChatGPT, MarkGrok = c("#c4623f"), c("#121921"), c("#353e49")
 		SCursor = lipgloss.NewStyle().Foreground(c("#fffdf9")).Background(Accent)
+		Selection = c("#c9dcef")
 	default: // night
 		Rail, Subtle, Canvas, Document, Raised, Muted = c("#05080e"), c("#0b1016"), c("#11161d"), c("#182029"), c("#222b36"), c("#2c3643")
 		BorderSubtle, BorderDefault = c("#272e38"), c("#353e49")
@@ -56,6 +58,7 @@ func applyTheme(name string) {
 		CodeKeyword, CodeString, CodeNumber, CodeType, CodeComment, CodePunct = c("#88bfe6"), c("#8bcca1"), c("#e0b25c"), c("#7cc7bb"), c("#8691a0"), c("#a3a9b0")
 		MarkClaude, MarkChatGPT, MarkGrok = c("#d97757"), c("#e9e4da"), c("#cac7c0")
 		SCursor = lipgloss.NewStyle().Foreground(Canvas).Background(Accent)
+		Selection = c("#2f4b68")
 	}
 	SText, SSec, SMuted, SFaint = Fg(Text), Fg(TextSec), Fg(TextMuted), Fg(TextFaint)
 	SAccent, SAgent, SOk, SDanger = Fg(Accent), Fg(Agent), Fg(Success), Fg(Danger)

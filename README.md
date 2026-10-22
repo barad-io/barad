@@ -28,15 +28,18 @@ barad version
 Signing in never asks for your password. `barad login` shows a code such as `BCDF-GHJK` and opens Barad in your browser, where you are already signed in. Check that the page shows the same code and your computer's name, then approve it. barad gets a session of its own, which `barad logout` revokes. On a computer without a browser, open the link it prints anywhere you are signed in to Barad.
 
 - **Home**: your project's sessions, grouped by what they need from you: a reply you have not read or a failure, then what is running, then the rest.
-- **A session**: your messages on the right, the agent's replies on the left. Its work folds into one row when a run ends; **Tab** shows the steps, then their full output. Replies stream in as the agent writes them.
-- **One menu** (`?`, or Ctrl+P) for everything else: stop the agent, approve or dismiss a proposed session, model, reasoning effort, images, a read-only share link, rename, theme and archive.
+- **A session**: your messages on the right, the agent's replies on the left, each turn ending with when it finished and how long it took. Its work folds into one row when a run ends; **Tab** shows the steps, then their full output. Replies stream in as the agent writes them.
+- **The message box**: Shift+Enter starts a new line; the arrow keys move through what you have written, Home and End to the line's ends.
+- **Select and copy**: drag across any text to copy it; the copy leaves out the app's frames and indent. A click on a link opens it in your browser.
+- **The footer** says how many sessions need you and how many are working, and briefly when one finishes.
+- **One menu** (`?`, or Ctrl+P) for everything else: stop the agent, approve or dismiss a proposed session, model, reasoning effort, images, copy the last reply, a read-only share link, rename, theme and archive.
 - **New session** (`n`) starts from your project's agent, repository and effort.
 - **Images**: screenshots the agent took and images you attached. Attach one by dropping the file on the terminal or with Ctrl+V. Text pasted past 64 KB goes as a text attachment.
 - **Usage**: tokens, workspace time and spend over 30 days.
 
 The footer always lists the keys that work on the current screen.
 
-Pictures use the kitty graphics protocol where the terminal supports it (kitty, Ghostty, rex) and truecolor half blocks elsewhere. Two themes, night and paper, set the terminal's colours while barad runs, so it looks the same whatever your terminal theme is.
+Pictures use the kitty graphics protocol where the terminal draws its Unicode placeholders (kitty, Ghostty) and truecolor half blocks elsewhere, Rex included. `BARAD_GRAPHICS=kitty` or `blocks` overrides the choice. Two themes, night and paper, set the terminal's colours while barad runs, so it looks the same whatever your terminal theme is.
 
 ## Files and settings
 

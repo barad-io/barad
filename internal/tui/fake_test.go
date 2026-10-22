@@ -124,7 +124,7 @@ func (f *fakeAPI) seed() {
 	search := base("ses_search", "Profile the search API", "xai", "grok-4", "", wire.MachineStatusDehydrated, ago(72*time.Hour))
 	search.user("Why is /search slow for long queries?", ago(70*time.Hour), nil)
 	t = search.turn("turn_x1", ago(70*time.Hour))
-	search.reply(t, "Long queries skip the prefix index. A trigram index on `title` brings p95 from 840 ms to 95 ms.", ago(70*time.Hour))
+	search.reply(t, "Long queries skip the prefix index. A trigram index on `title` brings p95 from 840 ms to 95 ms ([pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)).", ago(70*time.Hour))
 	search.finish(t, wire.TurnStatusCompleted, nil, ago(70*time.Hour))
 
 	cron := base("ses_cron", "Move the billing cron to the queue", "claude", "claude-opus-5", "high", wire.MachineStatusHydrated, ago(20*time.Minute))

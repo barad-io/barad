@@ -26,7 +26,7 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 			return nil
 		case "up", "down":
 		default:
-			a.filter.Key(k)
+			a.filter.Key(k, 0)
 			if o := a.order(); len(o) > 0 {
 				a.sel = o[0].SessionID
 			}
@@ -129,7 +129,7 @@ func (a *app) homeView() ([]string, string) {
 
 	order := a.order()
 	if a.filter != nil {
-		field := append(Line{S("/ ", SAccent.Bold(true))}, a.filter.Lines(w-24, SText, "search sessions", true)[0]...)
+		field := append(Line{S("/ ", SAccent.Bold(true))}, a.filter.Lines(w-24, 1, SText, "search sessions", true)[0]...)
 		head = append(head, block([]Line{spread(field, Line{S(fmt.Sprintf("%d found", len(order)), SMuted)}, w-4)}, Raised, margin, w, 2)...)
 		head = append(head, blank())
 	}

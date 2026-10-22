@@ -21,6 +21,28 @@ func (a *app) View() tea.View {
 		v.AltScreen, v.BackgroundColor, v.ForegroundColor = true, Canvas, Text
 		return v
 	}
+	content := a.compose()
+	if a.span != nil {
+		content = a.highlight(content)
+	}
+	v := tea.NewView(content)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	v.BackgroundColor, v.ForegroundColor = Canvas, Text
+	v.WindowTitle = "Barad"
+	if a.conv != nil && a.screen != screenHome && a.screen != screenUsage {
+		v.WindowTitle = sessionName(a.conv.session) + " — Barad"
+	}
+	v.ProgramStatus = &tea.ProgramStatus{App: "barad", Title: "Barad", State: "idle"}
+	if n := a.countAll(groupRunning); n > 0 {
+		v.ProgramStatus.State = "working"
+		v.ProgramStatus.Message = fmt.Sprintf("%d working", n)
+	}
+	return v
+}
+
+// compose draws the screen: the current one, its footer, and a sheet over it.
+func (a *app) compose() string {
 	var body []string
 	var foot string
 	switch {
@@ -58,20 +80,7 @@ func (a *app) View() tea.View {
 		layers = []*lipgloss.Layer{lipgloss.NewLayer(ghost(screen) + "\n" + foot),
 			lipgloss.NewLayer(card).X((a.w - lipgloss.Width(card)) / 2).Y(max(1, a.h/6)).Z(2)}
 	}
-	v := tea.NewView(lipgloss.NewCompositor(layers...).Render())
-	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion
-	v.BackgroundColor, v.ForegroundColor = Canvas, Text
-	v.WindowTitle = "Barad"
-	if a.conv != nil && a.screen != screenHome && a.screen != screenUsage {
-		v.WindowTitle = sessionName(a.conv.session) + " — Barad"
-	}
-	v.ProgramStatus = &tea.ProgramStatus{App: "barad", Title: "Barad", State: "idle"}
-	if n := a.count(groupRunning); n > 0 {
-		v.ProgramStatus.State = "working"
-		v.ProgramStatus.Message = fmt.Sprintf("%d working", n)
-	}
-	return v
+	return lipgloss.NewCompositor(layers...).Render()
 }
 
 // ghost turns the screen behind a sheet into a faint outline of its text:

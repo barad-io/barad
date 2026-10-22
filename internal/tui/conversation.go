@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -33,7 +34,15 @@ type conversation struct {
 	syncing, resync   bool
 	liveTurn, liveSID string // the provider stream being shown
 	liveText          string
+
+	// The exchanges, derived from the fields above once per change: every
+	// frame reads them. Whatever changes those fields calls changed.
+	exs     []exchange
+	derived bool
 }
+
+// changed drops what was derived from the conversation.
+func (c *conversation) changed() { c.derived = false }
 
 func newConversation(s wire.Session) *conversation {
 	return &conversation{id: s.SessionID, session: s, turns: map[string]wire.Turn{}, proposals: map[int64]wire.SessionProposalView{}}
@@ -99,6 +108,7 @@ func (c *conversation) applySync(d *api.Sync) bool {
 	if c.session.CurrentTurnID == "" || committed || c.liveTurn != c.session.CurrentTurnID {
 		c.liveTurn, c.liveSID, c.liveText = "", "", ""
 	}
+	c.changed()
 	return d.TranscriptHasMore || d.EventHasMore
 }
 
@@ -178,6 +188,12 @@ func (c *conversation) applyEvents(events []wire.Event) {
 type exchange struct {
 	user  *userMessage // nil when the page starts mid-exchange
 	parts []part
+	pics  []picRef // the images it shows
+	// sum fingerprints everything the exchange shows, so its layout can be
+	// kept while it is unchanged; moving is true while it shows a spinner
+	// or a clock that runs, and must be drawn every frame.
+	sum    uint64
+	moving bool
 }
 
 type userMessage struct {
@@ -195,7 +211,7 @@ const (
 	partCompaction
 	partProposal
 	partFailure
-	partCancelled
+	partEnd // how a turn ended, and when
 )
 
 type part struct {
@@ -203,7 +219,7 @@ type part struct {
 	turnID  string
 	steps   []*step              // a run
 	text    string               // text, or a compaction's note
-	turn    *wire.Turn           // a failure
+	turn    *wire.Turn           // a failure, an end
 	call    *wire.TranscriptItem // a proposal's call
 	result  *wire.TranscriptItem // a proposal's result
 	live    bool                 // text the agent is still writing
@@ -219,8 +235,16 @@ type step struct {
 	think  string
 }
 
-// exchanges derives the conversation's exchanges from its items.
+// exchanges is the conversation's exchanges, derived once per change.
 func (c *conversation) exchanges() []exchange {
+	if !c.derived {
+		c.exs, c.derived = c.derive(), true
+	}
+	return c.exs
+}
+
+// derive works the exchanges out from the items.
+func (c *conversation) derive() []exchange {
 	var out []exchange
 	current := func() *exchange {
 		if len(out) == 0 {
@@ -321,8 +345,14 @@ func (c *conversation) exchanges() []exchange {
 		}
 	}
 
-	// How each turn ended: a failure after its work, a cancellation noted.
-	for id, t := range c.turns {
+	// How each turn ended, after its work: a failure's reason, then when.
+	ended := make([]string, 0, len(c.turns))
+	for id := range c.turns {
+		ended = append(ended, id)
+	}
+	sort.Slice(ended, func(i, j int) bool { return c.turns[ended[i]].CreatedAt.Before(c.turns[ended[j]].CreatedAt) })
+	for _, id := range ended {
+		t := c.turns[id]
 		idx, ok := lastOfTurn[id]
 		if !ok {
 			if id != c.session.LatestTerminalTurnID || len(out) == 0 {
@@ -330,12 +360,11 @@ func (c *conversation) exchanges() []exchange {
 			}
 			idx = len(out) - 1
 		}
-		t := t
 		switch t.Status {
 		case wire.TurnStatusFailed:
-			out[idx].parts = append(out[idx].parts, part{kind: partFailure, turnID: id, turn: &t})
-		case wire.TurnStatusCancelled:
-			out[idx].parts = append(out[idx].parts, part{kind: partCancelled, turnID: id, turn: &t})
+			out[idx].parts = append(out[idx].parts, part{kind: partFailure, turnID: id, turn: &t}, part{kind: partEnd, turnID: id, turn: &t})
+		case wire.TurnStatusCompleted, wire.TurnStatusCancelled:
+			out[idx].parts = append(out[idx].parts, part{kind: partEnd, turnID: id, turn: &t})
 		}
 	}
 
@@ -364,7 +393,57 @@ func (c *conversation) exchanges() []exchange {
 	for _, p := range c.sending {
 		out = append(out, exchange{user: &userMessage{text: p.Text, at: p.CreatedAt, status: "sending"}})
 	}
+	for i := range out {
+		c.settle(&out[i])
+	}
 	return out
+}
+
+// settle works out what an exchange shows beyond its parts: its pictures,
+// whether it moves, and its fingerprint.
+func (c *conversation) settle(ex *exchange) {
+	h := fnv.New64a()
+	put := func(vs ...any) { fmt.Fprint(h, vs...); h.Write([]byte{0}) }
+	put(c.session.Provider, c.session.Model)
+	if u := ex.user; u != nil {
+		put(u.at.UnixNano(), u.text, u.status, len(u.media))
+		for _, m := range u.media {
+			put(m.MediaID, m.Filename)
+			if isImage(m.MediaType) && m.MediaID != "" {
+				ex.pics = append(ex.pics, mediaRef(m))
+			}
+		}
+		ex.moving = ex.moving || u.status != ""
+	}
+	for _, p := range ex.parts {
+		put(p.kind, p.turnID, len(p.text), p.live, p.working)
+		ex.moving = ex.moving || p.live || p.working
+		if p.turn != nil {
+			put(p.turn.Status, p.turn.CompletedAt.UnixNano())
+		}
+		for _, s := range p.steps {
+			if s.call != nil {
+				put(s.call.Sequence)
+			}
+			if s.result != nil {
+				put(s.result.Sequence)
+			}
+			if s.screenshot() {
+				ex.pics = append(ex.pics, shotRef(s.result))
+			}
+		}
+		if p.kind == partProposal {
+			ex.moving = ex.moving || p.result == nil
+			if p.result != nil {
+				v, ok := c.proposals[p.result.Sequence]
+				put(ok, v.Decision != nil)
+				if v.Decision != nil {
+					put(v.Decision.Status)
+				}
+			}
+		}
+	}
+	ex.sum = h.Sum64()
 }
 
 func payloadText(raw json.RawMessage) string {
@@ -579,10 +658,24 @@ func (c *conversation) applyOlder(d *api.Older) {
 		}
 	}
 	c.merge(d.Items)
+	c.changed()
 	c.before, c.hasOlder = d.BeforeCursor, d.HasOlder
 	if c.before == 0 && len(c.items) > 0 {
 		c.before = c.items[0].Sequence
 	}
+}
+
+// lastReply is the agent's newest finished text, as it wrote it.
+func (c *conversation) lastReply() string {
+	exs := c.exchanges()
+	for i := len(exs) - 1; i >= 0; i-- {
+		for j := len(exs[i].parts) - 1; j >= 0; j-- {
+			if p := exs[i].parts[j]; p.kind == partText && !p.live {
+				return p.text
+			}
+		}
+	}
+	return ""
 }
 
 // openProposal is the newest proposal still waiting for you.
@@ -627,39 +720,7 @@ func (s *step) screenshot() bool {
 func (c *conversation) pictures() []picRef {
 	var out []picRef
 	for _, ex := range c.exchanges() {
-		if ex.user != nil {
-			for _, m := range ex.user.media {
-				if isImage(m.MediaType) {
-					out = append(out, mediaRef(m))
-				}
-			}
-		}
-		for _, p := range ex.parts {
-			for _, s := range p.steps {
-				if s.screenshot() {
-					out = append(out, shotRef(s.result))
-				}
-			}
-		}
-	}
-	return out
-}
-
-// activity is how much the conversation did in each of n equal spans up to
-// now, over its loaded items; nil when there is too little to draw.
-func (c *conversation) activity(now time.Time, n int) []float64 {
-	if len(c.items) < 4 {
-		return nil
-	}
-	first := c.items[0].CreatedAt
-	span := now.Sub(first) / time.Duration(n)
-	if span <= 0 {
-		return nil
-	}
-	out := make([]float64, n)
-	for _, it := range c.items {
-		i := int(it.CreatedAt.Sub(first) / span)
-		out[min(max(i, 0), n-1)]++
+		out = append(out, ex.pics...)
 	}
 	return out
 }

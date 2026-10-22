@@ -96,8 +96,9 @@ type app struct {
 	toast             string
 	toastBad          bool
 	toastAt           time.Time
-	md                map[mdKey][]Line // agent prose, laid out
-	cancelRequestedOn string           // the turn you asked to stop
+	md                map[mdKey][]Line     // agent prose, laid out
+	laid              map[laidKey][]string // still exchanges, painted (transcript)
+	cancelRequestedOn string               // the turn you asked to stop
 
 	// Where you are.
 	screen screen
@@ -111,6 +112,7 @@ type app struct {
 	start  *starter // the new session sheet
 	menu   *menu
 	imgIdx int
+	span   *span // text selected with the mouse
 }
 
 type mdKey struct {
@@ -123,7 +125,7 @@ func Run(client *api.Client) error {
 	a := newApp(client, DetectGraphics())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := tea.NewProgram(a)
+	p := tea.NewProgram(a, tea.WithFPS(120)) // a key shows within 8 ms of its frame
 	go a.follow(ctx, p)
 	if _, err := p.Run(); err != nil {
 		return err
@@ -493,6 +495,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The message goes back in the box, unless you have started another.
 			if a.conv != nil && a.conv.id == msg.id {
 				a.conv.sending = slices.DeleteFunc(a.conv.sending, func(p api.PendingMessage) bool { return p.RequestID == msg.requestID })
+				a.conv.changed()
 				if a.comp.Value() == "" && len(a.attach) == 0 {
 					a.comp.Insert(msg.text)
 					a.attach = msg.attach
@@ -559,6 +562,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.session != nil && a.conv != nil && a.conv.id == msg.session.SessionID {
 			a.conv.session = *msg.session
+			a.conv.changed()
 			a.replaceSession(*msg.session)
 		}
 		if msg.relist {
@@ -572,7 +576,10 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, a.sync())
 		}
 		return a, tea.Batch(cmds...)
+	case tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
+		return a, a.mouse(msg.(tea.MouseMsg))
 	case tea.MouseWheelMsg:
+		a.span = nil
 		if a.screen == screenChat && a.menu == nil {
 			if msg.Button == tea.MouseWheelUp {
 				return a, a.scrollBy(3)
@@ -595,6 +602,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.paste(msg.Content)
 		}
 	case tea.KeyPressMsg:
+		a.span = nil
 		return a, a.key(msg)
 	}
 	return a, nil
@@ -651,7 +659,7 @@ func isStatus(err error, status int) bool {
 // setSessions takes a fresh list. The open session keeps whichever copy is
 // newer: the list and a sync can pass each other.
 func (a *app) setSessions(list []wire.Session) {
-	var keep []wire.Session
+	var keep, ended []wire.Session
 	for _, s := range list {
 		if s.MachineStatus == wire.MachineStatusDeleting || !s.ArchivedAt.IsZero() {
 			continue
@@ -659,9 +667,13 @@ func (a *app) setSessions(list []wire.Session) {
 		if a.conv != nil && s.SessionID == a.conv.id && a.conv.session.UpdatedAt.After(s.UpdatedAt) {
 			s = a.conv.session
 		}
+		if prev, ok := a.session(s.SessionID); ok && a.endedUnseen(prev, s) {
+			ended = append(ended, s)
+		}
 		keep = append(keep, s)
 	}
 	a.sessions = keep
+	a.announce(ended)
 	if !a.listed {
 		a.listed = true
 		if a.prefs.Reviewed == nil { // a first run has read everything so far, as the web app assumes
@@ -682,12 +694,40 @@ func (a *app) setSessions(list []wire.Session) {
 func (a *app) replaceSession(s wire.Session) {
 	for i := range a.sessions {
 		if a.sessions[i].SessionID == s.SessionID {
+			if a.endedUnseen(a.sessions[i], s) {
+				a.announce([]wire.Session{s})
+			}
 			a.sessions[i] = s
 			return
 		}
 	}
 	if s.ArchivedAt.IsZero() {
 		a.sessions = append(a.sessions, s)
+	}
+}
+
+// endedUnseen reports whether a session's turn ended between two copies
+// of it, out of your sight: not the conversation on screen.
+func (a *app) endedUnseen(prev, next wire.Session) bool {
+	watching := a.screen == screenChat && a.conv != nil && a.conv.id == next.SessionID
+	return a.listed && !watching && next.LatestTerminalTurnID != "" && next.LatestTerminalTurnID != prev.LatestTerminalTurnID
+}
+
+// announce says briefly, in the footer, that sessions finished a turn.
+func (a *app) announce(ended []wire.Session) {
+	switch len(ended) {
+	case 0:
+		return
+	case 1:
+		s := ended[0]
+		word := map[wire.TurnStatus]string{wire.TurnStatusFailed: " failed", wire.TurnStatusCancelled: " stopped"}[s.LatestTerminalTurnStatus]
+		if word == "" {
+			word = " is done"
+		}
+		a.say(sessionName(s) + word)
+		a.toastBad = s.LatestTerminalTurnStatus == wire.TurnStatusFailed
+	default:
+		a.say(fmt.Sprintf("%d sessions finished", len(ended)))
 	}
 }
 
@@ -878,6 +918,17 @@ func (a *app) count(g group) int {
 	n, project := 0, a.projectID()
 	for _, s := range a.sessions {
 		if projectOf(s) == project && a.standing(s).group == g {
+			n++
+		}
+	}
+	return n
+}
+
+// countAll counts the sessions of every project in a group.
+func (a *app) countAll(g group) int {
+	n := 0
+	for _, s := range a.sessions {
+		if a.standing(s).group == g {
 			n++
 		}
 	}

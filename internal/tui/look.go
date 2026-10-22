@@ -289,23 +289,6 @@ func gauge(theme string, frac float64, cells int, fill color.Color) Line {
 	return Line{S(strings.Repeat("━", n), Fg(fill)), S(strings.Repeat("━", cells-n), Fg(lands[theme].dim))}
 }
 
-// spark draws values as a row of eighth blocks.
-func spark(vs []float64) string {
-	top := 0.0
-	for _, v := range vs {
-		top = math.Max(top, v)
-	}
-	var b strings.Builder
-	for _, v := range vs {
-		i := 0
-		if top > 0 {
-			i = int(v / top * 7)
-		}
-		b.WriteRune([]rune("▁▂▃▄▅▆▇█")[i])
-	}
-	return b.String()
-}
-
 // sheet is a pop-over: a strip of ground carrying the title, then a raised
 // body. tone tints the strip (a danger strip for a question that destroys).
 func sheet(theme string, title, right Line, body []Line, w int, tone color.Color) string {

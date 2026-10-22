@@ -41,6 +41,8 @@ const (
 )
 
 // DetectGraphics reads the environment; BARAD_GRAPHICS=kitty|blocks decides.
+// Rex is built on libghostty but does not draw kitty's Unicode placeholders,
+// so it gets half blocks, whatever TERM says.
 func DetectGraphics() Graphics {
 	switch os.Getenv("BARAD_GRAPHICS") {
 	case "kitty":
@@ -48,8 +50,11 @@ func DetectGraphics() Graphics {
 	case "blocks":
 		return GraphicsBlocks
 	}
+	if os.Getenv("TERM_PROGRAM") == "rex" {
+		return GraphicsBlocks
+	}
 	if os.Getenv("KITTY_WINDOW_ID") != "" || os.Getenv("TERM") == "xterm-kitty" || os.Getenv("TERM") == "xterm-ghostty" ||
-		os.Getenv("TERM_PROGRAM") == "ghostty" || os.Getenv("TERM_PROGRAM") == "rex" {
+		os.Getenv("TERM_PROGRAM") == "ghostty" {
 		return GraphicsKitty
 	}
 	return GraphicsBlocks

@@ -238,7 +238,7 @@ func TestExchangesPairCallsWithResultsAndEndTurns(t *testing.T) {
 	if got := readResult(run.steps[0].result).failure("bash"); got != "Exited with status 2." {
 		t.Fatalf("failure = %q", got)
 	}
-	if exs[0].parts[1].kind != partFailure || exs[1].parts[1].kind != partCancelled {
+	if exs[0].parts[1].kind != partFailure || exs[0].parts[2].kind != partEnd || exs[1].parts[1].kind != partEnd || exs[1].parts[1].turn.Status != wire.TurnStatusCancelled {
 		t.Fatalf("turn ends = %+v / %+v", exs[0].parts, exs[1].parts)
 	}
 }
@@ -416,5 +416,164 @@ func TestSignInWithADeviceCode(t *testing.T) {
 	started.DeviceCode = "guess"
 	if err := client.FinishSignIn(ctx, started); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("a wrong device code: %v", err)
+	}
+}
+
+func TestTheComposerKeepsTheCursorInSightAndMovesByRows(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	d.keys("first line")
+	d.send(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
+	// The cursor stands at the start of the new, empty line.
+	field := d.a.comp.Lines(d.a.composerWidth(), 8, SText, "", true)
+	if len(field) != 2 || len(field[1]) < 2 || field[1][1].Text != " " || field[1][1].Style.GetBackground() != SCursor.GetBackground() {
+		t.Fatalf("after shift+enter the field is %+v", field)
+	}
+	d.keys("  indented")
+	if got := d.a.comp.Value(); got != "first line\n  indented" {
+		t.Fatalf("value = %q", got)
+	}
+	d.sees("› first line", "  indented") // leading spaces are kept
+	d.keys("up")
+	if d.a.comp.Pos != len("first line") {
+		t.Fatalf("up went to %d", d.a.comp.Pos)
+	}
+	d.keys("down")
+	if d.a.comp.Pos != len("first line\n  indented") {
+		t.Fatalf("down went to %d", d.a.comp.Pos)
+	}
+	d.send(tea.KeyPressMsg{Code: tea.KeyLeft})
+	d.keys("X")
+	if got := d.a.comp.Value(); got != "first line\n  indenteXd" {
+		t.Fatalf("value = %q", got)
+	}
+}
+
+func TestEditorRowsWrapLongLinesAndKeepEveryRune(t *testing.T) {
+	e := &Editor{}
+	e.Insert("aaaa bbbb cccc\n\ndd")
+	rows, cur := e.rows(8) // rows of 7 cells
+	var got []string
+	for _, r := range rows {
+		got = append(got, string(e.Text[r[0]:r[1]]))
+	}
+	if strings.Join(got, "|") != "aaaa |bbbb |cccc||dd" || cur != 4 {
+		t.Fatalf("rows = %q, cursor row %d", got, cur)
+	}
+	e.Pos = 5 // the start of "bbbb": a wrapped row's end is the next row's start
+	if _, cur := e.rows(8); cur != 1 {
+		t.Fatalf("cursor row = %d", cur)
+	}
+	e.vertical(-1, 8)
+	if e.Pos != 0 {
+		t.Fatalf("up from the second row went to %d", e.Pos)
+	}
+	e.Pos = 13
+	e.vertical(1, 8) // from "cccc" down to the empty line
+	if e.Pos != 15 {
+		t.Fatalf("down to the empty line went to %d", e.Pos)
+	}
+}
+
+func TestTurnsSayWhenTheyEndedAndHowLongTheyTook(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	turn := d.a.conv.turns["turn_1"]
+	when := clock(turn.CompletedAt, d.a.now)
+	d.reads("✓  done  " + when + "  ·  took 6m 00s")
+	d.sees("last active  " + when)
+	d.misses("activity")
+}
+
+func TestFinishedSessionsAreAnnouncedBriefly(t *testing.T) {
+	d := newDriver(t)
+	d.a.online = true // the driver has no update socket
+	d.openSession("checkout")
+	d.sees("1 need you", "1 working") // the failed SDK upgrade; the cron move
+	d.f.mu.Lock()
+	cron := d.f.find("ses_cron")
+	cron.finish("turn_c1", wire.TurnStatusCompleted, nil, time.Now())
+	d.f.mu.Unlock()
+	d.send(dirtyMsg(api.Dirty{Summaries: []string{"ses_cron"}}))
+	d.sees("Move the billing cron to the queue is done") // in place of the counts, briefly
+	d.a.toastAt = d.a.toastAt.Add(-4 * time.Second)
+	d.sees("2 need you")
+	d.misses("is done", "working")
+}
+
+func TestRexDrawsPicturesInHalfBlocks(t *testing.T) {
+	t.Setenv("BARAD_GRAPHICS", "")
+	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("TERM_PROGRAM", "rex")
+	if DetectGraphics() != GraphicsBlocks {
+		t.Fatal("Rex does not draw kitty placeholders, so it gets half blocks")
+	}
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	if DetectGraphics() != GraphicsKitty {
+		t.Fatal("Ghostty gets kitty graphics")
+	}
+}
+
+// at finds text on the screen: its first cell.
+func (d *driver) at(text string) (x, y int) {
+	d.t.Helper()
+	for y, line := range strings.Split(d.screen(), "\n") {
+		if i := strings.Index(line, text); i >= 0 {
+			return ansi.StringWidth(line[:i]), y
+		}
+	}
+	d.t.Fatalf("%q is not on the screen", text)
+	return 0, 0
+}
+
+func TestDraggingSelectsAndCopiesText(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	text := "The checkout test fails about one run in five"
+	x, y := d.at(text)
+	d.send(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
+	d.send(tea.MouseMotionMsg{X: x + 10, Y: y, Button: tea.MouseLeft})
+	_, cmd := d.a.Update(tea.MouseReleaseMsg{X: x + len(text) - 1, Y: y, Button: tea.MouseLeft})
+	if cmd == nil || d.a.span == nil {
+		t.Fatal("letting go of a drag copied nothing")
+	}
+	if got := selected(d.a.grid(d.a.compose()), *d.a.span); got != text {
+		t.Fatalf("copied %q", got)
+	}
+	d.sees("Copied 45 characters")
+	if !strings.Contains(d.a.View().Content, "\x1b[") {
+		t.Fatal("the selection is not drawn")
+	}
+	d.keys("x") // a key clears it
+	if d.a.span != nil {
+		t.Fatal("the selection survived a key")
+	}
+
+	// Across rows, the copy loses the surfaces' edges and shared indent.
+	x0, y0 := d.at("WHAT CHANGED")
+	x1, y1 := d.at("The test runs 50 times")
+	d.send(tea.MouseClickMsg{X: x0, Y: y0, Button: tea.MouseLeft})
+	d.send(tea.MouseReleaseMsg{X: x1 + 200, Y: y1, Button: tea.MouseLeft})
+	want := "WHAT CHANGED\n\n• Cart now holds a sync.Mutex, taken by Add and Total.\n• The test runs 50 times under -race without a failure."
+	if got := selected(d.a.grid(d.a.compose()), *d.a.span); got != want {
+		t.Fatalf("copied %q, want %q", got, want)
+	}
+}
+
+func TestLinksInRepliesAndMessagesAreClickable(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("search")
+	x, y := d.at("pg_trgm")
+	grid := d.a.grid(d.a.compose())
+	if c := grid.CellAt(x, y); c == nil || c.Link.URL != "https://www.postgresql.org/docs/current/pgtrgm.html" {
+		t.Fatalf("the link's label carries %+v", c)
+	}
+	d.keys("see https://example.com/a?b=1.", "enter")
+	x, y = d.at("https://example.com/a?b=1")
+	if c := d.a.grid(d.a.compose()).CellAt(x+3, y); c == nil || c.Link.URL != "https://example.com/a?b=1" {
+		t.Fatalf("a bare address in your message carries %+v", c)
+	}
+	if seg := linkify("run javascript:alert(1) or file:///etc/passwd", SText); len(seg) != 1 {
+		t.Fatalf("only web addresses link: %+v", seg)
 	}
 }

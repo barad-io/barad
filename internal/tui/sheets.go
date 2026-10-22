@@ -99,7 +99,7 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 				return mn.submit(a, text)
 			}
 		default:
-			mn.edit.Key(k)
+			mn.edit.Key(k, 0)
 		}
 		return nil
 	}
@@ -128,7 +128,7 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 			return it.run(a)
 		}
 	default:
-		mn.q.Key(k)
+		mn.q.Key(k, 0)
 		mn.sel = 0
 	}
 	return nil
@@ -222,6 +222,12 @@ func (a *app) chatMenu() *menu {
 	items = append(items, item{label: "Model", value: s.Model, sub: func(a *app) *menu { return a.modelMenu() }})
 	if efforts := a.efforts(s.ProviderResourceID, s.Model, s.SupportedReasoningEfforts); len(efforts) > 0 {
 		items = append(items, item{label: "Reasoning effort", value: effortLabel(s.ReasoningEffort), sub: func(a *app) *menu { return a.effortMenu() }})
+	}
+	if reply := c.lastReply(); reply != "" {
+		items = append(items, item{label: "Copy the last reply", run: func(a *app) tea.Cmd {
+			a.say("Copied the last reply")
+			return tea.SetClipboard(reply)
+		}})
 	}
 	pics := len(c.pictures())
 	items = append(items,
@@ -364,12 +370,12 @@ func (a *app) menuView() string {
 		return sheet(a.prefs.Theme, title, Line{S("esc", quiet)}, lines, w, hex("#5a1f33"))
 	}
 	if mn.edit != nil {
-		field := append(Line{S("› ", SAccent.Bold(true))}, mn.edit.Lines(inner-4, SText, "", true)[0]...)
+		field := append(Line{S("› ", SAccent.Bold(true))}, mn.edit.Lines(inner-4, 1, SText, "", true)[0]...)
 		lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{},
 			append(append(button("enter", "Save", OnAccent, Accent), gap(2)), button("esc", "Cancel", Text, Muted)...))
 		return sheet(a.prefs.Theme, Line{S(mn.title, Fg(groundText).Bold(true))}, Line{S("esc", quiet)}, lines, w, nil)
 	}
-	field := append(Line{S("› ", SAccent.Bold(true))}, mn.q.Lines(inner-4, SText, "type to filter", true)[0]...)
+	field := append(Line{S("› ", SAccent.Bold(true))}, mn.q.Lines(inner-4, 1, SText, "type to filter", true)[0]...)
 	lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{})
 	if mn.hint != "" {
 		lines = append(lines, Line{gap(3), S(mn.hint, SMuted)})
@@ -572,7 +578,7 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	if st.field == fieldTask {
-		st.task.Key(k)
+		st.task.Key(k, a.taskWidth())
 	}
 	return nil
 }
@@ -673,13 +679,17 @@ func (a *app) begin() tea.Cmd {
 	}
 }
 
+// startWidth is the new session sheet's width; its task field is taskWidth.
+func (a *app) startWidth() int { return min(88, a.w-8) }
+func (a *app) taskWidth() int  { return a.startWidth() - 8 - 6 }
+
 // startView draws the new session sheet.
 func (a *app) startView() string {
 	st := a.start
-	w := min(88, a.w-8)
+	w := a.startWidth()
 	inner := w - 8
 	var lines []Line
-	field := st.task.Lines(inner-6, SText, "What should the new session work on?", st.field == fieldTask && a.menu == nil)
+	field := st.task.Lines(a.taskWidth(), 6, SText, "What should the new session work on?", st.field == fieldTask && a.menu == nil)
 	for i, l := range field {
 		lead := gap(2)
 		if i == 0 {

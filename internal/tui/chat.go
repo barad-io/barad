@@ -96,7 +96,7 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
-	a.comp.Key(k)
+	a.comp.Key(k, a.composerWidth())
 	return nil
 }
 
@@ -124,6 +124,7 @@ func (a *app) send() tea.Cmd {
 		pending.Media = append(pending.Media, wire.PromptMediaRef{Filename: at.name, MediaType: at.mediaType})
 	}
 	c.sending = append(c.sending, pending)
+	c.changed()
 	a.comp.Reset()
 	a.attach, a.note, a.scroll = nil, "", 0
 	id := c.id
@@ -252,6 +253,9 @@ func (a *app) chatRows() int {
 	return max(1, a.h-1-len(a.sessionBar())-1-len(a.composer())-1)
 }
 
+// composerWidth is how wide the message box's text is.
+func (a *app) composerWidth() int { return a.width() - 8 }
+
 // composer is the message box: a raised block, the caret in vermilion, the
 // images going with it above.
 func (a *app) composer() []string {
@@ -281,11 +285,8 @@ func (a *app) composer() []string {
 	case st == "asleep":
 		placeholder = "Message — sending wakes its computer"
 	}
-	field := a.comp.Lines(w-8, SText, placeholder, a.menu == nil)
-	if len(field) > 8 { // a long message scrolls in the box, keeping the caret's end in view
-		field = field[len(field)-8:]
-	}
-	for i, l := range field {
+	// a long message scrolls in the box, keeping the cursor in view
+	for i, l := range a.comp.Lines(a.composerWidth(), 8, SText, placeholder, a.menu == nil) {
 		lead := gap(2)
 		if i == 0 {
 			lead = S("› ", SAccent.Bold(true))
@@ -296,7 +297,7 @@ func (a *app) composer() []string {
 }
 
 // footer is the only help the app needs: the keys that work right now, and
-// on the right what just happened.
+// on the right what just happened, or what your sessions are doing.
 func (a *app) footer(keys ...string) string {
 	l := Line{}
 	for i := 0; i+1 < len(keys); i += 2 {
@@ -307,7 +308,7 @@ func (a *app) footer(keys ...string) string {
 	}
 	var right Line
 	switch {
-	case a.toast != "" && a.now.Sub(a.toastAt) < 4*time.Second:
+	case a.toast != "" && a.now.Sub(a.toastAt) < 3*time.Second:
 		mark, st := S("✓  ", SOk), SText
 		if a.toastBad {
 			mark = S("✕  ", SDanger)
@@ -316,6 +317,16 @@ func (a *app) footer(keys ...string) string {
 		right = pill(Line{mark, S(ansi.Truncate(a.toast, max(10, room), "…"), st)}, Raised)
 	case !a.online && a.listed:
 		right = Line{S("○ ", SFaint), S("reconnecting", SMuted)}
+	case a.screen != screenHome: // the cover says it at home
+		if n := a.countAll(groupNeedsYou); n > 0 {
+			right = append(right, S("● ", SAccent), S(fmt.Sprintf("%d need you", n), SMuted))
+		}
+		if n := a.countAll(groupRunning); n > 0 {
+			if len(right) > 0 {
+				right = append(right, gap(3))
+			}
+			right = append(right, S(Spinner[a.frame%10]+" ", SAgent), S(fmt.Sprintf("%d working", n), SMuted))
+		}
 	}
 	return at(spread(l, right, a.width()))
 }
@@ -352,7 +363,7 @@ func (a *app) statusPill(s wire.Session) Line {
 
 // sessionBar is the top of every screen inside a session: where you are,
 // its state, and a line about its agent, repositories, context, machine and
-// recent activity. screen names a page within the session; none is the
+// when it was last active. screen names a page within the session; none is the
 // conversation.
 func (a *app) sessionBar(screen ...string) []string {
 	s := a.conv.session
@@ -396,14 +407,29 @@ func (a *app) sessionBar(screen ...string) []string {
 	default:
 		detail = append(detail, gap(5), S("○ "+machine, quiet))
 	}
-	if act := a.conv.activity(a.now, 16); act != nil {
-		detail = spread(detail, Line{S("activity  ", quiet), S(spark(act), Fg(groundAgent))}, a.width())
+	if last := a.lastActive(); !last.IsZero() {
+		when := ago(last, a.now) + " ago"
+		if when == "now ago" {
+			when = "just now"
+		}
+		detail = spread(detail, Line{S("last active  ", quiet), S(clock(last, a.now), Fg(groundSec)), S("  ·  "+when, quiet)}, a.width())
 	}
 	sweep := -1
 	if a.standing(s).group == groupRunning {
 		sweep = a.frame
 	}
 	return bar(a.prefs.Theme, a.w, crumbs, ansi.Truncate(title, a.width()/2, "…"), a.statusPill(s), detail, sweep)
+}
+
+// lastActive is when the open session last did something: its newest
+// message, step or reply, or the end of its last turn.
+func (a *app) lastActive() time.Time {
+	c := a.conv
+	last := activityAt(c.session)
+	if n := len(c.items); n > 0 && c.items[n-1].CreatedAt.After(last) {
+		last = c.items[n-1].CreatedAt
+	}
+	return last
 }
 
 // modelName is the provider and model, said once: "Claude opus-4", "Grok 4".
@@ -437,12 +463,42 @@ func (a *app) transcript() []string {
 	if len(exs) == 0 {
 		out = append(out, at(Line{gap(2), S("Nothing here yet. Say what this session should work on.", SMuted)}))
 	}
+	// An exchange that is still keeps its painted rows from frame to frame;
+	// one that moves (a spinner, a running clock, a picture on its way) is
+	// drawn anew. Only the rows this frame used are kept.
+	y, m, d := a.now.Date()
+	kept := make(map[laidKey][]string, len(exs))
 	for _, ex := range exs {
-		for _, l := range a.exchange(ex, w) {
-			out = append(out, at(l))
+		still := !ex.moving
+		for _, p := range ex.pics {
+			still = still && (a.pics[p.key] != nil || a.picErr[p.key] != "")
 		}
+		k := laidKey{ex.sum, w, a.prefs.Work, a.prefs.Theme, y*10000 + int(m)*100 + d}
+		rows, ok := a.laid[k]
+		if !ok || !still {
+			rows = rows[:0:0]
+			for _, l := range a.exchange(ex, w) {
+				rows = append(rows, at(l))
+			}
+		}
+		if still {
+			kept[k] = rows
+		}
+		out = append(out, rows...)
 	}
+	a.laid = kept
 	return out
+}
+
+// laidKey is what an exchange's painted rows depend on, besides the
+// exchange itself (its sum): the width, how steps show, the theme, and the
+// day (times show their day when it is not today).
+type laidKey struct {
+	sum   uint64
+	w     int
+	work  work
+	theme string
+	day   int
 }
 
 // exchange lays out one message and the agent's answer. Your message sits
@@ -479,7 +535,7 @@ func (a *app) exchange(ex exchange, w int) []Line {
 		}
 		you := []Line{spread(Line{S("you", Fg(AccentText).Bold(true))}, meta, cw)}
 		if u.text != "" {
-			you = append(you, Wrap([]Seg{S(u.text, SText)}, cw)...)
+			you = append(you, Wrap(linkify(u.text, SText), cw)...)
 		}
 		if len(u.media) > 0 {
 			you = append(you, Line{})
@@ -528,8 +584,8 @@ func (a *app) exchange(ex exchange, w int) []Line {
 			body = append(body, Indent(Wrap([]Seg{S(msg, SSec)}, aw-9), 3)...)
 			add(0, Line{})
 			add(0, slab(body, DangerSurf, aw, 3)...)
-		case partCancelled:
-			add(0, Line{}, Line{S("■  ", SFaint), S("stopped at your request", SMuted)})
+		case partEnd:
+			add(0, Line{}, a.ending(*p.turn))
 		case partProposal:
 			add(0, Line{})
 			add(0, slab(a.proposal(p, aw-6), AccentSurface, aw, 3)...)
@@ -537,6 +593,28 @@ func (a *app) exchange(ex exchange, w int) []Line {
 	}
 	add(0, Line{}, Line{}, Line{})
 	return rows
+}
+
+// ending is the line under a turn's answer: how it ended, when, and how
+// long it took.
+func (a *app) ending(t wire.Turn) Line {
+	var l Line
+	switch t.Status {
+	case wire.TurnStatusFailed:
+		l = Line{S("✕  ", SDanger), S("failed", SSec)}
+	case wire.TurnStatusCancelled:
+		l = Line{S("■  ", SFaint), S("stopped at your request", SSec)}
+	default:
+		l = Line{S("✓  ", SOk), S("done", SSec)}
+	}
+	if t.CompletedAt.IsZero() {
+		return l
+	}
+	l = append(l, S("  "+clock(t.CompletedAt, a.now), SMuted))
+	if !t.CreatedAt.IsZero() && t.CompletedAt.After(t.CreatedAt) {
+		l = append(l, S("  ·  took "+dur(t.CompletedAt.Sub(t.CreatedAt).Truncate(time.Second)), SFaint))
+	}
+	return l
 }
 
 // proposal is a session the agent wants to start, and what became of it.

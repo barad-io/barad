@@ -255,18 +255,23 @@ func (r *mdRenderer) inline(n ast.Node, base lipgloss.Style) []Seg {
 				}
 			case *east.Strikethrough:
 				walk(c, st.Strikethrough(true))
-			case *ast.Link:
+			case *ast.Link: // the label, and the address when it differs, both open it
+				url := string(c.Destination)
 				before := len(segs)
-				walk(c, st.Foreground(Agent).Underline(true))
+				walk(c, linked(st.Foreground(Agent).Underline(true), url))
 				label := ""
 				for _, s := range segs[before:] {
 					label += s.Text
 				}
-				if url := string(c.Destination); url != "" && url != label {
-					segs = append(segs, S(" ("+url+")", SFaint))
+				if url != "" && url != label {
+					segs = append(segs, S(" ("+url+")", linked(SFaint, url)))
 				}
 			case *ast.AutoLink:
-				segs = append(segs, S(string(c.URL(r.src)), st.Foreground(Agent).Underline(true)))
+				url := string(c.URL(r.src))
+				if c.AutoLinkType == ast.AutoLinkEmail {
+					url = "mailto:" + url
+				}
+				segs = append(segs, S(string(c.Label(r.src)), linked(st.Foreground(Agent).Underline(true), url)))
 			case *ast.Image:
 				segs = append(segs, S("▣ "+string(c.Destination), SMuted))
 			case *ast.RawHTML:
@@ -289,8 +294,9 @@ func (r *mdRenderer) inline(n ast.Node, base lipgloss.Style) []Seg {
 	return segs
 }
 
-// CodeBlock highlights code on a surface w cells wide: half a row of padding
-// above and below (half blocks), and the language at the top right.
+// CodeBlock highlights code on a surface w cells wide, with half a row of
+// padding above and below (half blocks). Nothing else shares its rows, so
+// the code copies clean.
 func CodeBlock(code, lang string, width int, bg color.Color) []Line {
 	lexer := lexers.Get(lang)
 	if lexer == nil {
@@ -323,13 +329,10 @@ func CodeBlock(code, lang string, width int, bg color.Color) []Line {
 	}
 	pad := lipgloss.NewStyle().Background(bg)
 	out := []Line{{S(strings.Repeat("▄", width), Fg(bg))}}
-	for i, r := range rows {
+	for _, r := range rows {
 		l := Line{S("  ", pad)}
 		for _, s := range r {
 			l = append(l, S(s.Text, s.Style.Background(bg)))
-		}
-		if i == 0 && lang != "" && l.Width()+len(lang)+4 <= width {
-			l = append(l, S(strings.Repeat(" ", width-l.Width()-len(lang)-2), pad), S(lang, Fg(TextFaint).Background(bg)))
 		}
 		if w := l.Width(); w < width {
 			l = append(l, S(strings.Repeat(" ", width-w), pad))
