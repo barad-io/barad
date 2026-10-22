@@ -19,36 +19,31 @@ import (
 	"time"
 )
 
-// Endpoints is where the client talks to. The defaults are production; the
-// BARAD_API_URL, BARAD_COGNITO_URL and BARAD_COGNITO_CLIENT_ID variables point
-// it somewhere else (a development stack, or the fake API in tests).
+// Endpoints is where the client talks to: production, unless BARAD_API_URL
+// points it at another stack (or the fake API in tests). Where tokens are
+// refreshed comes with the tokens.
 type Endpoints struct {
-	API      string // https://api.barad.io
-	Cognito  string // https://cognito-idp.eu-west-1.amazonaws.com/
-	ClientID string
+	API string // https://api.barad.io
 }
 
 func DefaultEndpoints() Endpoints {
-	e := Endpoints{API: "https://api.barad.io", Cognito: "https://cognito-idp.eu-west-1.amazonaws.com/", ClientID: "41mukom8o592l2lk2vcjum953h"}
+	e := Endpoints{API: "https://api.barad.io"}
 	if v := os.Getenv("BARAD_API_URL"); v != "" {
 		e.API = strings.TrimRight(v, "/")
-	}
-	if v := os.Getenv("BARAD_COGNITO_URL"); v != "" {
-		e.Cognito = v
-	}
-	if v := os.Getenv("BARAD_COGNITO_CLIENT_ID"); v != "" {
-		e.ClientID = v
 	}
 	return e
 }
 
-// Tokens is the signed-in identity, as stored on disk.
+// Tokens is the signed-in identity, as stored on disk: the Cognito session,
+// and the app client and endpoint that refresh and revoke it.
 type Tokens struct {
 	AccessToken  string    `json:"access_token"`
 	IDToken      string    `json:"id_token"`
 	RefreshToken string    `json:"refresh_token"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	Email        string    `json:"email"`
+	ClientID     string    `json:"client_id"`
+	CognitoURL   string    `json:"cognito_url"`
 }
 
 // Client is safe for concurrent use: the Bubble Tea program runs requests in
@@ -118,11 +113,12 @@ func New() (*Client, error) {
 
 func (c *Client) credentialsPath() string { return filepath.Join(c.dir, "credentials.json") }
 
-// SignedIn reports whether a refresh token is stored.
+// SignedIn reports whether a session that can be refreshed is stored.
+// Credentials from before device-code sign-in name no client, and are not.
 func (c *Client) SignedIn() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.tokens.RefreshToken != ""
+	return c.tokens.RefreshToken != "" && c.tokens.ClientID != "" && c.tokens.CognitoURL != ""
 }
 
 // Email is the signed-in account's address.
@@ -157,7 +153,7 @@ func (c *Client) accessToken(ctx context.Context, force bool) (string, error) {
 	c.mu.Lock()
 	t := c.tokens
 	c.mu.Unlock()
-	if t.RefreshToken == "" {
+	if t.RefreshToken == "" || t.ClientID == "" || t.CognitoURL == "" {
 		return "", ErrSignedOut
 	}
 	if !force && t.AccessToken != "" && time.Until(t.ExpiresAt) > time.Minute {
@@ -171,32 +167,15 @@ func (c *Client) accessToken(ctx context.Context, force bool) (string, error) {
 	return c.tokens.AccessToken, nil
 }
 
-// Do calls the API: method on path (with its query), in as the JSON body,
-// out decoded from the JSON response. A 401 refreshes the token once.
+// Do calls the API as the signed-in user: method on path (with its query),
+// in as the JSON body, out decoded from the JSON response. A 401 refreshes the
+// token once.
 func (c *Client) Do(ctx context.Context, method, path string, in, out any) error {
-	var body []byte
-	if in != nil {
-		var err error
-		if body, err = json.Marshal(in); err != nil {
-			return err
-		}
-	}
-	send := func(token string) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, method, c.Endpoints.API+path, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		if in != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		return c.HTTP.Do(req)
-	}
 	token, err := c.accessToken(ctx, false)
 	if err != nil {
 		return err
 	}
-	resp, err := send(token)
+	resp, err := c.send(ctx, method, path, in, token)
 	if err != nil {
 		return err
 	}
@@ -205,10 +184,45 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 		if token, err = c.accessToken(ctx, true); err != nil {
 			return err
 		}
-		if resp, err = send(token); err != nil {
+		if resp, err = c.send(ctx, method, path, in, token); err != nil {
 			return err
 		}
 	}
+	return decode(resp, out)
+}
+
+// doPublic calls one of the API's routes that need no sign-in.
+func (c *Client) doPublic(ctx context.Context, method, path string, in, out any) error {
+	resp, err := c.send(ctx, method, path, in, "")
+	if err != nil {
+		return err
+	}
+	return decode(resp, out)
+}
+
+func (c *Client) send(ctx context.Context, method, path string, in any, token string) (*http.Response, error) {
+	var body []byte
+	if in != nil {
+		var err error
+		if body, err = json.Marshal(in); err != nil {
+			return nil, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.Endpoints.API+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return c.HTTP.Do(req)
+}
+
+// decode reads a response: out from a success, *Error from a failure.
+func decode(resp *http.Response, out any) error {
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {

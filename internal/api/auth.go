@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,14 +11,89 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/barad-io/barad/wire"
 )
 
-// Sign-in talks to Cognito directly, as the web app does: USER_PASSWORD_AUTH
-// for email and password, NEW_PASSWORD_REQUIRED for invited accounts, and
-// REFRESH_TOKEN_AUTH to keep the session alive.
+// Sign-in is a device code: barad asks the API for a code, you approve it in
+// the web app where you are already signed in, and the API hands barad a
+// Cognito session on the command line's own app client. barad never sees your
+// password. Refreshing and revoking that session talk to Cognito directly.
+
+// StartSignIn asks for a sign-in code for this computer (device names it on
+// the approval page).
+func (c *Client) StartSignIn(ctx context.Context, device string) (*wire.CLISignInStarted, error) {
+	var out wire.CLISignInStarted
+	if err := c.doPublic(ctx, http.MethodPost, "/cli/sign-in", map[string]string{"device": device}, &out); err != nil {
+		return nil, err
+	}
+	if out.UserCode == "" || out.DeviceCode == "" || out.VerificationURL == "" {
+		return nil, errors.New("the sign-in request was incomplete")
+	}
+	return &out, nil
+}
+
+// FinishSignIn waits for the code to be approved, then stores the session.
+// It returns when you approve or deny it, when it expires, or when ctx ends.
+func (c *Client) FinishSignIn(ctx context.Context, started *wire.CLISignInStarted) error {
+	interval := time.Duration(max(started.Interval, 1)) * time.Second
+	deadline := time.Now().Add(time.Duration(started.ExpiresIn) * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+		var out wire.CLITokens
+		err := c.doPublic(ctx, http.MethodPost, "/cli/sign-in/token", map[string]string{"user_code": started.UserCode, "device_code": started.DeviceCode}, &out)
+		var e *Error
+		switch {
+		case err == nil:
+			if out.RefreshToken == "" || out.ClientID == "" || out.CognitoURL == "" {
+				return errors.New("the sign-in returned no session")
+			}
+			return c.store(Tokens{AccessToken: out.AccessToken, IDToken: out.IDToken, RefreshToken: out.RefreshToken,
+				ExpiresAt: time.Now().Add(time.Duration(max(out.ExpiresIn, 60)) * time.Second), Email: emailOf(out.IDToken),
+				ClientID: out.ClientID, CognitoURL: out.CognitoURL})
+		case errors.As(err, &e) && e.Code == "authorization_pending":
+		case errors.As(err, &e) && e.Code == "slow_down":
+			interval += 5 * time.Second
+		case errors.As(err, &e) && e.Code == "access_denied":
+			return errors.New("the sign-in was denied")
+		case errors.As(err, &e) && (e.Code == "expired_token" || e.Code == "invalid_grant"):
+			return errors.New("the sign-in code expired; run barad login again")
+		case errors.As(err, &e) && e.Status < 500:
+			return err
+		default:
+			// The network or the API failed; keep waiting while the code lives.
+		}
+		if time.Now().After(deadline) {
+			return errors.New("the sign-in code expired; run barad login again")
+		}
+	}
+}
+
+// emailOf reads the email claim of an ID token, for showing who is signed in.
+// The token is not verified here: it came from the API over TLS, and nothing
+// is decided by it.
+func emailOf(idToken string) string {
+	parts := strings.Split(idToken, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Email string `json:"email"`
+	}
+	_ = json.Unmarshal(payload, &claims)
+	return claims.Email
+}
 
 // CognitoError is a failed Cognito call; Type is its exception name
-// (NotAuthorizedException, UserNotConfirmedException…).
+// (NotAuthorizedException, TooManyRequestsException…).
 type CognitoError struct {
 	Type    string
 	Message string
@@ -30,25 +106,12 @@ func (e *CognitoError) Error() string {
 	return e.Type
 }
 
-type authResult struct {
-	AccessToken  string `json:"AccessToken"`
-	IDToken      string `json:"IdToken"`
-	RefreshToken string `json:"RefreshToken"`
-	ExpiresIn    int    `json:"ExpiresIn"`
-}
-
-type initiateResponse struct {
-	AuthenticationResult *authResult `json:"AuthenticationResult"`
-	ChallengeName        string      `json:"ChallengeName"`
-	Session              string      `json:"Session"`
-}
-
-func (c *Client) cognito(ctx context.Context, action string, in, out any) error {
+func (c *Client) cognito(ctx context.Context, endpoint, action string, in, out any) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoints.Cognito, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -84,60 +147,6 @@ func (c *Client) cognito(ctx context.Context, action string, in, out any) error 
 	return json.Unmarshal(data, out)
 }
 
-func (c *Client) adopt(r *authResult, email, previousRefresh string) error {
-	t := Tokens{AccessToken: r.AccessToken, IDToken: r.IDToken, RefreshToken: r.RefreshToken, Email: email,
-		ExpiresAt: time.Now().Add(time.Duration(max(r.ExpiresIn, 60)) * time.Second)}
-	if t.RefreshToken == "" {
-		t.RefreshToken = previousRefresh // Cognito returns a new one only when it rotates
-	}
-	return c.store(t)
-}
-
-// NewPasswordRequired is returned by SignIn for an invited account that must
-// choose its own password; finish with SetNewPassword.
-type NewPasswordRequired struct {
-	Email   string
-	session string
-}
-
-func (e *NewPasswordRequired) Error() string { return "this account needs a new password" }
-
-// SignIn signs in with email and password and stores the tokens.
-func (c *Client) SignIn(ctx context.Context, email, password string) error {
-	email = strings.ToLower(strings.TrimSpace(email))
-	var out initiateResponse
-	err := c.cognito(ctx, "InitiateAuth", map[string]any{
-		"AuthFlow": "USER_PASSWORD_AUTH", "ClientId": c.Endpoints.ClientID,
-		"AuthParameters": map[string]string{"USERNAME": email, "PASSWORD": password},
-	}, &out)
-	if err != nil {
-		return err
-	}
-	if out.ChallengeName == "NEW_PASSWORD_REQUIRED" {
-		return &NewPasswordRequired{Email: email, session: out.Session}
-	}
-	if out.AuthenticationResult == nil {
-		return fmt.Errorf("unsupported sign-in challenge %q; sign in on app.barad.io first", out.ChallengeName)
-	}
-	return c.adopt(out.AuthenticationResult, email, "")
-}
-
-// SetNewPassword answers a NEW_PASSWORD_REQUIRED challenge.
-func (c *Client) SetNewPassword(ctx context.Context, challenge *NewPasswordRequired, password string) error {
-	var out initiateResponse
-	err := c.cognito(ctx, "RespondToAuthChallenge", map[string]any{
-		"ClientId": c.Endpoints.ClientID, "ChallengeName": "NEW_PASSWORD_REQUIRED", "Session": challenge.session,
-		"ChallengeResponses": map[string]string{"USERNAME": challenge.Email, "NEW_PASSWORD": password},
-	}, &out)
-	if err != nil {
-		return err
-	}
-	if out.AuthenticationResult == nil {
-		return errors.New("the password change did not complete; sign in again")
-	}
-	return c.adopt(out.AuthenticationResult, challenge.Email, "")
-}
-
 // refresh exchanges the refresh token in t for new tokens. Concurrent callers
 // wait for one exchange; a caller that waited finds the tokens already new.
 func (c *Client) refresh(ctx context.Context, t Tokens) error {
@@ -149,9 +158,16 @@ func (c *Client) refresh(ctx context.Context, t Tokens) error {
 	if current.AccessToken != t.AccessToken && time.Until(current.ExpiresAt) > time.Minute {
 		return nil // someone else refreshed while this caller waited
 	}
-	var out initiateResponse
-	err := c.cognito(ctx, "InitiateAuth", map[string]any{
-		"AuthFlow": "REFRESH_TOKEN_AUTH", "ClientId": c.Endpoints.ClientID,
+	var out struct {
+		AuthenticationResult *struct {
+			AccessToken  string `json:"AccessToken"`
+			IDToken      string `json:"IdToken"`
+			RefreshToken string `json:"RefreshToken"`
+			ExpiresIn    int    `json:"ExpiresIn"`
+		} `json:"AuthenticationResult"`
+	}
+	err := c.cognito(ctx, current.CognitoURL, "InitiateAuth", map[string]any{
+		"AuthFlow": "REFRESH_TOKEN_AUTH", "ClientId": current.ClientID,
 		"AuthParameters": map[string]string{"REFRESH_TOKEN": current.RefreshToken},
 	}, &out)
 	var ce *CognitoError
@@ -161,10 +177,17 @@ func (c *Client) refresh(ctx context.Context, t Tokens) error {
 	if err != nil {
 		return err
 	}
-	if out.AuthenticationResult == nil {
+	r := out.AuthenticationResult
+	if r == nil {
 		return errors.New("the sign-in service returned no tokens")
 	}
-	return c.adopt(out.AuthenticationResult, current.Email, current.RefreshToken)
+	next := current
+	next.AccessToken, next.IDToken = r.AccessToken, r.IDToken
+	next.ExpiresAt = time.Now().Add(time.Duration(max(r.ExpiresIn, 60)) * time.Second)
+	if r.RefreshToken != "" {
+		next.RefreshToken = r.RefreshToken // Cognito returns a new one only when it rotates
+	}
+	return c.store(next)
 }
 
 // SignOut revokes the refresh token and forgets the credentials.
@@ -172,15 +195,12 @@ func (c *Client) SignOut(ctx context.Context) error {
 	c.mu.Lock()
 	t := c.tokens
 	c.mu.Unlock()
-	if t.RefreshToken != "" {
+	if t.RefreshToken != "" && t.ClientID != "" && t.CognitoURL != "" {
 		// Best effort: an unreachable Cognito must not keep the credentials on disk.
-		_ = c.cognito(ctx, "RevokeToken", map[string]string{"Token": t.RefreshToken, "ClientId": c.Endpoints.ClientID}, nil)
+		_ = c.cognito(ctx, t.CognitoURL, "RevokeToken", map[string]string{"Token": t.RefreshToken, "ClientId": t.ClientID}, nil)
 	}
 	c.mu.Lock()
 	c.tokens = Tokens{}
 	c.mu.Unlock()
-	if err := removeIfExists(c.credentialsPath()); err != nil {
-		return err
-	}
-	return nil
+	return removeIfExists(c.credentialsPath())
 }

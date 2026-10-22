@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -28,16 +29,19 @@ import (
 
 // fakeAPI is a Barad API in memory, with the routes the app uses and an
 // agent that answers messages with a run of work. It also answers Cognito,
-// so `barad login` works against it.
+// and approves a device-code sign-in at its second poll, so `barad login`
+// works against it.
 type fakeAPI struct {
-	srv   *httptest.Server
-	pace  time.Duration // between an agent's steps; 0 answers at once
-	mu    sync.Mutex
-	list  []*fakeSession
-	media map[string][]byte
-	refs  map[string]wire.PromptMediaRef // reserved media, by id
-	socks map[chan api.Dirty]bool
-	calls []string // "METHOD path" of every API call, for assertions
+	srv     *httptest.Server
+	pace    time.Duration // between an agent's steps; 0 answers at once
+	mu      sync.Mutex
+	list    []*fakeSession
+	media   map[string][]byte
+	refs    map[string]wire.PromptMediaRef // reserved media, by id
+	socks   map[chan api.Dirty]bool
+	calls   []string // "METHOD path" of every API call, for assertions
+	polls   int      // sign-in polls so far
+	started wire.CLISignInStarted
 }
 
 type fakeSession struct {
@@ -62,8 +66,8 @@ func newFakeAPI(pace time.Duration) *fakeAPI {
 func (f *fakeAPI) signIn(t testing.TB, dir string) *api.Client {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("BARAD_API_URL", f.srv.URL)
-	t.Setenv("BARAD_COGNITO_URL", f.srv.URL+"/cognito")
-	creds, _ := json.Marshal(api.Tokens{AccessToken: "fake", RefreshToken: "fake", ExpiresAt: time.Now().Add(24 * time.Hour), Email: "you@example.com"})
+	creds, _ := json.Marshal(api.Tokens{AccessToken: "fake", RefreshToken: "fake", ExpiresAt: time.Now().Add(24 * time.Hour), Email: "you@example.com",
+		ClientID: "fake-cli", CognitoURL: f.srv.URL + "/cognito"})
 	_ = os.MkdirAll(filepath.Join(dir, "barad"), 0o700)
 	if err := os.WriteFile(filepath.Join(dir, "barad", "credentials.json"), creds, 0o600); err != nil {
 		t.Fatal(err)
@@ -314,6 +318,36 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	case path == "/updates":
 		f.socket(w, r)
+		return
+	case path == "/cli/sign-in" && r.Method == http.MethodPost:
+		f.mu.Lock()
+		f.started = wire.CLISignInStarted{UserCode: "BCDF-GHJK", DeviceCode: "device-secret", ExpiresIn: 600, Interval: 1,
+			VerificationURL: f.srv.URL + "/?cli=BCDF-GHJK"}
+		f.polls = 0
+		started := f.started
+		f.mu.Unlock()
+		reply(200, started)
+		return
+	case path == "/cli/sign-in/token" && r.Method == http.MethodPost:
+		var in struct {
+			UserCode   string `json:"user_code"`
+			DeviceCode string `json:"device_code"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		f.mu.Lock()
+		f.polls++
+		polls, ok := f.polls, in.UserCode == f.started.UserCode && in.DeviceCode == f.started.DeviceCode && f.started.UserCode != ""
+		f.mu.Unlock()
+		switch {
+		case !ok:
+			fail(400, "invalid_grant", "no such sign-in request")
+		case polls < 2:
+			fail(400, "authorization_pending", "waiting for you to approve the sign-in")
+		default:
+			claims := base64.RawURLEncoding.EncodeToString([]byte(`{"email":"you@example.com"}`))
+			reply(200, wire.CLITokens{AccessToken: "fake", IDToken: "e30." + claims + ".sig", RefreshToken: "fake", ExpiresIn: 3600,
+				ClientID: "fake-cli", CognitoURL: f.srv.URL + "/cognito"})
+		}
 		return
 	case strings.HasPrefix(path, "/blob/"):
 		f.mu.Lock()
@@ -615,7 +649,8 @@ func picture(w, h, seed int) []byte {
 
 // TestServeFakeAPI runs the fake API for a manual session when
 // BARAD_FAKE_API_DIR names a directory: it writes the credentials there and
-// serves until interrupted. Point barad at it with
+// serves until interrupted (barad login against it is approved at once).
+// Point barad at it with
 //
 //	XDG_CONFIG_HOME=$BARAD_FAKE_API_DIR BARAD_API_URL=$(cat $BARAD_FAKE_API_DIR/url) barad
 func TestServeFakeAPI(t *testing.T) {

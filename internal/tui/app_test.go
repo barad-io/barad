@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,5 +383,38 @@ func TestEveryScreenFitsSmallWindows(t *testing.T) {
 		d.keys("esc", "esc", "?", "usage", "enter")
 		d.screen()
 		d.keys("esc")
+	}
+}
+
+func TestSignInWithADeviceCode(t *testing.T) {
+	f := newFakeAPI(0)
+	t.Cleanup(f.srv.Close)
+	client := f.signIn(t, t.TempDir())
+	if err := client.SignOut(context.Background()); err != nil || client.SignedIn() {
+		t.Fatalf("sign out: %v, still signed in %v", err, client.SignedIn())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started, err := client.StartSignIn(ctx, "barad on test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.UserCode != "BCDF-GHJK" || !strings.HasSuffix(started.VerificationURL, "/?cli=BCDF-GHJK") {
+		t.Fatalf("started = %+v", started)
+	}
+	if err := client.FinishSignIn(ctx, started); err != nil {
+		t.Fatal(err)
+	}
+	if !client.SignedIn() || client.Email() != "you@example.com" || f.polls != 2 {
+		t.Fatalf("signed in %v as %q after %d polls", client.SignedIn(), client.Email(), f.polls)
+	}
+	// The stored session is the one the app uses.
+	if _, err := client.Sessions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A wrong device code is refused, not waited on.
+	started.DeviceCode = "guess"
+	if err := client.FinishSignIn(ctx, started); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("a wrong device code: %v", err)
 	}
 }

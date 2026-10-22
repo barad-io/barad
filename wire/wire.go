@@ -285,3 +285,26 @@ type WorkspaceUsage struct {
 	Totals WorkspaceTime  `json:"totals"`
 	Daily  []WorkspaceDay `json:"daily"`
 }
+
+// Signing in: the command line's device-code flow.
+
+// CLISignInStarted is a new sign-in: the code you approve at VerificationURL,
+// and the secret barad polls with.
+type CLISignInStarted struct {
+	UserCode        string `json:"user_code"`
+	DeviceCode      string `json:"device_code"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+	VerificationURL string `json:"verification_url"`
+}
+
+// CLITokens is an approved sign-in: a Cognito session on the command line's
+// app client, and where to refresh and revoke it.
+type CLITokens struct {
+	AccessToken  string `json:"access_token"`
+	IDToken      string `json:"id_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	ClientID     string `json:"client_id"`
+	CognitoURL   string `json:"cognito_url"`
+}
