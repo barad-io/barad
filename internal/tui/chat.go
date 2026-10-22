@@ -71,16 +71,14 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		a.savePrefs()
 		return nil
 	case "ctrl+k":
-		a.menu = a.chatMenu()
-		return nil
+		return a.openChatMenu()
 	case "ctrl+p":
 		return a.jump(-1)
 	case "ctrl+n":
 		return a.jump(1)
 	case "?":
 		if empty {
-			a.menu = a.chatMenu()
-			return nil
+			return a.openChatMenu()
 		}
 	case "ctrl+v":
 		return func() tea.Msg {
@@ -424,7 +422,11 @@ func (a *app) sessionBar(screen ...string) []string {
 		detail = append(detail, S("  ·  "+string(s.ReasoningEffort), quiet))
 	}
 	if repos := a.sessionRepos[s.SessionID]; len(repos) > 0 {
-		detail = append(detail, gap(5), S("repo  ", quiet), S(strings.Join(repos, ", "), Fg(groundSec)))
+		var names []string
+		for _, r := range repos {
+			names = append(names, r.CanonicalPath)
+		}
+		detail = append(detail, gap(5), S("repo  ", quiet), S(strings.Join(names, ", "), Fg(groundSec)))
 	}
 	if total := s.ContextWindowTokens; total > 0 {
 		u := s.LatestProviderUsage

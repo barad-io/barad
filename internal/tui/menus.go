@@ -1,0 +1,338 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/update"
+	"github.com/barad-io/barad/wire"
+)
+
+// The menus, by what they act on. Every menu ends with Barad's own group:
+// its settings, and the way out.
+
+func (a *app) homeMenu() *menu {
+	items := []item{
+		{group: "SESSIONS", label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
+		{group: "SESSIONS", label: "Search sessions", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
+		{group: "SESSIONS", label: "Project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
+			return a.projectMenu(a.projectID(), func(a *app, id string) tea.Cmd { a.prefs.Project = id; a.sel = ""; a.savePrefs(); return nil })
+		}},
+	}
+	return &menu{title: "Barad", items: append(items, a.baradItems()...)}
+}
+
+// baradItems are the account's own: usage, settings, quit.
+func (a *app) baradItems() []item {
+	balance := ""
+	if a.balance != nil {
+		balance = money(a.balance.BalanceUSDNanos) + " left"
+	}
+	return []item{
+		{group: "BARAD", label: "Usage", value: balance, run: func(a *app) tea.Cmd { a.screen = screenUsage; return a.loadUsage() }},
+		{group: "BARAD", label: "Settings", sub: func(a *app) *menu { return a.settingsMenu() }},
+		{group: "BARAD", label: "Quit", key: "q", run: func(a *app) tea.Cmd { return tea.Quit }},
+	}
+}
+
+// settingsMenu is Barad's own settings: how it looks here, the provider
+// connections sessions use, and the account.
+func (a *app) settingsMenu() *menu {
+	mn := &menu{title: "Settings", reload: func(a *app) *menu { return a.settingsMenu() }}
+	mn.items = append(mn.items, item{group: "APPEARANCE", label: "Theme", value: a.prefs.Theme, stay: true, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }})
+	for _, p := range a.providers {
+		state := "ready"
+		if !p.Ready {
+			state = "needs sign-in"
+		}
+		mn.items = append(mn.items, item{group: "PROVIDERS", label: p.Name, value: providerName(string(p.ProviderType)) + "  ·  " + state})
+	}
+	if len(a.providers) == 0 {
+		mn.items = append(mn.items, item{group: "PROVIDERS", label: "No provider is connected"})
+	}
+	release := a.version
+	switch {
+	case update.Newer(a.prefs.Latest, a.version):
+		release += "  ·  " + a.prefs.Latest + " is out: barad update"
+	case update.Released(a.version):
+		release += "  ·  the newest"
+	}
+	mn.items = append(mn.items,
+		item{group: "ACCOUNT", label: "Signed in as", value: a.api.Email()},
+		item{group: "ACCOUNT", label: "barad", value: release},
+		item{group: "ACCOUNT", label: "Sign out", danger: true, ask: "Sign out of Barad on this computer? Your sessions keep running.", run: func(a *app) tea.Cmd {
+			return func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				return signOutMsg{a.api.SignOut(ctx)}
+			}
+		}},
+	)
+	return mn
+}
+
+func (a *app) chatMenu() *menu {
+	c := a.conv
+	s := c.session
+	var items []item
+	// What needs you now.
+	if s.CurrentTurnID != "" {
+		items = append(items, item{label: "Stop the agent", key: "ctrl+x", run: func(a *app) tea.Cmd { return a.cancelTurn() }})
+	}
+	if view, ok := c.openProposal(); ok {
+		items = append(items,
+			item{label: "Approve: " + view.Proposal.Title, run: func(a *app) tea.Cmd {
+				s := a.conv.session
+				return call(func(ctx context.Context) (*wire.SessionProposalDecision, error) {
+					return a.api.ApproveProposal(ctx, s, view)
+				},
+					func(d *wire.SessionProposalDecision, err error) tea.Msg {
+						if err != nil {
+							return doneMsg{say: "Could not approve", err: err}
+						}
+						return doneMsg{say: "Approved — the new session is starting", relist: true, open: d.DestinationID}
+					})
+			}},
+			item{label: "Dismiss the proposal", run: func(a *app) tea.Cmd {
+				id := a.conv.id
+				return call(func(ctx context.Context) (struct{}, error) {
+					return struct{}{}, a.api.DismissProposal(ctx, id, view.Sequence)
+				},
+					func(_ struct{}, err error) tea.Msg { return doneMsg{say: "Dismissed", err: err, resync: true} })
+			}})
+	}
+	if s.MachineStatus == wire.MachineStatusDehydrated && !s.PendingTurn {
+		items = append(items, item{label: "Wake its computer", run: func(a *app) tea.Cmd { return a.wake() }})
+	}
+
+	conversation := "THIS CONVERSATION"
+	if reply := c.lastReply(); reply != "" {
+		items = append(items, item{group: conversation, label: "Copy the last reply", run: func(a *app) tea.Cmd {
+			a.say("Copied the last reply")
+			return tea.SetClipboard(reply)
+		}})
+	}
+	items = append(items,
+		item{group: conversation, label: "Images", value: fmt.Sprint(len(c.pictures())), run: func(a *app) tea.Cmd { return a.openImages() }},
+		item{group: conversation, label: "Steps", value: a.prefs.Work.String(), key: "tab", run: func(a *app) tea.Cmd { a.prefs.Work = (a.prefs.Work + 1) % 3; a.savePrefs(); return nil }},
+		item{group: conversation, label: "Attach an image", key: "ctrl+v", run: func(a *app) tea.Cmd {
+			return func() tea.Msg { data, err := clipboardImage(); return clipboardMsg{data, err} }
+		}},
+		item{group: conversation, label: "Share a read-only link", run: func(a *app) tea.Cmd {
+			id := a.conv.id
+			return call(func(ctx context.Context) (*api.Share, error) { return a.api.Share(ctx, id, randomID("share_", 12)) },
+				func(sh *api.Share, err error) tea.Msg { return sharedMsg{sh, err} })
+		}},
+	)
+	items = append(items, a.sessionItems()...)
+	items = append(items, item{group: "BARAD", label: "Back to sessions", key: "esc", run: func(a *app) tea.Cmd { a.screen, a.sel = screenHome, a.conv.id; return nil }})
+	return &menu{title: sessionName(s), items: append(items, a.baradItems()...)}
+}
+
+// sessionItems are the open session's settings, under its name.
+func (a *app) sessionItems() []item {
+	s := a.conv.session
+	group := "SESSION  ·  " + sessionName(s)
+	items := []item{
+		{group: group, label: "Rename", sub: func(a *app) *menu {
+			e := &Editor{}
+			e.Insert(sessionName(a.conv.session))
+			return &menu{title: "Rename", edit: e, submit: func(a *app, name string) tea.Cmd {
+				st := api.SettingsOf(a.conv.session)
+				st.Name = name
+				return a.updateSettings(st, "Renamed")
+			}}
+		}},
+		{group: group, label: "Model", value: s.Model, sub: func(a *app) *menu { return a.modelMenu() }},
+	}
+	if efforts := a.efforts(s.ProviderResourceID, s.Model, s.SupportedReasoningEfforts); len(efforts) > 0 {
+		items = append(items, item{group: group, label: "Reasoning effort", value: effortLabel(s.ReasoningEffort), sub: func(a *app) *menu { return a.effortMenu() }})
+	}
+	if usesFastMode(s) {
+		value := "off"
+		if s.FastMode {
+			value = "on"
+		}
+		items = append(items, item{group: group, label: "Fast mode", value: value, run: func(a *app) tea.Cmd {
+			st := api.SettingsOf(a.conv.session)
+			st.FastMode = !st.FastMode
+			say := "Fast mode off"
+			if st.FastMode {
+				say = "Fast mode on: faster replies, at more usage or API cost"
+			}
+			return a.updateSettings(st, say)
+		}})
+	}
+	repos := "none"
+	if r := a.sessionRepos[s.SessionID]; len(r) > 0 {
+		repos = fmt.Sprint(len(r))
+	}
+	items = append(items,
+		item{group: group, label: "Project", value: a.projectName(projectOf(s)), sub: func(a *app) *menu {
+			return a.projectMenu(projectOf(a.conv.session), func(a *app, id string) tea.Cmd { return a.moveSession(id) })
+		}},
+		item{group: group, label: "Repositories", value: repos, sub: func(a *app) *menu { return a.repositoriesMenu() }},
+		item{group: group, label: "Details", sub: func(a *app) *menu { return a.detailsMenu() }},
+		item{group: group, label: "Archive", danger: true, ask: "Archive erases this session's workspace and its published pages. The conversation stays. You cannot undo this.",
+			run: func(a *app) tea.Cmd {
+				id := a.conv.id
+				a.screen, a.conv = screenHome, nil
+				return call(func(ctx context.Context) (*wire.Session, error) { return a.api.Archive(ctx, id) },
+					func(_ *wire.Session, err error) tea.Msg { return doneMsg{say: "Archived", err: err, relist: true} })
+			}},
+		item{group: group, label: "Delete", danger: true, ask: "Delete permanently removes the session, its transcript and its workspace. You cannot undo this.",
+			run: func(a *app) tea.Cmd {
+				id := a.conv.id
+				a.screen, a.conv = screenHome, nil
+				return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.DeleteSession(ctx, id) },
+					func(_ struct{}, err error) tea.Msg {
+						return doneMsg{say: "Deleting the session", err: err, relist: true}
+					})
+			}},
+	)
+	return items
+}
+
+// usesFastMode reports whether a session's provider has a fast mode, as the
+// web app decides it.
+func usesFastMode(s wire.Session) bool {
+	switch s.Provider {
+	case "xai", "grok", "claude":
+		return false
+	}
+	return true
+}
+
+func (a *app) wake() tea.Cmd {
+	id := a.conv.id
+	return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.Wake(ctx, id) },
+		func(_ struct{}, err error) tea.Msg {
+			return doneMsg{say: "Waking", err: err, resync: true, relist: true}
+		})
+}
+
+func (a *app) moveSession(projectID string) tea.Cmd {
+	id := a.conv.id
+	if projectID == projectOf(a.conv.session) {
+		return nil
+	}
+	return call(func(ctx context.Context) (*wire.Session, error) { return a.api.MoveSession(ctx, id, projectID) },
+		func(s *wire.Session, err error) tea.Msg {
+			return doneMsg{say: "Moved to " + a.projectName(projectID), err: err, session: s, relist: true}
+		})
+}
+
+// repositoriesMenu is the repositories your Git sources reach, those the
+// session's Git credentials reach checked. Choosing one gives or takes away
+// that access; the workspace's files are never touched.
+func (a *app) repositoriesMenu() *menu {
+	id := a.conv.id
+	mn := &menu{title: "Repositories", reload: func(a *app) *menu { return a.repositoriesMenu() },
+		hint: "Gives the session's Git credentials access. The workspace's files stay as they are."}
+	attached := map[string]wire.SessionGitRepository{}
+	for _, r := range a.sessionRepos[id] {
+		attached[r.GitSourceResourceID+"\n"+strings.ToLower(r.CanonicalPath)] = r
+	}
+	if a.repos == nil {
+		mn.hint = "Loading repositories…"
+		return mn
+	}
+	for _, r := range a.repos {
+		have, ok := attached[r.SourceID+"\n"+strings.ToLower(r.FullName)]
+		if ok {
+			mn.items = append(mn.items, item{label: r.FullName, check: true, danger: true, action: "Take away access",
+				ask: "Take away " + r.FullName + "? The session's Git credentials stop reaching it; its clone in the workspace stays.",
+				run: func(a *app) tea.Cmd {
+					return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.RemoveRepository(ctx, id, have) },
+						func(_ struct{}, err error) tea.Msg {
+							return reposChangedMsg{id, "Took away " + have.CanonicalPath, err}
+						})
+				}})
+			continue
+		}
+		mn.items = append(mn.items, item{label: r.FullName, value: r.DefaultBranch, run: func(a *app) tea.Cmd {
+			return call(func(ctx context.Context) (struct{}, error) {
+				return struct{}{}, a.api.AddRepository(ctx, id, r.SourceID, r.FullName)
+			},
+				func(_ struct{}, err error) tea.Msg { return reposChangedMsg{id, "Gave access to " + r.FullName, err} })
+		}})
+	}
+	if len(a.repos) == 0 {
+		mn.hint = "No repository is reachable. Connect a Git source on the web, under Settings › Source control."
+	}
+	return mn
+}
+
+// reposChangedMsg ends giving or taking away a repository.
+type reposChangedMsg struct {
+	id, say string
+	err     error
+}
+
+// openChatMenu opens the session's menu, fetching what its submenus list
+// if it has not been fetched: your repositories and the agent's
+// instruction files.
+func (a *app) openChatMenu() tea.Cmd {
+	a.menu = a.chatMenu()
+	var cmds []tea.Cmd
+	if a.repos == nil {
+		cmds = append(cmds, call(a.api.Repositories, func(r []api.Repository, err error) tea.Msg { return reposMsg{r, err} }))
+	}
+	if id := a.conv.id; a.instructions[id] == nil {
+		cmds = append(cmds, call(func(ctx context.Context) (*wire.WorkspaceInstructions, error) {
+			return a.api.WorkspaceInstructions(ctx, id)
+		},
+			func(w *wire.WorkspaceInstructions, err error) tea.Msg { return instructionsMsg{id, w, err} }))
+	}
+	return tea.Batch(cmds...)
+}
+
+// instructionsMsg brings a session's instruction files.
+type instructionsMsg struct {
+	id  string
+	w   *wire.WorkspaceInstructions
+	err error
+}
+
+// detailsMenu is what the web app's technical details show, and the
+// instruction files the agent reads.
+func (a *app) detailsMenu() *menu {
+	s := a.conv.session
+	mn := &menu{title: "Details", reload: func(a *app) *menu { return a.detailsMenu() }}
+	add := func(group, label, value string, run func(a *app) tea.Cmd) {
+		mn.items = append(mn.items, item{group: group, label: label, value: value, run: run})
+	}
+	add("SESSION", "Provider", a.providerOf(s.ProviderResourceID).Name, nil)
+	add("SESSION", "Model", modelName(s), nil)
+	add("SESSION", "Status", string(s.MachineStatus), nil)
+	add("SESSION", "Session ID", s.SessionID, func(a *app) tea.Cmd { a.say("Copied the session ID"); return tea.SetClipboard(s.SessionID) })
+	add("SESSION", "Created", clock(s.CreatedAt, a.now), nil)
+	add("SESSION", "Last activity", clock(a.lastActive(), a.now), nil)
+	ins := a.instructions[s.SessionID]
+	switch {
+	case ins == nil:
+		add("AGENT INSTRUCTIONS", "Loading…", "", nil)
+	case len(ins.Loaded) == 0 && ins.ScannedAt.IsZero():
+		add("AGENT INSTRUCTIONS", "Read when the workspace is first set up", "", nil)
+	case len(ins.Loaded) == 0:
+		add("AGENT INSTRUCTIONS", "None found", "", nil)
+	}
+	if ins != nil {
+		for _, f := range ins.Loaded {
+			size := fmt.Sprintf("%.1f KB", float64(f.LoadedBytes)/1024)
+			if f.LoadedBytes < f.SourceBytes {
+				size += fmt.Sprintf(" of %.1f KB", float64(f.SourceBytes)/1024)
+			}
+			add("AGENT INSTRUCTIONS", f.Path, size, nil)
+		}
+		if n := len(ins.Discovered) - len(ins.Loaded); n > 0 {
+			add("AGENT INSTRUCTIONS", fmt.Sprintf("%d more found, not read", n), "", nil)
+		}
+	}
+	return mn
+}

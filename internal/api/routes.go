@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -359,18 +360,45 @@ func (c *Client) Share(ctx context.Context, sessionID, requestID string) (*Share
 }
 
 // SessionRepositories names the repositories a session can reach (owner/name).
-func (c *Client) SessionRepositories(ctx context.Context, sessionID string) ([]string, error) {
+func (c *Client) SessionRepositories(ctx context.Context, sessionID string) ([]wire.SessionGitRepository, error) {
 	var out struct {
 		Repositories []wire.SessionGitRepository `json:"repositories"`
 	}
-	if err := c.Do(ctx, http.MethodGet, "/sessions/"+escape(sessionID)+"/repositories", nil, &out); err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(out.Repositories))
-	for _, r := range out.Repositories {
-		names = append(names, r.CanonicalPath)
-	}
-	return names, nil
+	err := c.Do(ctx, http.MethodGet, "/sessions/"+escape(sessionID)+"/repositories", nil, &out)
+	return out.Repositories, err
+}
+
+// AddRepository gives a session's Git credentials access to a repository of
+// one of your Git sources. The workspace's files are not touched.
+func (c *Client) AddRepository(ctx context.Context, sessionID, sourceID, repository string) error {
+	return c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/repositories", map[string]string{"source_id": sourceID, "repository": repository}, nil)
+}
+
+// RemoveRepository takes that access away. A clone in the workspace stays.
+func (c *Client) RemoveRepository(ctx context.Context, sessionID string, r wire.SessionGitRepository) error {
+	q := url.Values{"host": {r.Host}, "repository": {r.CanonicalPath}}
+	return c.Do(ctx, http.MethodDelete, "/sessions/"+escape(sessionID)+"/repositories?"+q.Encode(), nil, nil)
+}
+
+// MoveSession lists a session under another project, whose variables it
+// then receives.
+func (c *Client) MoveSession(ctx context.Context, sessionID, projectID string) (*wire.Session, error) {
+	var out wire.Session
+	err := c.Do(ctx, http.MethodPut, "/sessions/"+escape(sessionID)+"/project", map[string]string{"project_id": projectID}, &out)
+	return &out, err
+}
+
+// DeleteSession asks for a session, its transcript and its workspace to be
+// removed for good.
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	return c.Do(ctx, http.MethodDelete, "/sessions/"+escape(sessionID), nil, nil)
+}
+
+// WorkspaceInstructions are the instruction files the session's agent reads.
+func (c *Client) WorkspaceInstructions(ctx context.Context, sessionID string) (*wire.WorkspaceInstructions, error) {
+	var out wire.WorkspaceInstructions
+	err := c.Do(ctx, http.MethodGet, "/sessions/"+escape(sessionID)+"/workspace-instructions", nil, &out)
+	return &out, err
 }
 
 // WorkspaceUsage is the account's computer time over the last days, by local day.

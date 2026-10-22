@@ -270,7 +270,7 @@ func TestMenuRenamesChangesModelAndArchives(t *testing.T) {
 	d.sees("✻ claude-sonnet-5  ·  high")
 
 	d.keys("?", "archive", "enter")
-	d.sees("Archive?", "erases this session's computer")
+	d.sees("Archive?", "erases this session's workspace")
 	d.keys("enter")
 	if d.fake("ses_checkout").ArchivedAt.IsZero() {
 		t.Fatal("the session was not archived")
@@ -648,4 +648,87 @@ func TestHomeMentionsANewerRelease(t *testing.T) {
 	}
 	d.a.version = "v0.5.0"
 	d.misses("is out")
+}
+
+func TestTheMenuGroupsBySubjectAndChangesRepositories(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	d.keys("?")
+	d.sees("THIS CONVERSATION", "Copy the last reply", "SESSION  ·  Fix the flaky checkout test", "Rename", "Repositories", "1",
+		"Details", "Delete", "BARAD", "Usage", "Settings", "Back to sessions")
+
+	// Repositories: acme/web is reached; give acme/api, take acme/web away.
+	d.keys("repositories", "enter")
+	d.sees("Gives the session's Git credentials access", "✓ acme/web", "acme/api")
+	d.keys("acme/api", "enter")
+	if got := d.f.find("ses_checkout").repos; !slices.Equal(got, []string{"acme/web", "acme/api"}) {
+		t.Fatalf("repositories = %v", got)
+	}
+	d.sees("Gave access to acme/api", "repo  acme/web, acme/api")
+	d.keys("?", "repositories", "enter", "acme/web", "enter")
+	d.sees("Take away access", "its clone in the workspace stays")
+	d.keys("enter")
+	if got := d.f.find("ses_checkout").repos; !slices.Equal(got, []string{"acme/api"}) {
+		t.Fatalf("repositories = %v", got)
+	}
+
+	// Details: the session's facts, and the instruction files its agent reads.
+	d.keys("?", "details", "enter")
+	d.sees("Session ID", "ses_checkout", "AGENT INSTRUCTIONS", "AGENTS.md", "2.0 KB", "1 more found, not read")
+	d.keys("esc", "esc")
+
+	// Project: the session moves.
+	d.keys("?", "project", "enter")
+	d.sees("Default", "Acme", "Ops")
+	d.keys("ops", "enter")
+	if got := d.f.find("ses_checkout").s.ProjectID; got != "proj_ops" {
+		t.Fatalf("project = %q", got)
+	}
+	d.sees("Moved to Ops")
+}
+
+func TestFastModeAndDeleteFromTheSessionMenu(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("payments")
+	d.keys("?", "fast", "enter")
+	if !d.f.find("ses_sdk").s.FastMode {
+		t.Fatal("fast mode is off")
+	}
+	d.sees("Fast mode on")
+	d.keys("?", "delete", "enter")
+	d.sees("Delete?", "permanently removes the session")
+	d.keys("enter")
+	if d.f.find("ses_sdk").s.MachineStatus != wire.MachineStatusDeleting {
+		t.Fatal("the session was not deleted")
+	}
+	d.misses("Upgrade the payments SDK")
+}
+
+func TestSettingsListTheProvidersAndTheAccount(t *testing.T) {
+	d := newDriver(t)
+	d.keys("?", "settings", "enter")
+	d.sees("APPEARANCE", "Theme", "night", "PROVIDERS", "Claude Max", "ACCOUNT", "Signed in as", "you@example.com", "Sign out")
+	d.keys("theme", "enter")
+	d.sees("paper")
+}
+
+// Every cell of a frame carries the theme's colours itself, so a terminal
+// that keeps its own default background (Rex) still shows the paper theme.
+func TestEveryCellIsPaintedInTheTheme(t *testing.T) {
+	d := newDriver(t)
+	d.a.toggleTheme()
+	for _, open := range []string{"", "checkout"} {
+		if open != "" {
+			d.openSession(open)
+		}
+		d.screen()
+		grid := d.a.grid(d.a.View().Content)
+		for y := range d.a.h {
+			for x := range d.a.w {
+				if c := grid.CellAt(x, y); c != nil && c.Width > 0 && (c.Style.Bg == nil || c.Style.Fg == nil) {
+					t.Fatalf("%q: the cell at %d,%d (%q) keeps the terminal's colours", open, x, y, c.Content)
+				}
+			}
+		}
+	}
 }

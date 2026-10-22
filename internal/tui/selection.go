@@ -133,27 +133,37 @@ func (a *app) mouse(msg tea.MouseMsg) tea.Cmd {
 	return nil
 }
 
-// highlight paints the selection over a frame.
-func (a *app) highlight(content string) string {
+// canvas paints the frame's cells: whatever the frame left unstyled takes
+// the theme's canvas and ink, and the selection goes over the rest. The view
+// also asks the terminal for those colours as its defaults (OSC 10 and 11),
+// but a terminal that ignores the request (Rex does) would otherwise keep its
+// own background under the paper theme's dark ink.
+func (a *app) canvas(content string) string {
 	grid := a.grid(content)
-	x0, y0, x1, y1 := a.span.ordered()
-	for y := y0; y <= y1 && y < a.h; y++ {
-		from, to := 0, a.w-1
-		if y == y0 {
-			from = x0
-		}
-		if y == y1 {
-			to = x1
-		}
-		for x := from; x <= to && x < a.w; x++ {
+	var sel span
+	if a.span != nil {
+		sel = *a.span
+	}
+	x0, y0, x1, y1 := sel.ordered()
+	for y := range a.h {
+		for x := range a.w {
 			c := grid.CellAt(x, y)
-			if c == nil {
+			if c == nil || c.Width == 0 { // past the edge, or the right half of a wide character
 				continue
 			}
-			if strings.ContainsAny(c.Content, "▄▀▐▌") { // a surface's edge: the whole cell is selected
-				c.Content = " "
+			if a.span != nil && (y > y0 || y == y0 && x >= x0) && (y < y1 || y == y1 && x <= x1) {
+				if strings.ContainsAny(c.Content, "▄▀▐▌") { // a surface's edge: the whole cell is selected
+					c.Content = " "
+				}
+				c.Style.Fg, c.Style.Bg = Text, Selection
+				continue
 			}
-			c.Style.Fg, c.Style.Bg = Text, Selection
+			if c.Style.Bg == nil {
+				c.Style.Bg = Canvas
+			}
+			if c.Style.Fg == nil {
+				c.Style.Fg = Text
+			}
 		}
 	}
 	return grid.Render()

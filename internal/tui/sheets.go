@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"fmt"
 	"image/color"
 	"slices"
 	"strings"
@@ -17,13 +16,17 @@ import (
 
 // ---------------------------------------------------------------- the menu
 //
-// One menu holds every rare thing: settings with their current values, the
-// other screens, and actions. Type to filter, Enter to choose, Esc to go
-// back. A menu can instead hold one text field (Rename).
+// One menu holds every rare thing, in groups: what needs you now, the
+// conversation, the session's settings under its name, and Barad's own
+// settings. Type to filter, Enter to choose, Esc to go back. A menu can
+// instead hold one text field (Rename).
 
 type item struct {
+	group             string // the heading it sits under; items of a group are listed together
 	label, value, key string
 	danger, check     bool
+	ask, action       string // what a dangerous item asks before it acts, and its button (the label when empty)
+	stay              bool   // the menu stays open after it runs (a setting you toggle)
 	run               func(a *app) tea.Cmd
 	sub               func(a *app) *menu
 }
@@ -34,8 +37,7 @@ type menu struct {
 	sel     int
 	q       Editor
 	parent  *menu
-	confirm *item  // an item that asks before it acts
-	ask     string // what the confirmation says
+	confirm *item  // a dangerous item, asking before it acts
 	hint    string // a line above the items: what is loading, or why there is nothing
 	edit    *Editor
 	submit  func(a *app, text string) tea.Cmd
@@ -123,6 +125,10 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 			a.showMenu(sub)
 		case it.danger:
 			mn.confirm = &it
+		case it.run != nil && it.stay:
+			cmd := it.run(a)
+			a.reloadMenu()
+			return cmd
 		case it.run != nil:
 			a.menu = nil
 			return it.run(a)
@@ -134,41 +140,13 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 	return nil
 }
 
-func (a *app) homeMenu() *menu {
-	balance := ""
-	if a.balance != nil {
-		balance = money(a.balance.BalanceUSDNanos) + " left"
-	}
-	return &menu{title: "Barad", items: []item{
-		{label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
-		{label: "Search sessions", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
-		{label: "Project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
-			return a.projectMenu(func(a *app, id string) { a.prefs.Project = id; a.sel = ""; a.savePrefs() })
-		}},
-		{label: "Usage", value: balance, run: func(a *app) tea.Cmd { a.screen = screenUsage; return a.loadUsage() }},
-		{label: "Theme", value: a.prefs.Theme, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }},
-		{label: "Sign out", danger: true, run: func(a *app) tea.Cmd {
-			return func() tea.Msg {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				return signOutMsg{a.api.SignOut(ctx)}
-			}
-		}},
-		{label: "Quit", key: "q", run: func(a *app) tea.Cmd { return tea.Quit }},
-	}, ask: "Sign out of Barad on this computer? Your sessions keep running."}
-}
-
 type signOutMsg struct{ err error }
 
-// projectMenu lists the projects; choosing one calls pick.
-func (a *app) projectMenu(pick func(a *app, id string)) *menu {
+// projectMenu lists the projects, cur checked; choosing one calls pick.
+func (a *app) projectMenu(cur string, pick func(a *app, id string) tea.Cmd) *menu {
 	projects := a.projects
 	if !slices.ContainsFunc(projects, func(p wire.Project) bool { return p.ProjectID == wire.DefaultProjectID }) {
 		projects = append([]wire.Project{{ProjectID: wire.DefaultProjectID, Name: wire.DefaultProjectName}}, projects...)
-	}
-	cur := a.projectID()
-	if a.start != nil {
-		cur = a.start.project
 	}
 	var items []item
 	for _, p := range projects {
@@ -176,90 +154,9 @@ func (a *app) projectMenu(pick func(a *app, id string)) *menu {
 			continue
 		}
 		id, name := p.ProjectID, p.Name
-		items = append(items, item{label: name, check: id == cur, run: func(a *app) tea.Cmd { pick(a, id); return nil }})
+		items = append(items, item{label: name, check: id == cur, run: func(a *app) tea.Cmd { return pick(a, id) }})
 	}
 	return &menu{title: "Project", items: items}
-}
-
-func (a *app) chatMenu() *menu {
-	c := a.conv
-	s := c.session
-	var items []item
-	if s.CurrentTurnID != "" {
-		items = append(items, item{label: "Stop the agent", key: "ctrl+x", run: func(a *app) tea.Cmd { return a.cancelTurn() }})
-	}
-	if view, ok := c.openProposal(); ok {
-		items = append(items,
-			item{label: "Approve: " + view.Proposal.Title, run: func(a *app) tea.Cmd {
-				s := a.conv.session
-				return call(func(ctx context.Context) (*wire.SessionProposalDecision, error) {
-					return a.api.ApproveProposal(ctx, s, view)
-				},
-					func(d *wire.SessionProposalDecision, err error) tea.Msg {
-						if err != nil {
-							return doneMsg{say: "Could not approve", err: err}
-						}
-						return doneMsg{say: "Approved — the new session is starting", relist: true, open: d.DestinationID}
-					})
-			}},
-			item{label: "Dismiss the proposal", run: func(a *app) tea.Cmd {
-				id := a.conv.id
-				return call(func(ctx context.Context) (struct{}, error) {
-					return struct{}{}, a.api.DismissProposal(ctx, id, view.Sequence)
-				},
-					func(_ struct{}, err error) tea.Msg { return doneMsg{say: "Dismissed", err: err, resync: true} })
-			}})
-	}
-	if s.MachineStatus == wire.MachineStatusDehydrated && !s.PendingTurn {
-		items = append(items, item{label: "Wake its computer", run: func(a *app) tea.Cmd {
-			id := a.conv.id
-			return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.Wake(ctx, id) },
-				func(_ struct{}, err error) tea.Msg {
-					return doneMsg{say: "Waking", err: err, resync: true, relist: true}
-				})
-		}})
-	}
-	items = append(items, item{label: "Model", value: s.Model, sub: func(a *app) *menu { return a.modelMenu() }})
-	if efforts := a.efforts(s.ProviderResourceID, s.Model, s.SupportedReasoningEfforts); len(efforts) > 0 {
-		items = append(items, item{label: "Reasoning effort", value: effortLabel(s.ReasoningEffort), sub: func(a *app) *menu { return a.effortMenu() }})
-	}
-	if reply := c.lastReply(); reply != "" {
-		items = append(items, item{label: "Copy the last reply", run: func(a *app) tea.Cmd {
-			a.say("Copied the last reply")
-			return tea.SetClipboard(reply)
-		}})
-	}
-	pics := len(c.pictures())
-	items = append(items,
-		item{label: "Images", value: fmt.Sprint(pics), run: func(a *app) tea.Cmd { return a.openImages() }},
-		item{label: "Steps", value: a.prefs.Work.String(), key: "tab", run: func(a *app) tea.Cmd { a.prefs.Work = (a.prefs.Work + 1) % 3; a.savePrefs(); return nil }},
-		item{label: "Attach an image", key: "ctrl+v", run: func(a *app) tea.Cmd {
-			return func() tea.Msg { data, err := clipboardImage(); return clipboardMsg{data, err} }
-		}},
-		item{label: "Share a read-only link", run: func(a *app) tea.Cmd {
-			id := a.conv.id
-			return call(func(ctx context.Context) (*api.Share, error) { return a.api.Share(ctx, id, randomID("share_", 12)) },
-				func(sh *api.Share, err error) tea.Msg { return sharedMsg{sh, err} })
-		}},
-		item{label: "Rename", sub: func(a *app) *menu {
-			e := &Editor{}
-			e.Insert(sessionName(a.conv.session))
-			return &menu{title: "Rename", edit: e, submit: func(a *app, name string) tea.Cmd {
-				st := api.SettingsOf(a.conv.session)
-				st.Name = name
-				return a.updateSettings(st, "Renamed")
-			}}
-		}},
-		item{label: "Theme", value: a.prefs.Theme, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }},
-		item{label: "Back to sessions", key: "esc", run: func(a *app) tea.Cmd { a.screen, a.sel = screenHome, a.conv.id; return nil }},
-		item{label: "Archive", danger: true, run: func(a *app) tea.Cmd {
-			id := a.conv.id
-			a.screen, a.conv = screenHome, nil
-			return call(func(ctx context.Context) (*wire.Session, error) { return a.api.Archive(ctx, id) },
-				func(_ *wire.Session, err error) tea.Msg { return doneMsg{say: "Archived", err: err, relist: true} })
-		}},
-	)
-	return &menu{title: sessionName(s), items: items, ask: "Archive erases this session's computer for good. The conversation stays readable on the web."}
 }
 
 type sharedMsg struct {
@@ -363,10 +260,10 @@ func (a *app) menuView() string {
 	quiet := Fg(lands[a.prefs.Theme].quiet)
 	var lines []Line
 	if mn.confirm != nil {
-		lines = append(lines, Wrap([]Seg{S(mn.ask, SSec)}, inner)...)
+		lines = append(lines, Wrap([]Seg{S(mn.confirm.ask, SSec)}, inner)...)
 		onDanger := map[string]color.Color{"night": Canvas, "paper": Raised}[a.prefs.Theme]
-		lines = append(lines, Line{}, append(append(button("enter", mn.confirm.label, onDanger, Danger), gap(2)), button("esc", "Cancel", Text, Muted)...))
-		title := Line{S("✕  ", Fg(groundDanger)), S(mn.confirm.label+"?", Fg(groundText).Bold(true))}
+		lines = append(lines, Line{}, append(append(button("enter", confirmAction(*mn.confirm), onDanger, Danger), gap(2)), button("esc", "Cancel", Text, Muted)...))
+		title := Line{S("✕  ", Fg(groundDanger)), S(confirmAction(*mn.confirm)+"?", Fg(groundText).Bold(true))}
 		return sheet(a.prefs.Theme, title, Line{S("esc", quiet)}, lines, w, hex("#5a1f33"))
 	}
 	if mn.edit != nil {
@@ -381,23 +278,55 @@ func (a *app) menuView() string {
 		lines = append(lines, Line{gap(3), S(mn.hint, SMuted)})
 	}
 	vis := mn.visible()
-	// a long list scrolls, keeping the selection in view
-	const most = 14
-	first := min(max(0, mn.sel-most/2), max(0, len(vis)-most))
-	for i := first; i < min(len(vis), first+most); i++ {
-		it := vis[i]
+	// The items, each group under its heading. A long list scrolls, keeping
+	// the selection in view.
+	type row struct {
+		head string
+		i    int // the item; -1 for a heading or the space before one
+	}
+	var rows []row
+	group, selRow := "", 0
+	for i, it := range vis {
+		if it.group != group || i == 0 {
+			if it.group != "" {
+				if len(rows) > 0 {
+					rows = append(rows, row{i: -1})
+				}
+				rows = append(rows, row{head: it.group, i: -1})
+			}
+			group = it.group
+		}
+		if i == mn.sel {
+			selRow = len(rows)
+		}
+		rows = append(rows, row{i: i})
+	}
+	most := max(8, a.h-a.h/6-14) // as many rows as fit under the sheet's top
+	first := min(max(0, selRow-most/2), max(0, len(rows)-most))
+	for _, r := range rows[first:min(len(rows), first+most)] {
+		if r.i < 0 {
+			if r.head != "" {
+				lines = append(lines, Line{gap(3), S(ansi.Truncate(r.head, inner-4, "…"), SFaint.Bold(true))})
+			} else {
+				lines = append(lines, Line{})
+			}
+			continue
+		}
+		it := vis[r.i]
 		st := SText
 		if it.danger {
 			st = SDanger
 		}
-		l := Line{gap(2)}
-		if it.check {
-			l = Line{S("✓ ", SOk)}
+		if r.i == mn.sel {
+			st = st.Bold(true)
 		}
-		l = append(l, S(ansi.Truncate(it.label, inner-30, "…"), st))
+		mark := gap(2)
+		if it.check {
+			mark = S("✓ ", SOk)
+		}
 		right := Line{}
 		if it.value != "" {
-			right = append(right, S(ansi.Truncate(it.value, 24, "…"), SMuted))
+			right = append(right, S(ansi.Truncate(it.value, 28, "…"), SMuted))
 		}
 		if it.key != "" {
 			right = append(right, gap(3), S(it.key, SFaint))
@@ -405,9 +334,8 @@ func (a *app) menuView() string {
 		if it.sub != nil {
 			right = append(right, S(" ›", SMuted))
 		}
-		l = spread(append(Line{gap(1)}, l...), append(right, gap(1)), inner)
-		if i == mn.sel {
-			l[1].Style = l[1].Style.Bold(true)
+		l := spread(Line{gap(1), mark, S(ansi.Truncate(it.label, inner-right.Width()-6, "…"), st)}, append(right, gap(1)), inner)
+		if r.i == mn.sel {
 			l = on(l, Muted)
 			l[0] = S("▍", Fg(Accent).Background(Muted))
 		}
@@ -416,8 +344,8 @@ func (a *app) menuView() string {
 	if len(vis) == 0 && mn.hint == "" {
 		lines = append(lines, Line{gap(3), S("Nothing matches.", SMuted)})
 	}
-	if len(vis) > most {
-		lines = append(lines, Line{gap(3), S(fmt.Sprintf("%d of %d", min(len(vis), first+most), len(vis)), SFaint)})
+	if first+most < len(rows) {
+		lines = append(lines, Line{gap(3), S("↓ more", SFaint)})
 	}
 	return sheet(a.prefs.Theme, Line{S(ansi.Truncate(mn.title, inner-6, "…"), Fg(groundText).Bold(true))}, Line{S("esc", quiet)}, lines, w, nil)
 }
@@ -573,7 +501,7 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		case fieldRepo:
 			a.showMenu(a.repoMenu())
 		case fieldProject:
-			a.showMenu(a.projectMenu(func(a *app, id string) { a.applyProject(id) }))
+			a.showMenu(a.projectMenu(st.project, func(a *app, id string) tea.Cmd { a.applyProject(id); return nil }))
 		}
 		return nil
 	}
@@ -742,4 +670,12 @@ func (a *app) startView() string {
 	}
 	quiet := Fg(lands[a.prefs.Theme].quiet)
 	return sheet(a.prefs.Theme, Line{S("New session", Fg(groundText).Bold(true))}, Line{S(a.projectName(st.project), quiet)}, lines, w, nil)
+}
+
+// confirmAction is what a dangerous item's button says.
+func confirmAction(it item) string {
+	if it.action != "" {
+		return it.action
+	}
+	return it.label
 }

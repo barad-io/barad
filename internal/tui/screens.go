@@ -17,15 +17,11 @@ func (a *app) View() tea.View {
 		return tea.NewView("")
 	}
 	if a.w < 60 || a.h < 16 { // the smallest window every screen and sheet fits in
-		v := tea.NewView(at(Line{S("Make the window a little larger.", SMuted)}))
+		v := tea.NewView(a.canvas(at(Line{S("Make the window a little larger.", SMuted)})))
 		v.AltScreen, v.BackgroundColor, v.ForegroundColor = true, Canvas, Text
 		return v
 	}
-	content := a.compose()
-	if a.span != nil {
-		content = a.highlight(content)
-	}
-	v := tea.NewView(content)
+	v := tea.NewView(a.canvas(a.compose()))
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	v.BackgroundColor, v.ForegroundColor = Canvas, Text

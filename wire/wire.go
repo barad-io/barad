@@ -183,8 +183,30 @@ type MessageAdmission struct {
 	Session *Session `json:"session"`
 }
 
+// SessionGitRepository is a repository a session's Git credentials reach.
 type SessionGitRepository struct {
-	CanonicalPath string `json:"canonical_path"`
+	GitSourceResourceID string `json:"git_source_resource_id"`
+	Host                string `json:"host"`
+	CanonicalPath       string `json:"canonical_path"`
+}
+
+// WorkspaceInstructionFile is an instruction file the agent read, and how
+// much of it.
+type WorkspaceInstructionFile struct {
+	Path        string `json:"path"`
+	LoadedBytes int    `json:"loaded_bytes"`
+	SourceBytes int    `json:"source_bytes"`
+}
+
+// WorkspaceInstructions are the instruction files (AGENTS.md and the like)
+// found when the workspace was set up.
+type WorkspaceInstructions struct {
+	ScannedAt            time.Time                  `json:"scanned_at,omitzero"`
+	Loaded               []WorkspaceInstructionFile `json:"loaded"`
+	Discovered           []string                   `json:"discovered"`
+	DiscoveryTruncated   bool                       `json:"discovery_truncated"`
+	ContentLimitBytes    int                        `json:"content_limit_bytes"`
+	InstructionFileLimit int                        `json:"instruction_file_limit"`
 }
 
 type ProjectAgent struct {

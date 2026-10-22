@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -453,8 +454,25 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 			fs.s.Name = fmt.Sprint(body["name"])
 			fs.s.Model = fmt.Sprint(body["model"])
 			fs.s.ReasoningEffort = wire.ReasoningEffort(fmt.Sprint(body["reasoning_effort"]))
+			fs.s.FastMode = body["fast_mode"] == true
 			fs.s.UpdatedAt = time.Now()
 			reply(200, fs.s)
+		case len(parts) == 2 && r.Method == http.MethodDelete:
+			fs.s.MachineStatus = wire.MachineStatusDeleting
+			reply(202, fs.s)
+		case parts[2] == "project":
+			fs.s.ProjectID = fmt.Sprint(body["project_id"])
+			fs.s.UpdatedAt = time.Now()
+			reply(200, fs.s)
+		case parts[2] == "workspace-instructions":
+			reply(200, wire.WorkspaceInstructions{ScannedAt: fs.s.CreatedAt, Loaded: []wire.WorkspaceInstructionFile{{Path: "AGENTS.md", LoadedBytes: 2048, SourceBytes: 2048}},
+				Discovered: []string{"AGENTS.md", "web/AGENTS.md"}})
+		case parts[2] == "repositories" && r.Method == http.MethodPost:
+			fs.repos = append(fs.repos, fmt.Sprint(body["repository"]))
+			reply(201, map[string]any{})
+		case parts[2] == "repositories" && r.Method == http.MethodDelete:
+			fs.repos = slices.DeleteFunc(fs.repos, func(name string) bool { return name == r.URL.Query().Get("repository") })
+			w.WriteHeader(http.StatusNoContent)
 		case parts[2] == "sync":
 			f.sync(fs, r, reply)
 		case parts[2] == "transcript":
@@ -462,7 +480,7 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		case parts[2] == "repositories":
 			var out []wire.SessionGitRepository
 			for _, name := range fs.repos {
-				out = append(out, wire.SessionGitRepository{CanonicalPath: name})
+				out = append(out, wire.SessionGitRepository{GitSourceResourceID: "src_1", Host: "github.com", CanonicalPath: name})
 			}
 			reply(200, map[string]any{"repositories": out})
 		case parts[2] == "messages":

@@ -87,7 +87,8 @@ type app struct {
 	providers         []wire.ProviderView
 	catalogs          map[string]*api.Models // by provider connection
 	repos             []api.Repository
-	sessionRepos      map[string][]string
+	sessionRepos      map[string][]wire.SessionGitRepository // what each session's Git credentials reach
+	instructions      map[string]*wire.WorkspaceInstructions // each session's agent instruction files
 	usage             *wire.UsageReport
 	workspace         *wire.WorkspaceUsage
 	balance           *api.Balance
@@ -146,7 +147,7 @@ func Run(client *api.Client, version string) error {
 }
 
 func newApp(client *api.Client, g Graphics) *app {
-	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]string{},
+	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]wire.SessionGitRepository{}, instructions: map[string]*wire.WorkspaceInstructions{},
 		reported: map[string]string{}, pics: map[string]*Picture{}, picErr: map[string]string{}, picLoading: map[string]bool{}, md: map[mdKey][]Line{}}
 	a.loadPrefs()
 	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
@@ -245,7 +246,8 @@ type (
 	}
 	sessionReposMsg struct {
 		id    string
-		repos []string
+		repos []wire.SessionGitRepository
+		err   error
 	}
 	pictureMsg struct {
 		key string
@@ -332,6 +334,17 @@ func (a *app) loadAccount() tea.Cmd {
 		providers, err := a.api.Providers(ctx)
 		return accountMsg{projects, providers, err}
 	}
+}
+
+// loadSessionRepos reads which repositories a session's Git credentials reach.
+func (a *app) loadSessionRepos(id string) tea.Cmd {
+	if _, ok := a.sessionRepos[id]; !ok {
+		a.sessionRepos[id] = nil // asked
+	}
+	return call(func(ctx context.Context) ([]wire.SessionGitRepository, error) {
+		return a.api.SessionRepositories(ctx, id)
+	},
+		func(r []wire.SessionGitRepository, err error) tea.Msg { return sessionReposMsg{id, r, err} })
 }
 
 func (a *app) loadCatalog(provider string) tea.Cmd {
@@ -498,8 +511,25 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.repos = msg.repos
 		a.reloadMenu()
+	case reposChangedMsg:
+		if msg.err != nil {
+			return a, a.fail("Could not change the repositories", msg.err)
+		}
+		a.say(msg.say)
+		return a, a.loadSessionRepos(msg.id)
+	case instructionsMsg:
+		if msg.err != nil {
+			return a, a.fail("Could not read the agent's instructions", msg.err)
+		}
+		a.instructions[msg.id] = msg.w
+		a.reloadMenu()
 	case sessionReposMsg:
+		if msg.err != nil {
+			delete(a.sessionRepos, msg.id) // ask again at the next sync
+			return a, nil
+		}
 		a.sessionRepos[msg.id] = msg.repos
+		a.reloadMenu()
 	case syncMsg:
 		return a, a.synced(msg)
 	case olderMsg:
@@ -667,10 +697,7 @@ func (a *app) synced(msg syncMsg) tea.Cmd {
 	a.markReviewed()
 	var cmds []tea.Cmd
 	if _, ok := a.sessionRepos[c.id]; !ok {
-		id := c.id
-		a.sessionRepos[id] = nil
-		cmds = append(cmds, call(func(ctx context.Context) ([]string, error) { return a.api.SessionRepositories(ctx, id) },
-			func(r []string, err error) tea.Msg { return sessionReposMsg{id, r} }))
+		cmds = append(cmds, a.loadSessionRepos(c.id))
 	}
 	if a.cancelRequestedOn != "" && a.cancelRequestedOn != c.session.CurrentTurnID {
 		a.cancelRequestedOn = ""
