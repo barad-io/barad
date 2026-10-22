@@ -8,11 +8,9 @@ package tui
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -22,6 +20,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/prefs"
 	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
@@ -34,30 +33,6 @@ const (
 	screenImages
 	screenUsage
 )
-
-// work is how a finished run shows its tool calls. Like the web app, a run
-// that finishes folds into one row; a working run always shows its steps.
-type work int
-
-const (
-	workFolded work = iota // the run's row alone
-	workShown              // one row per step, each result cut to its telling line
-	workFull               // every result whole
-)
-
-func (w work) String() string { return [...]string{"folded", "shown", "full output"}[w] }
-
-// prefs are what the app remembers between runs, in the config directory.
-type prefs struct {
-	Theme    string            `json:"theme"`
-	Project  string            `json:"project"`
-	Work     work              `json:"work"`
-	Reviewed map[string]string `json:"reviewed"` // session → the newest finished turn you have seen
-	// The newest release, as last looked up (at most daily): the home
-	// screen mentions it while it is newer than the one running.
-	Latest          string    `json:"latest"`
-	LatestCheckedAt time.Time `json:"latest_checked_at"`
-}
 
 // An attachment is a file waiting to go with the next message: an image,
 // or text too long for the message itself.
@@ -75,12 +50,13 @@ type app struct {
 	gfx      Graphics
 	frame    int
 	now      time.Time
-	prefs    prefs
+	prefs    prefs.Prefs
 	exit     error  // why the app quit, when it was not asked to
 	farewell string // what to say when it has quit
 
 	// The account.
 	sessions          []wire.Session // not archived, not being deleted
+	archived          []wire.Session // the conversations whose workspaces are gone
 	listed            bool
 	listing, relist   bool
 	projects          []wire.Project
@@ -91,9 +67,19 @@ type app struct {
 	instructions      map[string]*wire.WorkspaceInstructions // each session's agent instruction files
 	envs              map[string]*wire.EnvironmentView       // variables, by "sessions/ID" or "projects/ID"
 	branches          map[string]*wire.GitBranches           // by source and repository
+	github            *wire.GitHubAccount
+	sources           []wire.AccountResource
+	sourceRepos       map[string][]wire.GitHubRepository // by Git source
+	identity          *wire.GitSettings
+	history           []wire.BillingEntry
+	users             map[string][]wire.ResourceDependency // the sessions using each connection
+	signIn            *signIn                              // a provider sign-in in progress
+	awaiting          *awaitGitHub                         // GitHub, in the browser, finishing a step
+	paying            *wire.BillingAccount                 // the balance before a payment in the browser
+	payUntil          time.Time
 	usage             *wire.UsageReport
 	workspace         *wire.WorkspaceUsage
-	balance           *api.Balance
+	balance           *wire.BillingAccount
 	online            bool
 	reported          map[string]string // OSC 7501 sequences sent, by session
 	pics              map[string]*Picture
@@ -105,6 +91,7 @@ type app struct {
 	toast             string
 	toastBad          bool
 	toastAt           time.Time
+	notice            string               // a desktop notification to send at the next frame
 	md                map[mdKey][]Line     // agent prose, laid out
 	laid              map[laidKey][]string // still exchanges, painted (transcript)
 	cancelRequestedOn string               // the turn you asked to stop
@@ -118,10 +105,12 @@ type app struct {
 	note     string // the last thing the composer has to say about attachments
 	scroll   int    // transcript rows above the bottom
 	filter   *Editor
+	shelf    bool     // the home screen lists the archived sessions
 	start    *starter // the new session sheet
 	menu     *menu
 	imgIdx   int
 	usageTab int   // 0 Barad, 1 inference
+	days     int   // the usage screen's range: 7, 30 or 90 days
 	span     *span // text selected with the mouse
 }
 
@@ -150,14 +139,11 @@ func Run(client *api.Client, version string) error {
 
 func newApp(client *api.Client, g Graphics) *app {
 	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]wire.SessionGitRepository{}, instructions: map[string]*wire.WorkspaceInstructions{},
-		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{},
+		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{}, sourceRepos: map[string][]wire.GitHubRepository{}, users: map[string][]wire.ResourceDependency{},
 		reported: map[string]string{}, pics: map[string]*Picture{}, picErr: map[string]string{}, picLoading: map[string]bool{}, md: map[mdKey][]Line{}}
-	a.loadPrefs()
+	a.prefs = prefs.Load()
 	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
 		a.prefs.Theme = t
-	}
-	if a.prefs.Theme != "paper" {
-		a.prefs.Theme = "night"
 	}
 	applyTheme(a.prefs.Theme)
 	return a
@@ -260,7 +246,7 @@ type (
 	usageMsg struct {
 		report    *wire.UsageReport
 		workspace *wire.WorkspaceUsage
-		balance   *api.Balance
+		balance   *wire.BillingAccount
 		err       error
 	}
 	clipboardMsg struct {
@@ -423,6 +409,10 @@ func (a *app) fetchPictures() tea.Cmd {
 }
 
 func (a *app) loadUsage() tea.Cmd {
+	if a.days == 0 {
+		a.days = 30
+	}
+	days := a.days
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -431,14 +421,14 @@ func (a *app) loadUsage() tea.Cmd {
 			zone = "UTC"
 		}
 		var m usageMsg
-		m.report, m.err = a.api.Usage(ctx, 30, zone)
+		m.report, m.err = a.api.Usage(ctx, days, zone)
 		if m.err != nil {
 			return m
 		}
-		if m.workspace, m.err = a.api.WorkspaceUsage(ctx, 30, zone); m.err != nil {
+		if m.workspace, m.err = a.api.WorkspaceUsage(ctx, days, zone); m.err != nil {
 			return m
 		}
-		m.balance, m.err = a.api.Balance(ctx)
+		m.balance, m.err = a.api.Billing(ctx)
 		return m
 	}
 }
@@ -461,6 +451,10 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{tick(), a.report(), a.drawMast()}
 		if t := Transmissions(); t != "" && a.frame > 2 { // images sent before the alt screen are lost
 			cmds = append(cmds, tea.Raw(t))
+		}
+		if a.notice != "" {
+			cmds = append(cmds, tea.Raw(ansi.Notify(a.notice)))
+			a.notice = ""
 		}
 		return a, tea.Batch(cmds...)
 	case onlineMsg:
@@ -501,6 +495,24 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.projects, a.providers = msg.projects, msg.providers
 		a.reloadMenu()
+	case loadedMsg:
+		if msg.err != nil {
+			return a, a.fail(msg.what, msg.err)
+		}
+		cmd := msg.apply(a)
+		a.reloadMenu()
+		return a, cmd
+	case shellMsg:
+		if msg.err != nil {
+			return a, a.fail("The shell ended", msg.err)
+		}
+		return a, tea.Batch(a.sync(), a.list())
+	case signInMsg:
+		return a, a.signInStep(msg)
+	case githubMsg:
+		return a, a.githubStep(msg)
+	case paidMsg:
+		return a, a.paymentStep(msg)
 	case catalogMsg:
 		if msg.err != nil {
 			return a, a.fail("Could not load models", msg.err)
@@ -608,8 +620,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.attachImage("pasted.png", msg.data)
 	case latestMsg:
 		if msg.err == nil { // offline: ask again next time
-			a.prefs.Latest, a.prefs.LatestCheckedAt = msg.tag, a.now
-			a.savePrefs()
+			a.setPrefs(func(p *prefs.Prefs) { p.Latest, p.LatestCheckedAt = msg.tag, a.now })
 		}
 	case mastMsg:
 		a.mastBusy = false
@@ -643,8 +654,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Batch(cmds...)
 	case projectMadeMsg:
 		a.projects = append(a.projects, *msg.p)
-		a.prefs.Project, a.sel = msg.p.ProjectID, ""
-		a.savePrefs()
+		a.showProject(msg.p.ProjectID)
 		a.say("Made " + msg.p.Name + ": set its agent and repositories in the menu")
 		return a, a.loadAccount()
 	case envMsg:
@@ -743,9 +753,13 @@ func isStatus(err error, status int) bool {
 // setSessions takes a fresh list. The open session keeps whichever copy is
 // newer: the list and a sync can pass each other.
 func (a *app) setSessions(list []wire.Session) {
-	var keep, ended []wire.Session
+	var keep, ended, archived []wire.Session
 	for _, s := range list {
-		if s.MachineStatus == wire.MachineStatusDeleting || !s.ArchivedAt.IsZero() {
+		if s.MachineStatus == wire.MachineStatusDeleting {
+			continue
+		}
+		if !s.ArchivedAt.IsZero() {
+			archived = append(archived, s)
 			continue
 		}
 		if a.conv != nil && s.SessionID == a.conv.id && a.conv.session.UpdatedAt.After(s.UpdatedAt) {
@@ -756,18 +770,13 @@ func (a *app) setSessions(list []wire.Session) {
 		}
 		keep = append(keep, s)
 	}
-	a.sessions = keep
+	a.sessions, a.archived = keep, archived
+	a.prefs.Reviewed = prefs.Load().Reviewed // the commands may have marked some read
 	a.announce(ended)
 	if !a.listed {
 		a.listed = true
 		if a.prefs.Reviewed == nil { // a first run has read everything so far, as the web app assumes
-			a.prefs.Reviewed = map[string]string{}
-			for _, s := range keep {
-				if s.LatestTerminalTurnID != "" {
-					a.prefs.Reviewed[s.SessionID] = s.LatestTerminalTurnID
-				}
-			}
-			a.savePrefs()
+			a.markRead(keep)
 		}
 		if o := a.order(); len(o) > 0 && a.sel == "" {
 			a.sel = o[0].SessionID
@@ -797,8 +806,10 @@ func (a *app) endedUnseen(prev, next wire.Session) bool {
 	return a.listed && !watching && next.LatestTerminalTurnID != "" && next.LatestTerminalTurnID != prev.LatestTerminalTurnID
 }
 
-// announce says briefly, in the footer, that sessions finished a turn.
+// announce says briefly, in the footer, that sessions finished a turn, and
+// unless you silenced it, with a desktop notification (OSC 9).
 func (a *app) announce(ended []wire.Session) {
+	var text string
 	switch len(ended) {
 	case 0:
 		return
@@ -808,15 +819,19 @@ func (a *app) announce(ended []wire.Session) {
 		if word == "" {
 			word = " is done"
 		}
-		a.say(sessionName(s) + word)
-		a.toastBad = s.LatestTerminalTurnStatus == wire.TurnStatusFailed
+		text = sessionName(s) + word
 	default:
-		a.say(fmt.Sprintf("%d sessions finished", len(ended)))
+		text = fmt.Sprintf("%d sessions finished", len(ended))
+	}
+	a.say(text)
+	a.toastBad = len(ended) == 1 && ended[0].LatestTerminalTurnStatus == wire.TurnStatusFailed
+	if !a.prefs.Silent {
+		a.notice = "Barad: " + text
 	}
 }
 
 func (a *app) session(id string) (wire.Session, bool) {
-	for _, s := range a.sessions {
+	for _, s := range append(a.sessions, a.archived...) {
 		if s.SessionID == id {
 			return s, true
 		}
@@ -831,11 +846,7 @@ func (a *app) markReviewed() {
 	}
 	s := a.conv.session
 	if s.LatestTerminalTurnID != "" && a.prefs.Reviewed[s.SessionID] != s.LatestTerminalTurnID {
-		if a.prefs.Reviewed == nil {
-			a.prefs.Reviewed = map[string]string{}
-		}
-		a.prefs.Reviewed[s.SessionID] = s.LatestTerminalTurnID
-		a.savePrefs()
+		a.markRead([]wire.Session{s})
 	}
 }
 
@@ -871,47 +882,13 @@ func (a *app) signedOut() tea.Cmd {
 
 // ---------------------------------------------------------------- derived state
 
-type group int
+var groupLabel = map[api.Group]string{api.NeedsYou: "NEEDS YOU", api.Running: "RUNNING", api.Resting: "RESTING"}
 
-const (
-	groupNeedsYou group = iota // a reply you have not read, a failure
-	groupRunning
-	groupResting
-)
-
-var groupLabel = map[group]string{groupNeedsYou: "NEEDS YOU", groupRunning: "RUNNING", groupResting: "RESTING"}
-
-// standing is a session's state as the web app's sidebar derives it: one
-// word, and the group it files under.
-type standing struct {
-	word  string
-	group group
-}
-
-func (a *app) standing(s wire.Session) standing {
-	held := s.PendingTurn || (a.conv != nil && a.conv.id == s.SessionID && len(a.conv.sending)+len(a.conv.pending) > 0)
-	asleep := s.MachineStatus == wire.MachineStatusDehydrated || s.MachineStatus == wire.MachineStatusDehydrating
-	switch {
-	case s.MachineStatus == wire.MachineStatusBroken:
-		return standing{"failed", groupNeedsYou}
-	case s.CurrentTurnID != "":
-		return standing{"working", groupRunning}
-	case s.MachineStatus == wire.MachineStatusHydrating:
-		return standing{"waking", groupRunning}
-	case s.MachineStatus == wire.MachineStatusDehydrated && s.PendingTurn:
-		return standing{"asleep", groupResting}
-	case held && asleep:
-		return standing{"waking", groupRunning}
-	case held:
-		return standing{"working", groupRunning}
-	case s.LatestTerminalTurnID != "" && s.LatestTerminalTurnStatus == wire.TurnStatusFailed:
-		return standing{"failed", groupNeedsYou}
-	case s.LatestTerminalTurnID != "" && a.prefs.Reviewed[s.SessionID] != s.LatestTerminalTurnID:
-		return standing{"ready", groupNeedsYou}
-	case asleep:
-		return standing{"asleep", groupResting}
-	}
-	return standing{"idle", groupResting}
+// standing is a session's state on the list. A message you are sending
+// holds it as working.
+func (a *app) standing(s wire.Session) api.Standing {
+	held := a.conv != nil && a.conv.id == s.SessionID && len(a.conv.sending)+len(a.conv.pending) > 0
+	return api.StandingOf(s, a.prefs.Reviewed[s.SessionID], held)
 }
 
 // activityAt is when a session last did something you would notice.
@@ -965,20 +942,32 @@ func (a *app) projectName(id string) string {
 
 // order is the home list: the current project's sessions, what needs you
 // first, then what is running, then the rest, each most recent first.
+// order is the sessions the home screen lists: the project's, or with
+// tab the archived ones. A search looks across every project, by name or ID.
 func (a *app) order() []wire.Session {
 	var out []wire.Session
-	project := a.projectID()
-	for _, s := range a.sessions {
-		if projectOf(s) != project {
+	list, project, q := a.sessions, a.projectID(), ""
+	if a.shelf {
+		list = a.archived
+	}
+	if a.filter != nil {
+		q = strings.TrimSpace(a.filter.Value())
+	}
+	for _, s := range list {
+		if q == "" && projectOf(s) != project {
 			continue
 		}
-		if a.filter != nil && !Fuzzy(a.filter.Value(), sessionName(s)) {
+		if q != "" && !Fuzzy(q, sessionName(s)) && !strings.HasPrefix(s.SessionID, q) {
 			continue
 		}
 		out = append(out, s)
 	}
+	if a.shelf {
+		sort.SliceStable(out, func(i, j int) bool { return out[i].ArchivedAt.After(out[j].ArchivedAt) })
+		return out
+	}
 	sort.SliceStable(out, func(i, j int) bool {
-		gi, gj := a.standing(out[i]).group, a.standing(out[j]).group
+		gi, gj := a.standing(out[i]).Group, a.standing(out[j]).Group
 		if gi != gj {
 			return gi < gj
 		}
@@ -991,17 +980,17 @@ func (a *app) order() []wire.Session {
 func (a *app) elsewhere() int {
 	n, project := 0, a.projectID()
 	for _, s := range a.sessions {
-		if projectOf(s) != project && a.standing(s).group == groupNeedsYou {
+		if projectOf(s) != project && a.standing(s).Group == api.NeedsYou {
 			n++
 		}
 	}
 	return n
 }
 
-func (a *app) count(g group) int {
+func (a *app) count(g api.Group) int {
 	n, project := 0, a.projectID()
 	for _, s := range a.sessions {
-		if projectOf(s) == project && a.standing(s).group == g {
+		if projectOf(s) == project && a.standing(s).Group == g {
 			n++
 		}
 	}
@@ -1009,10 +998,10 @@ func (a *app) count(g group) int {
 }
 
 // countAll counts the sessions of every project in a group.
-func (a *app) countAll(g group) int {
+func (a *app) countAll(g api.Group) int {
 	n := 0
 	for _, s := range a.sessions {
-		if a.standing(s).group == g {
+		if a.standing(s).Group == g {
 			n++
 		}
 	}
@@ -1028,43 +1017,41 @@ func sessionName(s wire.Session) string {
 
 // ---------------------------------------------------------------- prefs
 
-func (a *app) prefsPath() string {
-	dir, err := api.ConfigDir()
+// setPrefs changes the preferences as they are on disk (the commands may
+// have changed them since), and keeps the result.
+func (a *app) setPrefs(change func(p *prefs.Prefs)) {
+	next, err := prefs.Update(change)
 	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "prefs.json")
-}
-
-func (a *app) loadPrefs() {
-	if p := a.prefsPath(); p != "" {
-		if data, err := os.ReadFile(p); err == nil {
-			_ = json.Unmarshal(data, &a.prefs)
-		}
-	}
-	if a.prefs.Work < workFolded || a.prefs.Work > workFull {
-		a.prefs.Work = workFolded
-	}
-}
-
-func (a *app) savePrefs() {
-	p := a.prefsPath()
-	if p == "" {
+		change(&a.prefs) // not saved, but in effect while the app runs
 		return
 	}
-	data, _ := json.MarshalIndent(a.prefs, "", "  ")
-	_ = os.MkdirAll(filepath.Dir(p), 0o700)
-	tmp := p + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, p)
+	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
+		next.Theme = a.prefs.Theme
 	}
+	a.prefs = next
+}
+
+// markRead records that you have seen these sessions' newest turns.
+func (a *app) markRead(list []wire.Session) {
+	a.setPrefs(func(p *prefs.Prefs) { p.Read(list) })
+}
+
+// showProject makes the home screen list a project's sessions.
+func (a *app) showProject(id string) {
+	a.setPrefs(func(p *prefs.Prefs) { p.Project = id })
+	a.sel = ""
+}
+
+func (a *app) cycleWork() {
+	a.setPrefs(func(p *prefs.Prefs) { p.Work = (p.Work + 1) % 3 })
 }
 
 func (a *app) toggleTheme() {
-	a.prefs.Theme = map[string]string{"night": "paper", "paper": "night"}[a.prefs.Theme]
+	theme := map[string]string{"night": "paper", "paper": "night"}[a.prefs.Theme]
+	a.setPrefs(func(p *prefs.Prefs) { p.Theme = theme })
+	a.prefs.Theme = theme // even when BARAD_THEME chose the first
 	applyTheme(a.prefs.Theme)
 	clear(a.md)
-	a.savePrefs()
 }
 
 // ---------------------------------------------------------------- program status (OSC 7501)
@@ -1075,8 +1062,8 @@ func (a *app) report() tea.Cmd {
 	var b strings.Builder
 	for _, s := range a.sessions {
 		st := a.standing(s)
-		r := ansi.ProgramStatus{ID: "barad/" + s.SessionID, App: "barad", Title: sessionName(s), State: ansi.ProgramStateIdle, Message: st.word}
-		switch st.word {
+		r := ansi.ProgramStatus{ID: "barad/" + s.SessionID, App: "barad", Title: sessionName(s), State: ansi.ProgramStateIdle, Message: st.Word}
+		switch st.Word {
 		case "working", "waking":
 			r.State = ansi.ProgramStateWorking
 		case "failed":

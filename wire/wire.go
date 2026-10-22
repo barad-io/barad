@@ -50,6 +50,10 @@ const (
 	DefaultProjectName = "Default"
 )
 
+// ProjectColours are the colours a project can have: palette names, which
+// the web app draws in each theme. Default's own, slate, is not among them.
+var ProjectColours = []string{"coral", "amber", "lime", "teal", "sky", "indigo", "violet", "rose"}
+
 // The API's limits on a message and what goes with it.
 const (
 	PromptMediaMaximumItems      = 10
@@ -88,8 +92,15 @@ type Session struct {
 	LatestProviderUsage       TokenUsage        `json:"latest_provider_usage"`
 	ProjectID                 string            `json:"project_id"`
 	ArchivedAt                time.Time         `json:"archived_at,omitzero"`
+	Origin                    *SessionOrigin    `json:"origin,omitempty"`
 	CreatedAt                 time.Time         `json:"created_at"`
 	UpdatedAt                 time.Time         `json:"updated_at"`
+}
+
+// SessionOrigin is the proposal a session was started from.
+type SessionOrigin struct {
+	SessionID string `json:"session_id"`
+	Sequence  int64  `json:"sequence"`
 }
 
 type ErrorInfo struct {
@@ -266,10 +277,14 @@ type ModelCapabilities struct {
 
 // AccountResource is a provider connection or a Git source.
 type AccountResource struct {
-	ResourceID   string `json:"resource_id"`
-	Name         string `json:"name"`
-	ProviderType string `json:"provider_type,omitempty"`
-	Deleting     bool   `json:"deleting,omitempty"`
+	ResourceID     string `json:"resource_id"`
+	Name           string `json:"name"`
+	ProviderType   string `json:"provider_type,omitempty"`
+	GitSourceType  string `json:"git_source_type,omitempty"`
+	InstallationID int64  `json:"installation_id,omitempty"`
+	AccountLogin   string `json:"account_login,omitempty"`
+	AccountURL     string `json:"account_url,omitempty"`
+	Deleting       bool   `json:"deleting,omitempty"`
 }
 
 // ProviderView is a provider connection as the API lists it.
@@ -303,9 +318,19 @@ func (c CostMetrics) Nanodollars() int64 {
 type UsageMetrics struct {
 	InputTokens       int64       `json:"input_tokens"`
 	CachedInputTokens int64       `json:"cached_input_tokens"`
+	OutputTokens      int64       `json:"output_tokens"`
 	ProcessedTokens   int64       `json:"processed_tokens"`
 	ActualCost        CostMetrics `json:"actual_cost"`
 	APIEquivalentCost CostMetrics `json:"api_equivalent_cost"`
+}
+
+// UsageBucket is one provider connection's or one model's usage.
+type UsageBucket struct {
+	ProviderResourceID   string       `json:"provider_resource_id,omitempty"`
+	ProviderResourceName string       `json:"provider_resource_name,omitempty"`
+	Provider             Provider     `json:"provider"`
+	Model                string       `json:"model,omitempty"`
+	Metrics              UsageMetrics `json:"metrics"`
 }
 
 type UsageDay struct {
@@ -315,8 +340,10 @@ type UsageDay struct {
 
 // UsageReport is the account's provider usage by local day.
 type UsageReport struct {
-	Totals UsageMetrics `json:"totals"`
-	Daily  []UsageDay   `json:"daily"`
+	Totals    UsageMetrics  `json:"totals"`
+	Daily     []UsageDay    `json:"daily"`
+	Providers []UsageBucket `json:"providers"`
+	Models    []UsageBucket `json:"models"`
 }
 
 // WorkspaceTime is computer time and its charge.
@@ -331,10 +358,22 @@ type WorkspaceDay struct {
 	WorkspaceTime
 }
 
-// WorkspaceUsage is the account's computer time by local day.
+// WorkspaceRun is one session's computer time in a report.
+type WorkspaceRun struct {
+	SessionID       string    `json:"session_id"`
+	BilledMinutes   int64     `json:"billed_minutes"`
+	ChargedUSDNanos int64     `json:"charged_usd_nanos"`
+	Runs            int64     `json:"runs"`
+	LastUsedAt      time.Time `json:"last_used_at"`
+}
+
+// WorkspaceUsage is the account's computer time by local day and by
+// session, and what came into and went out of the balance.
 type WorkspaceUsage struct {
-	Totals WorkspaceTime  `json:"totals"`
-	Daily  []WorkspaceDay `json:"daily"`
+	Totals          WorkspaceTime  `json:"totals"`
+	Daily           []WorkspaceDay `json:"daily"`
+	Workspaces      []WorkspaceRun `json:"workspaces"`
+	BalanceActivity []BillingEntry `json:"balance_activity"`
 }
 
 // Signing in: the command line's device-code flow.

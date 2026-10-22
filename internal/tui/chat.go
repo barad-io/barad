@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/prefs"
 	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
@@ -53,8 +55,20 @@ func (a *app) key(k tea.KeyPressMsg) tea.Cmd {
 		switch ks {
 		case "esc", "q":
 			a.screen = screenHome
-		case "tab", "shift+tab", "left", "right":
+		case "tab", "shift+tab":
 			a.usageTab = 1 - a.usageTab
+		case "left", "right":
+			ranges := []int{7, 30, 90}
+			i := slices.Index(ranges, a.days)
+			if ks == "left" {
+				i = max(0, i-1)
+			} else {
+				i = min(len(ranges)-1, i+1)
+			}
+			if ranges[i] != a.days {
+				a.days, a.usage, a.workspace = ranges[i], nil, nil
+				return a.loadUsage()
+			}
 		}
 	}
 	return nil
@@ -67,11 +81,18 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		a.screen, a.sel = screenHome, a.conv.id
 		return nil
 	case "tab":
-		a.prefs.Work = (a.prefs.Work + 1) % 3
-		a.savePrefs()
+		a.cycleWork()
 		return nil
 	case "ctrl+k":
 		a.menu = a.chatMenu()
+		return nil
+	case "ctrl+o":
+		a.menu = a.outlineMenu()
+		return nil
+	case "ctrl+t":
+		if a.conv.session.ArchivedAt.IsZero() {
+			return a.shell()
+		}
 		return nil
 	case "ctrl+p":
 		return a.jump(-1)
@@ -93,13 +114,24 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		return a.scrollBy(-a.h / 2)
 	case "ctrl+x":
 		return a.cancelTurn()
+	}
+	if !a.conv.session.ArchivedAt.IsZero() { // an archived conversation takes no messages
+		return nil
+	}
+	switch k.String() {
 	case "backspace":
 		if a.comp.Value() == "" && len(a.attach) > 0 {
 			a.attach = a.attach[:len(a.attach)-1]
 			a.note = ""
 			return nil
 		}
-	case "enter":
+	case "enter", "alt+enter", "ctrl+enter":
+		// Enter sends and Alt+Enter starts a line, or with the newline
+		// preference the other way round. Shift+Enter always starts a line.
+		if sends := (k.String() == "enter") != a.prefs.Newline; !sends {
+			a.comp.Insert("\n")
+			return nil
+		}
 		if strings.TrimSpace(a.comp.Value()) != "" || len(a.attach) > 0 {
 			return a.send()
 		}
@@ -148,6 +180,34 @@ func (a *app) jump(dir int) tea.Cmd {
 		return a.loadOlder()
 	}
 	return nil
+}
+
+// outlineMenu lists your messages, as the web app's conversation map does;
+// choosing one shows it at the top of the transcript.
+func (a *app) outlineMenu() *menu {
+	_, yours := a.transcript()
+	mn := &menu{title: "Your messages"}
+	if a.conv.hasOlder {
+		mn.hint = "Earlier messages are listed once they load: scroll up."
+	}
+	i := 0
+	for _, ex := range a.conv.exchanges() {
+		if ex.user == nil || i >= len(yours) {
+			continue
+		}
+		label, _, _ := strings.Cut(strings.TrimSpace(ex.user.text), "\n")
+		if label == "" {
+			label = fmt.Sprintf("%d attached", len(ex.user.media))
+		}
+		row := yours[i]
+		mn.items = append(mn.items, item{label: ansi.Truncate(label, 52, "…"), value: clock(ex.user.at, a.now), run: func(a *app) tea.Cmd {
+			lines, _ := a.transcript()
+			return a.scrollBy(len(lines) - a.chatRows() - row - a.scroll)
+		}})
+		i++
+	}
+	mn.sel = len(mn.items) - 1 // the newest, as the transcript ends
+	return mn
 }
 
 // send uploads the attachments, then sends the message. It shows as
@@ -280,6 +340,12 @@ func (a *app) chatView() ([]string, string) {
 	out = append(out, blank())
 	out = append(out, bottom...)
 	keys := []string{"enter", "send", "esc", "sessions", "tab", [...]string{"show steps", "full output", "fold steps"}[a.prefs.Work], "ctrl+p ctrl+n", "your messages"}
+	switch {
+	case !a.conv.session.ArchivedAt.IsZero():
+		keys = keys[2:]
+	case a.prefs.Newline:
+		keys[0] = "alt+enter"
+	}
 	if a.conv.session.CurrentTurnID != "" {
 		keys = append(keys, "ctrl+x", "stop")
 	}
@@ -299,6 +365,13 @@ func (a *app) composerWidth() int { return a.width() - 8 }
 // images going with it above.
 func (a *app) composer() []string {
 	w := a.width()
+	if s := a.conv.session; !s.ArchivedAt.IsZero() {
+		when := "just now"
+		if d := ago(s.ArchivedAt, a.now); d != "now" {
+			when = d + " ago"
+		}
+		return []string{at(Line{S(ruleMark, SFaint), S("Archived "+when, SSec), S("  ·  its workspace is gone, so it takes no messages", SMuted)})}
+	}
 	var comp []Line
 	if len(a.attach) > 0 {
 		var chips Line
@@ -318,7 +391,7 @@ func (a *app) composer() []string {
 		comp = append(comp, Line{})
 	}
 	placeholder := "Message"
-	switch st := a.standing(a.conv.session).word; {
+	switch st := a.standing(a.conv.session).Word; {
 	case a.conv.session.CurrentTurnID != "":
 		placeholder = "Message — the agent reads it at its next step"
 	case st == "asleep":
@@ -359,10 +432,10 @@ func (a *app) footer(keys ...string) string {
 	case a.screen == screenHome && update.Newer(a.prefs.Latest, a.version):
 		right = Line{S(a.prefs.Latest+" is out  ·  ", SFaint), S("barad update", SMuted)}
 	case a.screen != screenHome: // the cover says it at home
-		if n := a.countAll(groupNeedsYou); n > 0 {
+		if n := a.countAll(api.NeedsYou); n > 0 {
 			right = append(right, S("● ", SAccent), S(fmt.Sprintf("%d need you", n), SMuted))
 		}
-		if n := a.countAll(groupRunning); n > 0 {
+		if n := a.countAll(api.Running); n > 0 {
 			if len(right) > 0 {
 				right = append(right, gap(3))
 			}
@@ -383,8 +456,8 @@ func (a *app) footer(keys ...string) string {
 func (a *app) statusPill(s wire.Session) Line {
 	quiet := Fg(lands[a.prefs.Theme].quiet)
 	st := a.standing(s)
-	word := st.word
-	if a.conv != nil && a.conv.id == s.SessionID && st.group != groupRunning {
+	word := st.Word
+	if a.conv != nil && a.conv.id == s.SessionID && st.Group != api.Running {
 		if _, ok := a.conv.openProposal(); ok {
 			word = "asks you"
 		}
@@ -468,7 +541,7 @@ func (a *app) sessionBar(screen ...string) []string {
 		detail = spread(detail, Line{S("last active  ", quiet), S(clock(last, a.now), Fg(groundSec)), S("  ·  "+when, quiet)}, a.width())
 	}
 	sweep := -1
-	if a.standing(s).group == groupRunning {
+	if a.standing(s).Group == api.Running {
 		sweep = a.frame
 	}
 	return bar(a.prefs.Theme, a.w, crumbs, ansi.Truncate(title, a.width()/2, "…"), a.statusPill(s), detail, sweep)
@@ -552,7 +625,7 @@ func (a *app) transcript() (out []string, yours []int) {
 type laidKey struct {
 	sum   uint64
 	w     int
-	work  work
+	work  prefs.Work
 	theme string
 	day   int
 }
@@ -830,7 +903,7 @@ func (a *app) run(p part, last bool, w int) []Line {
 	default:
 		row = Line{S("▸ ", SFaint), S("worked for "+dur(took)+count, SFaint)}
 	}
-	if !working && a.prefs.Work == workFolded {
+	if !working && a.prefs.Work == prefs.WorkFolded {
 		return []Line{row}
 	}
 	if !working {
@@ -842,7 +915,7 @@ func (a *app) run(p part, last bool, w int) []Line {
 	}
 	var body []Line
 	steps := p.steps
-	if working && a.prefs.Work == workFolded && len(steps) > 6 { // a long run shows its newest steps while it works
+	if working && a.prefs.Work == prefs.WorkFolded && len(steps) > 6 { // a long run shows its newest steps while it works
 		body = append(body, Line{S(fmt.Sprintf("… %d earlier steps", len(steps)-6), SFaint)})
 		steps = steps[len(steps)-6:]
 	}
@@ -959,7 +1032,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 	}
 	if s.kind == "reasoning" {
 		lines := Wrap([]Seg{S(strings.TrimSpace(s.think), SFaint.Italic(true))}, tw)
-		if a.prefs.Work != workFull && len(lines) > 2 {
+		if a.prefs.Work != prefs.WorkFull && len(lines) > 2 {
 			lines = append(lines[:2:2], Line{S("…", SFaint)})
 		}
 		out := []Line{append(Line{lab}, lines[0]...)}
@@ -995,7 +1068,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 		target = target[:i] + " …"
 	}
 	out := []Line{spread(Line{lab, S(ansi.Truncate(target, max(4, tw-outcome.Width()-2), "…"), ink)}, outcome, w)}
-	if a.prefs.Work == workFolded && !running || s.result == nil || r.cancelled {
+	if a.prefs.Work == prefs.WorkFolded && !running || s.result == nil || r.cancelled {
 		return out
 	}
 
@@ -1003,7 +1076,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 	text := strings.TrimRight(r.output(), "\n")
 	if failure != "" && text == "" { // a failure with output shows the output; one without, why
 		lines := Wrap([]Seg{S(failure, SMuted)}, tw-1)
-		if a.prefs.Work != workFull && len(lines) > 3 {
+		if a.prefs.Work != prefs.WorkFull && len(lines) > 3 {
 			lines = lines[:3]
 		}
 		return under(out, lines...)
@@ -1021,7 +1094,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 			out = under(out, Line{S(Spinner[a.frame%10]+" loading the screenshot", SFaint)})
 		}
 		return append(out, Line{})
-	case s.kind == "edit" && a.prefs.Work == workFull:
+	case s.kind == "edit" && a.prefs.Work == prefs.WorkFull:
 		edits, _ := s.args["edits"].([]any)
 		for _, e := range edits {
 			m, _ := e.(map[string]any)
@@ -1041,11 +1114,11 @@ func (a *app) step(s *step, running bool, w int) []Line {
 			}
 		}
 		return out
-	case s.kind == "write" && a.prefs.Work == workFull:
+	case s.kind == "write" && a.prefs.Work == prefs.WorkFull:
 		content, _ := s.args["content"].(string)
 		return under(out, codeLines(content, filepath.Ext(target), tw)...)
 	case (s.kind == "read" || s.kind == "fs_read") && text != "" && failure == "":
-		if a.prefs.Work == workFull {
+		if a.prefs.Work == prefs.WorkFull {
 			return under(out, codeLines(text, filepath.Ext(target), tw)...)
 		}
 		return under(out, Line{S(fmt.Sprintf("%d lines", strings.Count(text, "\n")+1), SFaint)})
@@ -1060,7 +1133,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 		}
 		return SFaint
 	}
-	if a.prefs.Work == workFull {
+	if a.prefs.Work == prefs.WorkFull {
 		const most = 400
 		for i, o := range output {
 			if i == most {

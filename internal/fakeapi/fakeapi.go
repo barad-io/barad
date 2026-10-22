@@ -44,6 +44,7 @@ type API struct {
 
 	Projects     []wire.Project
 	Environments map[string]*wire.EnvironmentView // by "sessions/ID" or "projects/ID"
+	account
 }
 
 type Session struct {
@@ -55,6 +56,7 @@ type Session struct {
 	Pending   []api.PendingMessage
 	Proposals map[int64]wire.SessionProposalView
 	Repos     []string
+	Files     map[string][]byte // the workspace, by path under /workspace
 	Seq, Ev   int64
 }
 
@@ -63,6 +65,7 @@ func New(pace time.Duration) *API {
 		Environments: map[string]*wire.EnvironmentView{}}
 	f.Srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	f.seed()
+	f.seedAccount()
 	return f
 }
 
@@ -93,7 +96,8 @@ func (f *API) seed() {
 		return &Session{S: wire.Session{SessionID: id, Name: name, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: mdl,
 			ReasoningEffort: effort, SupportsReasoningEffort: effort != "", SupportedReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"},
 			MachineStatus: machine, ContextWindowTokens: 200_000, AutoCompactTokenLimit: 160_000, ProjectID: "proj_acme", CreatedAt: created, UpdatedAt: created},
-			Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}, Repos: []string{"acme/web"}}
+			Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}, Repos: []string{"acme/web"},
+			Files: map[string][]byte{"web/README.md": []byte("# Web\n\nThe storefront.\n"), "web/checkout/cart.go": []byte("package checkout\n"), "notes.txt": []byte("remember the milk\n")}}
 	}
 
 	checkout := base("ses_checkout", "Fix the flaky checkout test", "claude", "claude-opus-5", "high", wire.MachineStatusHydrated, ago(3*time.Hour))
@@ -320,10 +324,29 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/cognito":
 		var in struct {
-			AuthFlow string
+			AuthFlow                           string
+			PreviousPassword, ProposedPassword string
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		if r.Header.Get("X-Amz-Target") == "AWSCognitoIdentityProviderService.ChangePassword" {
+			f.Mu.Lock()
+			defer f.Mu.Unlock()
+			if in.PreviousPassword != f.Password {
+				w.WriteHeader(400)
+				_ = json.NewEncoder(w).Encode(map[string]string{"__type": "NotAuthorizedException", "message": "Incorrect username or password."})
+				return
+			}
+			f.Password = in.ProposedPassword
+			reply(200, map[string]any{})
+			return
+		}
 		reply(200, map[string]any{"AuthenticationResult": map[string]any{"AccessToken": "fake", "IdToken": "fake", "RefreshToken": "fake", "ExpiresIn": 3600}})
+		return
+	case strings.HasPrefix(path, "/object/"):
+		f.objects(w, r)
+		return
+	case path == "/relay":
+		f.relay(w, r)
 		return
 	case path == "/updates":
 		f.socket(w, r)
@@ -395,6 +418,9 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 			f.Mu.Unlock()
 		}
 	}()
+	if f.serveAccount(w, r, parts, body, reply, fail) {
+		return
+	}
 	switch {
 	case path == "/account/initialize":
 		reply(200, map[string]any{})
@@ -482,11 +508,6 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		reply(200, out)
 	case len(parts) == 4 && parts[1] == "git-sources" && parts[3] == "branches":
 		reply(200, wire.GitBranches{DefaultBranch: "main", Branches: []string{"main", "release", "spike/queue"}})
-	case path == "/account/providers":
-		reply(200, map[string]any{"providers": []wire.ProviderView{
-			{AccountResource: wire.AccountResource{ResourceID: "prov_claude", Name: "Claude Max", ProviderType: "claude"}, Ready: true},
-			{AccountResource: wire.AccountResource{ResourceID: "prov_openai", Name: "OpenAI", ProviderType: "openai"}, Ready: true},
-		}})
 	case len(parts) == 4 && parts[0] == "account" && parts[1] == "providers" && parts[3] == "models":
 		models := []wire.ModelCapabilities{{Model: "claude-opus-5", SupportsReasoningEffort: true, ReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultReasoningEffort: "high"},
 			{Model: "claude-sonnet-5", SupportsReasoningEffort: true, ReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultReasoningEffort: "medium"}}
@@ -496,8 +517,6 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 			def = "gpt-5.5"
 		}
 		reply(200, api.Models{Models: models, DefaultModel: def})
-	case path == "/account/git-sources":
-		reply(200, map[string]any{"sources": []wire.AccountResource{{ResourceID: "src_1", Name: "acme"}}})
 	case len(parts) == 4 && parts[1] == "git-sources":
 		reply(200, map[string]any{"repositories": []map[string]any{{"full_name": "acme/web", "default_branch": "main"}, {"full_name": "acme/api", "default_branch": "main"}, {"full_name": "acme/infra", "default_branch": "trunk"}}})
 	case path == "/account/usage":
@@ -507,9 +526,12 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		for i := range days {
 			days[i] = map[string]any{"date": Start.AddDate(0, 0, i-29).Format("2006-01-02"), "billed_minutes": 30 + i*3, "charged_usd_nanos": int64(20_000_000 * (1 + i%5)), "runs": 2}
 		}
-		reply(200, map[string]any{"totals": map[string]any{"billed_minutes": 2472, "charged_usd_nanos": 1_840_000_000, "runs": 61}, "daily": days})
-	case path == "/account/billing":
-		reply(200, api.Balance{Currency: "usd", BalanceUSDNanos: 8_200_000_000, TermsAccepted: true})
+		reply(200, map[string]any{"totals": map[string]any{"billed_minutes": 2472, "charged_usd_nanos": 1_840_000_000, "runs": 61}, "daily": days,
+			"workspaces": []wire.WorkspaceRun{
+				{SessionID: "ses_checkout", BilledMinutes: 1500, ChargedUSDNanos: 1_000_000_000, Runs: 30, LastUsedAt: Start.Add(-time.Hour)},
+				{SessionID: "ses_sdk", BilledMinutes: 972, ChargedUSDNanos: 840_000_000, Runs: 31, LastUsedAt: Start.Add(-5 * time.Hour)},
+			},
+			"balance_activity": f.History})
 	case parts[0] == "sessions" && len(parts) >= 2:
 		fs := f.Find(parts[1])
 		if fs == nil {
@@ -700,6 +722,20 @@ func Usage() wire.UsageReport {
 		r.Totals.ProcessedTokens += m.ProcessedTokens
 		r.Totals.ActualCost.ProviderReportedNanodollars += cost
 		r.Totals.APIEquivalentCost.ProviderReportedNanodollars += cost * 60
+	}
+	share := func(part float64) wire.UsageMetrics {
+		t := r.Totals
+		return wire.UsageMetrics{InputTokens: int64(float64(t.InputTokens) * part), ProcessedTokens: int64(float64(t.ProcessedTokens) * part),
+			ActualCost: wire.CostMetrics{ProviderReportedNanodollars: int64(float64(t.ActualCost.Nanodollars()) * part)}}
+	}
+	r.Providers = []wire.UsageBucket{
+		{ProviderResourceID: "prov_claude", ProviderResourceName: "Claude Max", Provider: "claude", Metrics: share(0.7)},
+		{ProviderResourceID: "prov_openai", ProviderResourceName: "OpenAI", Provider: "openai", Metrics: share(0.3)},
+	}
+	r.Models = []wire.UsageBucket{
+		{Provider: "claude", Model: "claude-opus-5", Metrics: share(0.6)},
+		{Provider: "claude", Model: "claude-sonnet-5", Metrics: share(0.1)},
+		{Provider: "openai", Model: "gpt-5.5", Metrics: share(0.3)},
 	}
 	return r
 }

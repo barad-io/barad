@@ -15,14 +15,19 @@ import (
 )
 
 var sessionsList = command{
-	usage: "sessions [list] [--project P]",
-	about: "your sessions, newest first",
-	flags: func(fs *flag.FlagSet, c *call) { strFlag(fs, c, "project", "only this project's") },
+	usage: "sessions [list] [--project P] [--unread] [--archived]",
+	about: "your sessions, what needs you first, as the app lists them",
+	flags: func(fs *flag.FlagSet, c *call) {
+		strFlag(fs, c, "project", "only this project's")
+		boolFlag(fs, c, "unread", "only those with a reply you have not read")
+		boolFlag(fs, c, "archived", "the archived ones instead, newest first")
+	},
 	run: func(c *call) error {
 		all, err := c.api.Sessions(c.ctx)
 		if err != nil {
 			return err
 		}
+		read := c.reviewed(all)
 		projects, err := c.api.Projects(c.ctx)
 		if err != nil {
 			return err
@@ -39,16 +44,38 @@ var sessionsList = command{
 			}
 			only = p.ProjectID
 		}
+		archived := c.flag("archived")
 		var list []wire.Session
 		for _, s := range all {
-			if s.ArchivedAt.IsZero() && s.MachineStatus != wire.MachineStatusDeleting && (only == "" || projectOf(s) == only) {
+			switch {
+			case s.MachineStatus == wire.MachineStatusDeleting, s.ArchivedAt.IsZero() == archived:
+			case only != "" && projectOf(s) != only:
+			case c.flag("unread") && !api.Unread(s, read[s.SessionID]):
+			default:
 				list = append(list, s)
 			}
 		}
-		sort.SliceStable(list, func(i, j int) bool { return activity(list[i]).After(activity(list[j])) })
+		sort.SliceStable(list, func(i, j int) bool {
+			if archived {
+				return list[i].ArchivedAt.After(list[j].ArchivedAt)
+			}
+			gi, gj := api.StandingOf(list[i], read[list[i].SessionID], false).Group, api.StandingOf(list[j], read[list[j].SessionID], false).Group
+			if gi != gj {
+				return gi < gj
+			}
+			return activity(list[i]).After(activity(list[j]))
+		})
 		var rows [][]string
 		for _, s := range list {
-			rows = append(rows, []string{sessionName(s), state(s), names[projectOf(s)], s.Model, ago(activity(s)), s.SessionID})
+			word, when := api.StandingOf(s, read[s.SessionID], false).Word, ago(activity(s))
+			if archived {
+				when = ago(s.ArchivedAt)
+			}
+			rows = append(rows, []string{sessionName(s), word, names[projectOf(s)], s.Model, when, s.SessionID})
+		}
+		if len(rows) == 0 && c.flag("unread") && !c.asJSON {
+			_, err := fmt.Fprintln(c.out, "Nothing unread.")
+			return err
 		}
 		return c.table(list, []string{"NAME", "STATE", "PROJECT", "MODEL", "ACTIVE", "ID"}, rows)
 	},
@@ -58,7 +85,7 @@ var sessionsShow = command{
 	usage: "sessions show SESSION",
 	about: "a session's settings, repositories and variables",
 	run: func(c *call) error {
-		s, err := c.sessionArg()
+		s, err := c.sessionArg(false)
 		if err != nil {
 			return err
 		}
@@ -90,8 +117,12 @@ var sessionsShow = command{
 			effort = "—"
 		}
 		fmt.Fprintf(c.out, "%s  (%s)\n\n", sessionName(s), s.SessionID)
+		state := api.StandingOf(s, c.reviewed([]wire.Session{s})[s.SessionID], false).Word
+		if !s.ArchivedAt.IsZero() {
+			state += " " + ago(s.ArchivedAt)
+		}
 		for _, kv := range [][2]string{
-			{"state", state(s)}, {"model", s.Model}, {"effort", effort}, {"project", project.Name},
+			{"state", state}, {"model", s.Model}, {"effort", effort}, {"project", project.Name},
 			{"repositories", repo}, {"environment", describeEnv(env.Variables)},
 			{"created", s.CreatedAt.Local().Format("2 Jan 2006 15:04")}, {"active", ago(activity(s))},
 		} {
@@ -102,7 +133,7 @@ var sessionsShow = command{
 }
 
 var sessionsNew = command{
-	usage: "sessions new [TASK] [--project P] [--provider P [--model M] [--effort E]] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
+	usage: "sessions new [TASK] [--wait] [--project P] [--provider P [--model M] [--effort E]] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
 	about: "start a session (from its project's agent and repositories unless you name others), and send it TASK",
 	flags: func(fs *flag.FlagSet, c *call) {
 		strFlag(fs, c, "project", "the project it joins (default: Default)")
@@ -111,6 +142,7 @@ var sessionsNew = command{
 		boolFlag(fs, c, "no-repos", "a blank workspace, whatever the project clones")
 		listFlag(fs, c, "env", "a variable it receives (repeat for more)")
 		listFlag(fs, c, "secret-env", "a secret variable it receives")
+		boolFlag(fs, c, "wait", "with a task, wait for the agent's reply and print it")
 	},
 	run: func(c *call) error {
 		project, err := c.project(firstNonEmpty(c.str("project"), wire.DefaultProjectID))
@@ -169,6 +201,9 @@ var sessionsNew = command{
 			if _, err := c.api.SendMessage(c.ctx, s.SessionID, requestID(), task, nil); err != nil {
 				return fmt.Errorf("started %s, but could not send it the task: %w", s.SessionID, err)
 			}
+			if c.flag("wait") {
+				return c.waitForReply(*s, "")
+			}
 		}
 		return c.say(s, "Started %s (%s).", sessionName(*s), s.SessionID)
 	},
@@ -185,7 +220,7 @@ var sessionsEdit = command{
 		strFlag(fs, c, "project", "the project it moves to")
 	},
 	run: func(c *call) error {
-		s, err := c.sessionArg()
+		s, err := c.sessionArg(true)
 		if err != nil {
 			return err
 		}
@@ -241,7 +276,7 @@ var sessionsRepos = command{
 		listFlag(fs, c, "remove", "take access away")
 	},
 	run: func(c *call) error {
-		s, err := c.sessionArg()
+		s, err := c.sessionArg(true)
 		if err != nil {
 			return err
 		}
@@ -293,9 +328,9 @@ var sessionsRepos = command{
 }
 
 // sessionAction is a command that does one thing to a session.
-func sessionAction(usage, about, confirm string, do func(c *call, s wire.Session) (string, error)) command {
+func sessionAction(usage, about, confirm string, live bool, do func(c *call, s wire.Session) (string, error)) command {
 	return command{usage: usage, about: about, run: func(c *call) error {
-		s, err := c.sessionArg()
+		s, err := c.sessionArg(live)
 		if err != nil {
 			return err
 		}
@@ -313,24 +348,24 @@ func sessionAction(usage, about, confirm string, do func(c *call, s wire.Session
 }
 
 var sessionsArchive = sessionAction("sessions archive SESSION [--yes]", "erase a session's workspace and published pages; the conversation stays",
-	"Archive %s? Its workspace and published pages are erased; the conversation stays.",
+	"Archive %s? Its workspace and published pages are erased; the conversation stays.", true,
 	func(c *call, s wire.Session) (string, error) {
 		_, err := c.api.Archive(c.ctx, s.SessionID)
 		return "Archived " + sessionName(s) + ".", err
 	})
 
 var sessionsDelete = sessionAction("sessions delete SESSION [--yes]", "remove a session, its transcript and its workspace for good",
-	"Delete %s? The session, its transcript and its workspace are removed for good.",
+	"Delete %s? The session, its transcript and its workspace are removed for good.", false,
 	func(c *call, s wire.Session) (string, error) {
 		return "Deleting " + sessionName(s) + ".", c.api.DeleteSession(c.ctx, s.SessionID)
 	})
 
-var sessionsWake = sessionAction("sessions wake SESSION", "start a session's computer so it is ready for work", "",
+var sessionsWake = sessionAction("sessions wake SESSION", "start a session's computer so it is ready for work", "", true,
 	func(c *call, s wire.Session) (string, error) {
 		return "Waking " + sessionName(s) + ".", c.api.Wake(c.ctx, s.SessionID)
 	})
 
-var sessionsStop = sessionAction("sessions stop SESSION", "stop the agent after its current step", "",
+var sessionsStop = sessionAction("sessions stop SESSION", "stop the agent after its current step", "", true,
 	func(c *call, s wire.Session) (string, error) {
 		if s.CurrentTurnID == "" {
 			return "", fmt.Errorf("%s is not working", sessionName(s))
@@ -338,7 +373,7 @@ var sessionsStop = sessionAction("sessions stop SESSION", "stop the agent after 
 		return "Stopping " + sessionName(s) + " after this step.", c.api.Cancel(c.ctx, s.SessionID)
 	})
 
-var sessionsShare = sessionAction("sessions share SESSION", "a read-only link to the conversation, for 24 hours", "",
+var sessionsShare = sessionAction("sessions share SESSION", "a read-only link to the conversation, for 24 hours", "", false,
 	func(c *call, s wire.Session) (string, error) {
 		sh, err := c.api.Share(c.ctx, s.SessionID, "share"+strings.TrimPrefix(requestID(), "msg"))
 		if err != nil {
@@ -347,30 +382,15 @@ var sessionsShare = sessionAction("sessions share SESSION", "a read-only link to
 		return sh.URL, nil
 	})
 
-var send = command{
-	usage: "send SESSION MESSAGE…",
-	about: "send a session a message (the agent reads it at its next step if it is working)",
-	run: func(c *call) error {
-		s, err := c.sessionArg()
-		if err != nil {
-			return err
-		}
-		text := strings.TrimSpace(strings.Join(c.args[1:], " "))
-		if text == "" {
-			return errors.New("missing the message")
-		}
-		out, err := c.api.SendMessage(c.ctx, s.SessionID, requestID(), text, nil)
-		if err != nil {
-			return err
-		}
-		return c.say(out, "Sent to %s.", sessionName(s))
-	},
-}
-
-func (c *call) sessionArg() (wire.Session, error) {
+// sessionArg is the session the first argument names; live refuses an
+// archived one.
+func (c *call) sessionArg(live bool) (wire.Session, error) {
 	q, err := c.arg(0, "the session")
 	if err != nil {
 		return wire.Session{}, err
+	}
+	if live {
+		return c.live(q)
 	}
 	return c.session(q)
 }
@@ -380,23 +400,6 @@ func projectOf(s wire.Session) string {
 		return wire.DefaultProjectID
 	}
 	return s.ProjectID
-}
-
-// state is a session's state in a word.
-func state(s wire.Session) string {
-	switch {
-	case s.MachineStatus == wire.MachineStatusBroken:
-		return "broken"
-	case s.CurrentTurnID != "":
-		return "working"
-	case s.MachineStatus == wire.MachineStatusHydrating:
-		return "waking"
-	case s.LatestTerminalTurnStatus == wire.TurnStatusFailed:
-		return "failed"
-	case s.MachineStatus == wire.MachineStatusDehydrated:
-		return "asleep"
-	}
-	return "idle"
 }
 
 func activity(s wire.Session) time.Time {

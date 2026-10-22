@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -136,6 +137,7 @@ type NewSession struct {
 }
 
 func (c *Client) CreateSession(ctx context.Context, in NewSession) (*wire.Session, error) {
+	cloneDirectories(in.Repositories)
 	var out wire.Session
 	err := c.Do(ctx, http.MethodPost, "/sessions", in, &out)
 	return &out, err
@@ -278,6 +280,22 @@ type RepositoryRequest struct {
 	SourceID     string `json:"source_id"`
 	Repository   string `json:"repository"`
 	RequestedRef string `json:"requested_ref,omitempty"`
+	Directory    string `json:"directory,omitempty"` // where it is cloned, when its name alone would clash
+}
+
+// cloneDirectories gives each of two repositories of one name (acme/web,
+// other/web), which cannot both clone to web, a directory of its own:
+// owner-name, as the web app suggests.
+func cloneDirectories(repos []RepositoryRequest) {
+	count := map[string]int{}
+	for _, r := range repos {
+		count[strings.ToLower(path.Base(r.Repository))]++
+	}
+	for i, r := range repos {
+		if count[strings.ToLower(path.Base(r.Repository))] > 1 && r.Directory == "" {
+			repos[i].Directory = strings.Replace(r.Repository, "/", "-", 1)
+		}
+	}
 }
 
 // ApproveProposal starts the session a proposal describes, with the proposing
@@ -309,6 +327,7 @@ func (c *Client) ApproveProposal(ctx context.Context, s wire.Session, view wire.
 			repositories = append(repositories, RepositoryRequest{SourceID: source, Repository: r.Repository, RequestedRef: ref})
 		}
 	}
+	cloneDirectories(repositories)
 	environment := []string{}
 	for _, v := range view.Proposal.Environment {
 		environment = append(environment, v.Name)
@@ -393,19 +412,6 @@ func (c *Client) ScreenshotURL(ctx context.Context, sessionID string, sequence i
 func (c *Client) Usage(ctx context.Context, days int, timeZone string) (*wire.UsageReport, error) {
 	var out wire.UsageReport
 	err := c.Do(ctx, http.MethodGet, fmt.Sprintf("/account/usage?days=%d&time_zone=%s", days, escape(timeZone)), nil, &out)
-	return &out, err
-}
-
-// Balance is the account's prepaid balance.
-type Balance struct {
-	Currency        string `json:"currency"`
-	BalanceUSDNanos int64  `json:"balance_usd_nanos"`
-	TermsAccepted   bool   `json:"terms_accepted"`
-}
-
-func (c *Client) Balance(ctx context.Context) (*Balance, error) {
-	var out Balance
-	err := c.Do(ctx, http.MethodGet, "/account/billing", nil, &out)
 	return &out, err
 }
 

@@ -7,6 +7,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/prefs"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -43,6 +45,26 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 	case "?", "ctrl+k":
 		a.menu = a.homeMenu()
 		return nil
+	case "tab":
+		a.shelf, a.sel = !a.shelf, ""
+		if o := a.order(); len(o) > 0 {
+			a.sel = o[0].SessionID
+		}
+		return nil
+	case "p":
+		a.showMenu(a.showProjectMenu())
+		return nil
+	case "R":
+		if unread := a.unreadHere(); len(unread) > 0 {
+			a.markRead(unread)
+			a.say(fmt.Sprintf("Marked %d read", len(unread)))
+		}
+		return nil
+	case "esc":
+		if a.shelf {
+			a.shelf, a.sel = false, ""
+		}
+		return nil
 	case "q":
 		return tea.Quit
 	}
@@ -50,6 +72,15 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	switch ks {
+	case "r":
+		if s := o[a.pos(o)]; s.ArchivedAt.IsZero() && s.LatestTerminalTurnID != "" {
+			a.toggleRead(s)
+		}
+	case "a":
+		if s := o[a.pos(o)]; s.ArchivedAt.IsZero() {
+			it := a.archiveItem(s.SessionID, "")
+			a.menu = &menu{confirm: &it}
+		}
 	case "up", "k":
 		a.sel = o[max(0, a.pos(o)-1)].SessionID
 	case "down", "j":
@@ -84,10 +115,54 @@ func (a *app) pos(o []wire.Session) int {
 	return 0
 }
 
+// toggleRead marks a session's newest turn read, or unread again.
+func (a *app) toggleRead(s wire.Session) {
+	if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+		a.markRead([]wire.Session{s})
+		return
+	}
+	a.setPrefs(func(p *prefs.Prefs) { p.Unread(s.SessionID) })
+}
+
+// unreadHere is the listed sessions with a turn you have not read: what
+// "mark read" covers, as on the web, while other projects' wait.
+func (a *app) unreadHere() []wire.Session {
+	var out []wire.Session
+	if a.shelf {
+		return nil
+	}
+	for _, s := range a.order() {
+		if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// showProjectMenu picks the project the home screen lists, each with what
+// needs you there.
+func (a *app) showProjectMenu() *menu {
+	needs := map[string]int{}
+	for _, s := range a.sessions {
+		if a.standing(s).Group == api.NeedsYou {
+			needs[projectOf(s)]++
+		}
+	}
+	mn := &menu{title: "Show a project"}
+	for _, p := range a.openProjects() {
+		id, value := p.ProjectID, ""
+		if n := needs[id]; n > 0 {
+			value = fmt.Sprintf("%d need you", n)
+		}
+		mn.items = append(mn.items, item{label: p.Name, value: value, check: id == a.projectID(), run: func(a *app) tea.Cmd { a.showProject(id); return nil }})
+	}
+	return mn
+}
+
 // glyph is a session's mark on the list: an unread dot, a failure, the
 // spinner, or a resting dot.
-func (a *app) glyph(st standing) Seg {
-	switch st.word {
+func (a *app) glyph(st api.Standing) Seg {
+	switch st.Word {
 	case "working", "waking":
 		return S(Spinner[a.frame%10], SAgent)
 	case "ready":
@@ -104,13 +179,15 @@ func (a *app) homeView() ([]string, string) {
 
 	// the cover: the landscape, with the wordmark on its shore
 	right := Line{S(a.projectName(a.projectID()), Fg(hex("#999fa6")))}
-	if n := a.count(groupNeedsYou); n > 0 {
+	if a.shelf {
+		right = Line{S("Archived", Fg(groundText).Bold(true)), S(fmt.Sprintf("  ·  %d in %s", len(a.order()), a.projectName(a.projectID())), Fg(hex("#999fa6")))}
+	} else if n := a.count(api.NeedsYou); n > 0 {
 		right = append(right, gap(4), S("● ", SAccent), S(fmt.Sprintf("%d need you", n), Fg(groundSec)))
 	}
-	if n := a.count(groupRunning); n > 0 {
+	if n := a.count(api.Running); n > 0 && !a.shelf {
 		right = append(right, gap(4), S(Spinner[a.frame%10]+" ", Fg(groundAgent)), S(fmt.Sprintf("%d working", n), Fg(groundSec)))
 	}
-	if n := a.elsewhere(); n > 0 {
+	if n := a.elsewhere(); n > 0 && !a.shelf {
 		right = append(right, gap(4), S(fmt.Sprintf("%d elsewhere", n), Fg(groundAccent)))
 	}
 	if rows := a.mastRows(); rows > 0 {
@@ -130,7 +207,11 @@ func (a *app) homeView() ([]string, string) {
 	order := a.order()
 	if a.filter != nil {
 		field := append(Line{S("/ ", SAccent.Bold(true))}, a.filter.Lines(w-24, 1, SText, "search sessions", true)[0]...)
-		head = append(head, block([]Line{spread(field, Line{S(fmt.Sprintf("%d found", len(order)), SMuted)}, w-4)}, Raised, margin, w, 2)...)
+		found := fmt.Sprintf("%d found in every project", len(order))
+		if a.shelf {
+			found = fmt.Sprintf("%d archived found", len(order))
+		}
+		head = append(head, block([]Line{spread(field, Line{S(found, SMuted)}, w-4)}, Raised, margin, w, 2)...)
 		head = append(head, blank())
 	}
 
@@ -140,7 +221,9 @@ func (a *app) homeView() ([]string, string) {
 	var out []string
 	selLine := 0
 	selRow := a.pos(order)
-	current := group(-1)
+	unread := len(a.unreadHere())
+	searching := a.filter != nil && strings.TrimSpace(a.filter.Value()) != ""
+	current := api.Group(-1)
 	capBelow := false
 	spacer := func(top bool) string {
 		edge := Fg(Raised)
@@ -157,27 +240,40 @@ func (a *app) homeView() ([]string, string) {
 	for p, s := range order {
 		st := a.standing(s)
 		sel := p == selRow && a.start == nil
-		if st.group != current {
+		if st.Group != current {
 			if current >= 0 {
 				out = append(out, spacer(false))
 			}
-			current = st.group
-			label := groupLabel[st.group]
-			out = append(out, at(Line{gap(2), S(label, SFaint.Bold(true)), gap(2), S(strings.Repeat("─", max(0, w-len(label)-4)), Fg(BorderSubtle))}))
+			current = st.Group
+			label := groupLabel[st.Group]
+			if a.shelf {
+				label = "ARCHIVED"
+			}
+			var end Line
+			if st.Group == api.NeedsYou && unread > 0 { // as the web app's "Mark N read"
+				end = Line{gap(2), S("R", SSec.Bold(true)), S(fmt.Sprintf(" mark %d read", unread), SMuted)}
+			}
+			out = append(out, at(append(Line{gap(2), S(label, SFaint.Bold(true)), gap(2), S(strings.Repeat("─", max(0, w-len(label)-4-end.Width())), Fg(BorderSubtle))}, end...)))
 		}
 		out = append(out, spacer(sel))
 		when := PadRight(ago(activityAt(s), a.now), 4)
-		if st.group == groupRunning {
+		if a.shelf {
+			when = PadRight(ago(s.ArchivedAt, a.now), 4)
+		}
+		if st.Group == api.Running {
 			when = "    "
 		}
 		name := SText
-		if sel || st.group == groupNeedsYou {
+		if sel || st.Group == api.NeedsYou {
 			name = SText.Bold(true)
 		}
-		word := map[string]Seg{"ready": S("ready", SOk), "failed": S("failed", SDanger), "working": S("working", SAgent), "waking": S("waking", SAgent), "asleep": S("asleep", SFaint)}[st.word]
+		word := map[string]Seg{"ready": S("ready", SOk), "failed": S("failed", SDanger), "working": S("working", SAgent), "waking": S("waking", SAgent), "asleep": S("asleep", SFaint), "archived": S("archived", SFaint)}[st.Word]
 		title := spread(Line{a.glyph(st), gap(2), S(ansi.Truncate(sessionName(s), w-30, "…"), name)}, Line{word, gap(3), S(when, SFaint)}, w-4)
 		mark, mc := providerMark(string(s.Provider))
 		dek := Line{gap(3), S(mark+" ", Fg(mc)), S(modelName(s), SMuted)}
+		if searching { // a search looks across projects: say whose it is
+			dek = append(Line{gap(3), S(a.projectName(projectOf(s)), SSec), S("  ·  ", SFaint)}, dek[1:]...)
+		}
 		if s.ReasoningEffort != "" {
 			dek = append(dek, S("  ·  "+string(s.ReasoningEffort), SFaint))
 		}
@@ -203,6 +299,8 @@ func (a *app) homeView() ([]string, string) {
 		out = append(out, at(Line{gap(2), S(Spinner[a.frame%10]+"  ", SAgent), S("Loading your sessions", SMuted)}))
 	case len(order) == 0 && a.filter != nil:
 		out = append(out, at(Line{gap(2), S("Nothing matches.", SMuted)}))
+	case len(order) == 0 && a.shelf:
+		out = append(out, at(Line{gap(2), S("No archived sessions in "+a.projectName(a.projectID())+". Press ", SMuted), S("tab", SSec.Bold(true)), S(" to go back.", SMuted)}))
 	case len(order) == 0:
 		out = append(out, at(Line{gap(2), S("No sessions here yet. Press ", SMuted), S("n", SSec.Bold(true)), S(" to start one.", SMuted)}))
 	}
@@ -217,8 +315,14 @@ func (a *app) homeView() ([]string, string) {
 		foot = a.footer("tab", "next field", "enter", "start", "esc", "cancel")
 	case a.filter != nil:
 		foot = a.footer("enter", "open", "esc", "clear")
+	case a.shelf:
+		foot = a.footer("↑↓", "select", "enter", "read", "/", "search", "tab", "sessions", "?", "menu")
 	default:
-		foot = a.footer("↑↓", "select", "enter", "open", "n", "new", "/", "search", "?", "menu")
+		keys := []string{"↑↓", "select", "enter", "open", "n", "new", "/", "search"}
+		if unread > 0 {
+			keys = append(keys, "R", "mark read")
+		}
+		foot = a.footer(append(keys, "p", "project", "tab", "archived", "?", "menu")...)
 	}
 	return append(head, out...), foot
 }

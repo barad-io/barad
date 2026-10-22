@@ -18,6 +18,7 @@ import (
 
 	"github.com/barad-io/barad/internal/api"
 	"github.com/barad-io/barad/internal/fakeapi"
+	"github.com/barad-io/barad/internal/prefs"
 	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
@@ -33,7 +34,10 @@ type driver struct {
 }
 
 func newDriver(t *testing.T) *driver {
-	frameEvery = 0
+	frameEvery, pollEvery = 0, time.Millisecond
+	open := OpenURL
+	OpenURL = func(string) error { return nil }
+	t.Cleanup(func() { OpenURL = open })
 	t.Setenv("BARAD_THEME", "night")
 	f := fakeapi.New(0)
 	t.Cleanup(f.Srv.Close)
@@ -151,8 +155,10 @@ func TestHomeListsSessionsByWhatTheyNeed(t *testing.T) {
 	if strings.Index(s, "Upgrade the payments SDK") > strings.Index(s, "Move the billing cron") || strings.Index(s, "Move the billing cron") > strings.Index(s, "Fix the flaky") {
 		t.Fatalf("groups are out of order:\n%s", s)
 	}
-	// Another project, from the menu.
-	d.keys("?", "project", "enter", "Ops", "enter")
+	// Another project, with p.
+	d.keys("p")
+	d.sees("Show a project", "1 need you")
+	d.keys("Ops", "enter")
 	d.sees("Rotate the staging keys", "Ops")
 	d.misses("Fix the flaky checkout test")
 }
@@ -177,7 +183,7 @@ func TestConversationShowsWorkFoldedThenUnfolded(t *testing.T) {
 
 	d.keys("tab") // folded again
 	d.misses("WARNING: DATA RACE")
-	if d.a.prefs.Work != workFolded {
+	if d.a.prefs.Work != prefs.WorkFolded {
 		t.Fatalf("work = %v", d.a.prefs.Work)
 	}
 }
@@ -191,7 +197,7 @@ func TestSendingAMessageShowsTheAgentsAnswer(t *testing.T) {
 	if n := len(d.a.conv.sending); n != 0 {
 		t.Fatalf("%d messages are still sending", n)
 	}
-	if got := d.a.standing(d.a.conv.session).word; got != "idle" {
+	if got := d.a.standing(d.a.conv.session).Word; got != "idle" {
 		t.Fatalf("an answer you are looking at is %q, want idle (read)", got)
 	}
 }
@@ -272,7 +278,7 @@ func TestMenuRenamesChangesModelAndArchives(t *testing.T) {
 	d.sees("✻ claude-sonnet-5  ·  high")
 
 	d.keys("?", "archive", "enter")
-	d.sees("Archive?", "erases this session's workspace")
+	d.sees("Archive Checkout race?", "erases this session's workspace")
 	d.keys("enter")
 	if d.fake("ses_checkout").ArchivedAt.IsZero() {
 		t.Fatal("the session was not archived")
@@ -732,7 +738,8 @@ func TestFastModeAndDeleteFromTheSessionMenu(t *testing.T) {
 func TestSettingsListTheProvidersAndTheAccount(t *testing.T) {
 	d := newDriver(t)
 	d.keys("?", "settings", "enter")
-	d.sees("APPEARANCE", "Theme", "night", "PROVIDERS", "Claude Max", "ACCOUNT", "Signed in as", "you@example.com", "Sign out")
+	d.sees("THIS COMPUTER", "Theme", "night", "PROVIDERS", "Claude Max", "SOURCE CONTROL", "@you", "Git identity", "BILLING", "$8.20 left",
+		"ACCOUNT", "Signed in as", "you@example.com", "Sign out")
 	d.keys("theme", "enter")
 	d.sees("paper")
 }

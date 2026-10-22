@@ -45,6 +45,14 @@ func (a *app) projectItems() []item {
 			return &menu{title: "Rename", edit: e, submit: func(a *app, name string) tea.Cmd {
 				return a.saveProject(p.ProjectID, func(s *api.ProjectSettings) { s.Name = name }, "Renamed")
 			}}
+		}}, item{group: group, label: "Colour", value: p.Colour, sub: func(a *app) *menu {
+			mn := &menu{title: "Colour", hint: "How the web app marks the project."}
+			for _, c := range wire.ProjectColours {
+				mn.items = append(mn.items, item{label: c, check: c == p.Colour, run: func(a *app) tea.Cmd {
+					return a.saveProject(p.ProjectID, func(s *api.ProjectSettings) { s.Colour = c }, "Colour: "+c)
+				}})
+			}
+			return mn
 		}})
 	}
 	items = append(items, item{group: group, label: "Agent", value: agent, sub: func(a *app) *menu {
@@ -92,8 +100,7 @@ func (a *app) projectItems() []item {
 			ask: "Its sessions move to Default. No session, transcript or workspace is deleted.",
 			run: func(a *app) tea.Cmd {
 				id := p.ProjectID
-				a.prefs.Project = ""
-				a.savePrefs()
+				a.showProject("")
 				return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.DeleteProject(ctx, id) },
 					func(_ struct{}, err error) tea.Msg {
 						return doneMsg{say: "Deleted " + p.Name, err: err, relist: true, account: true}

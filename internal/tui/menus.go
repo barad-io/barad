@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/barad-io/barad/internal/api"
-	"github.com/barad-io/barad/internal/update"
+	"github.com/barad-io/barad/internal/shell"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -19,11 +18,38 @@ import (
 func (a *app) homeMenu() *menu {
 	items := []item{
 		{group: "SESSIONS", label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
-		{group: "SESSIONS", label: "Search sessions", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
-		{group: "SESSIONS", label: "Show a project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
-			return a.projectMenu(a.projectID(), func(a *app, id string) tea.Cmd { a.prefs.Project = id; a.sel = ""; a.savePrefs(); return nil })
-		}},
-		{group: "SESSIONS", label: "New project", sub: func(a *app) *menu { return a.newProject() }},
+		{group: "SESSIONS", label: "Search every project", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
+	}
+	if unread := a.unreadHere(); len(unread) > 0 {
+		items = append(items, item{group: "SESSIONS", label: fmt.Sprintf("Mark %d read", len(unread)), key: "R", run: func(a *app) tea.Cmd {
+			a.markRead(unread)
+			return nil
+		}})
+	}
+	shelf := "Archived sessions"
+	if a.shelf {
+		shelf = "Back to sessions"
+	}
+	items = append(items,
+		item{group: "SESSIONS", label: shelf, key: "tab", run: func(a *app) tea.Cmd { a.shelf, a.sel = !a.shelf, ""; return nil }},
+		item{group: "SESSIONS", label: "Show a project", key: "p", value: a.projectName(a.projectID()), sub: func(a *app) *menu { return a.showProjectMenu() }},
+		item{group: "SESSIONS", label: "New project", sub: func(a *app) *menu { return a.newProject() }},
+	)
+	// the selected session's own, by their keys
+	if o := a.order(); len(o) > 0 && !a.shelf {
+		s := o[a.pos(o)]
+		group := "SELECTED  ·  " + sessionName(s)
+		if s.LatestTerminalTurnID != "" {
+			label := "Mark read"
+			if !api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+				label = "Mark unread"
+			}
+			items = append(items, item{group: group, label: label, key: "r", run: func(a *app) tea.Cmd { a.toggleRead(s); return nil }})
+		}
+		items = append(items, item{group: group, label: "Open", key: "enter", run: func(a *app) tea.Cmd { return a.open(s.SessionID) }})
+		archive := a.archiveItem(s.SessionID, group)
+		archive.key = "a"
+		items = append(items, archive)
 	}
 	items = append(items, a.projectItems()...)
 	return &menu{title: "Barad", items: append(items, a.baradItems()...), reload: func(a *app) *menu { return a.homeMenu() }}
@@ -40,42 +66,6 @@ func (a *app) baradItems() []item {
 		{group: "BARAD", label: "Settings", sub: func(a *app) *menu { return a.settingsMenu() }},
 		{group: "BARAD", label: "Quit", key: "q", run: func(a *app) tea.Cmd { return tea.Quit }},
 	}
-}
-
-// settingsMenu is Barad's own settings: how it looks here, the provider
-// connections sessions use, and the account.
-func (a *app) settingsMenu() *menu {
-	mn := &menu{title: "Settings", reload: func(a *app) *menu { return a.settingsMenu() }}
-	mn.items = append(mn.items, item{group: "APPEARANCE", label: "Theme", value: a.prefs.Theme, stay: true, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }})
-	for _, p := range a.providers {
-		state := "ready"
-		if !p.Ready {
-			state = "needs sign-in"
-		}
-		mn.items = append(mn.items, item{group: "PROVIDERS", label: p.Name, value: providerName(string(p.ProviderType)) + "  ·  " + state})
-	}
-	if len(a.providers) == 0 {
-		mn.items = append(mn.items, item{group: "PROVIDERS", label: "No provider is connected"})
-	}
-	release := a.version
-	switch {
-	case update.Newer(a.prefs.Latest, a.version):
-		release += "  ·  " + a.prefs.Latest + " is out: barad update"
-	case update.Released(a.version):
-		release += "  ·  the newest"
-	}
-	mn.items = append(mn.items,
-		item{group: "ACCOUNT", label: "Signed in as", value: a.api.Email()},
-		item{group: "ACCOUNT", label: "barad", value: release},
-		item{group: "ACCOUNT", label: "Sign out", danger: true, ask: "Sign out of Barad on this computer? Your sessions keep running.", run: func(a *app) tea.Cmd {
-			return func() tea.Msg {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				return signOutMsg{a.api.SignOut(ctx)}
-			}
-		}},
-	)
-	return mn
 }
 
 func (a *app) chatMenu() *menu {
@@ -111,6 +101,14 @@ func (a *app) chatMenu() *menu {
 	if s.MachineStatus == wire.MachineStatusDehydrated && !s.PendingTurn {
 		items = append(items, item{label: "Wake its computer", run: func(a *app) tea.Cmd { return a.wake() }})
 	}
+	if s.ArchivedAt.IsZero() {
+		items = append(items, item{label: "Open a shell in its computer", key: "ctrl+t", run: func(a *app) tea.Cmd { return a.shell() }})
+	}
+	if o := s.Origin; o != nil {
+		if from, ok := a.session(o.SessionID); ok {
+			items = append(items, item{label: "Go to the session it came from", value: sessionName(from), run: func(a *app) tea.Cmd { return a.open(from.SessionID) }})
+		}
+	}
 
 	conversation := "THIS CONVERSATION"
 	if reply := c.lastReply(); reply != "" {
@@ -120,8 +118,9 @@ func (a *app) chatMenu() *menu {
 		}})
 	}
 	items = append(items,
+		item{group: conversation, label: "Your messages", key: "ctrl+o", sub: func(a *app) *menu { return a.outlineMenu() }},
 		item{group: conversation, label: "Images", value: fmt.Sprint(len(c.pictures())), run: func(a *app) tea.Cmd { return a.openImages() }},
-		item{group: conversation, label: "Steps", value: a.prefs.Work.String(), key: "tab", run: func(a *app) tea.Cmd { a.prefs.Work = (a.prefs.Work + 1) % 3; a.savePrefs(); return nil }},
+		item{group: conversation, label: "Steps", value: a.prefs.Work.String(), key: "tab", run: func(a *app) tea.Cmd { a.cycleWork(); return nil }},
 		item{group: conversation, label: "Attach an image", key: "ctrl+v", run: func(a *app) tea.Cmd {
 			return func() tea.Msg { data, err := clipboardImage(); return clipboardMsg{data, err} }
 		}},
@@ -140,6 +139,9 @@ func (a *app) chatMenu() *menu {
 func (a *app) sessionItems() []item {
 	s := a.conv.session
 	group := "SESSION  ·  " + sessionName(s)
+	if !s.ArchivedAt.IsZero() {
+		return []item{{group: group, label: "Details", sub: func(a *app) *menu { return a.detailsMenu() }}, a.deleteItem(group)}
+	}
 	items := []item{
 		{group: group, label: "Rename", sub: func(a *app) *menu {
 			e := &Editor{}
@@ -184,24 +186,37 @@ func (a *app) sessionItems() []item {
 				"Its agent's commands and terminal shells receive these, live, with the project's.")
 		}},
 		item{group: group, label: "Details", sub: func(a *app) *menu { return a.detailsMenu() }},
-		item{group: group, label: "Archive", danger: true, ask: "Archive erases this session's workspace and its published pages. The conversation stays. You cannot undo this.",
-			run: func(a *app) tea.Cmd {
-				id := a.conv.id
-				a.screen, a.conv = screenHome, nil
-				return call(func(ctx context.Context) (*wire.Session, error) { return a.api.Archive(ctx, id) },
-					func(_ *wire.Session, err error) tea.Msg { return doneMsg{say: "Archived", err: err, relist: true} })
-			}},
-		item{group: group, label: "Delete", danger: true, ask: "Delete permanently removes the session, its transcript and its workspace. You cannot undo this.",
-			run: func(a *app) tea.Cmd {
-				id := a.conv.id
-				a.screen, a.conv = screenHome, nil
-				return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.DeleteSession(ctx, id) },
-					func(_ struct{}, err error) tea.Msg {
-						return doneMsg{say: "Deleting the session", err: err, relist: true}
-					})
-			}},
+		a.archiveItem(s.SessionID, group),
+		a.deleteItem(group),
 	)
 	return items
+}
+
+func (a *app) deleteItem(group string) item {
+	return item{group: group, label: "Delete", danger: true, ask: "Delete permanently removes the session, its transcript and its workspace. You cannot undo this.",
+		run: func(a *app) tea.Cmd {
+			id := a.conv.id
+			a.screen, a.conv = screenHome, nil
+			return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.DeleteSession(ctx, id) },
+				func(_ struct{}, err error) tea.Msg {
+					return doneMsg{say: "Deleting the session", err: err, relist: true}
+				})
+		}}
+}
+
+// archiveItem archives a session, after asking: its workspace and
+// published pages go for good; the conversation stays.
+func (a *app) archiveItem(id, group string) item {
+	s, _ := a.session(id)
+	return item{group: group, label: "Archive", danger: true, action: "Archive " + sessionName(s),
+		ask: "Archive erases this session's workspace and its published pages. The conversation stays. You cannot undo this.",
+		run: func(a *app) tea.Cmd {
+			if a.conv != nil && a.conv.id == id {
+				a.screen, a.conv = screenHome, nil
+			}
+			return call(func(ctx context.Context) (*wire.Session, error) { return a.api.Archive(ctx, id) },
+				func(_ *wire.Session, err error) tea.Msg { return doneMsg{say: "Archived", err: err, relist: true} })
+		}}
 }
 
 // usesFastMode reports whether a session's provider has a fast mode, as the
@@ -212,6 +227,14 @@ func usesFastMode(s wire.Session) bool {
 		return false
 	}
 	return true
+}
+
+type shellMsg struct{ err error }
+
+// shell steps the app aside for a shell in the open session's computer, and
+// comes back when it exits.
+func (a *app) shell() tea.Cmd {
+	return tea.Exec(&shell.Command{Client: a.api, Session: a.conv.session}, func(err error) tea.Msg { return shellMsg{err} })
 }
 
 func (a *app) wake() tea.Cmd {

@@ -6,8 +6,7 @@
 //	barad logout     sign out on this computer
 //	barad version    the release this is
 //	barad update     replace barad with its newest release
-//	barad help       every command, including those that change sessions,
-//	                 projects and their variables without the app
+//	barad help       every command: all the app does, without the app
 //
 // Credentials live in the user config directory (~/.config/barad on Linux),
 // readable only by you. BARAD_API_URL points it at another stack;
@@ -20,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -37,8 +35,11 @@ var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "barad:", err)
-		os.Exit(1)
+		code, say := cli.ExitCode(err)
+		if say {
+			fmt.Fprintln(os.Stderr, "barad:", err)
+		}
+		os.Exit(code)
 	}
 }
 
@@ -135,7 +136,7 @@ func login(client *api.Client) error {
 		return fmt.Errorf("could not start signing in: %w", err)
 	}
 	fmt.Printf("Sign in to Barad in your browser and approve this code:\n\n    %s\n\n", started.UserCode)
-	if openBrowser(started.VerificationURL) == nil {
+	if tui.OpenURL(started.VerificationURL) == nil {
 		fmt.Printf("If no browser opened, go to %s\n", started.VerificationURL)
 	} else {
 		fmt.Printf("Open %s\n", started.VerificationURL)
@@ -156,16 +157,3 @@ func login(client *api.Client) error {
 }
 
 // openBrowser opens url in the default browser, without waiting for it.
-func openBrowser(url string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	cmd.Stdout, cmd.Stderr = nil, nil
-	return cmd.Start()
-}

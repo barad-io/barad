@@ -43,8 +43,8 @@ func linkify(text string, st lipgloss.Style) []Seg {
 	return append(out, S(text[last:], st))
 }
 
-// openURL hands a web address to the system's browser.
-func openURL(address string) error {
+// OpenURL hands a web address to the system's browser. Tests replace it.
+var OpenURL = func(address string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return exec.Command("open", address).Start()
@@ -108,7 +108,7 @@ func (a *app) mouse(msg tea.MouseMsg) tea.Cmd {
 		if s.ax == s.bx && s.ay == s.by { // a click
 			a.span = nil
 			if c := grid.CellAt(m.X, m.Y); c != nil && openable(c.Link.URL) {
-				if err := openURL(c.Link.URL); err != nil {
+				if err := OpenURL(c.Link.URL); err != nil {
 					return a.fail("Could not open the link", err)
 				}
 				a.say("Opened " + c.Link.URL)

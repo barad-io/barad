@@ -7,27 +7,37 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/barad-io/barad/internal/fakeapi"
+	"github.com/barad-io/barad/internal/tui"
 	"github.com/barad-io/barad/wire"
 )
 
-// barad runs command lines against a fake Barad.
+// barad runs command lines against a fake Barad, from one computer: its
+// files (what you have read, the preferences) last between commands.
 type barad struct {
-	t *testing.T
-	f *fakeapi.API
+	t      *testing.T
+	f      *fakeapi.API
+	dir    string
+	opened []string // pages it opened in the browser
 }
 
 func newBarad(t *testing.T) *barad {
 	f := fakeapi.New(0)
 	t.Cleanup(f.Srv.Close)
-	return &barad{t: t, f: f}
+	b := &barad{t: t, f: f, dir: t.TempDir()}
+	pollEvery = 5 * time.Millisecond
+	open := tui.OpenURL
+	tui.OpenURL = func(u string) error { b.opened = append(b.opened, u); return nil }
+	t.Cleanup(func() { tui.OpenURL = open })
+	return b
 }
 
 // run runs a command line with stdin, returning what it printed.
 func (b *barad) run(stdin string, args ...string) (string, error) {
 	b.t.Helper()
-	client := b.f.SignIn(b.t, b.t.TempDir())
+	client := b.f.SignIn(b.t, b.dir)
 	var out bytes.Buffer
 	err := Run(context.Background(), client, args, strings.NewReader(stdin), &out)
 	return out.String(), err

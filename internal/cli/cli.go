@@ -14,11 +14,16 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"golang.org/x/term"
 
 	"github.com/barad-io/barad/internal/api"
 )
+
+// pollEvery is how often a command that waits asks again: for a reply, a
+// sign-in, a payment. Tests shorten it.
+var pollEvery = 2 * time.Second
 
 // A command runs one verb of a noun. Its flags are declared on fs; run gets
 // the arguments that are not flags.
@@ -47,14 +52,29 @@ var verbs = []struct {
 	noun, verb string
 	cmd        *command
 }{
-	{"sessions", "list", &sessionsList}, {"sessions", "show", &sessionsShow}, {"sessions", "new", &sessionsNew},
+	{"sessions", "list", &sessionsList}, {"sessions", "show", &sessionsShow}, {"sessions", "log", &sessionsLog},
+	{"sessions", "read", &sessionsRead}, {"sessions", "unread", &sessionsUnread}, {"sessions", "proposal", &sessionsProposal},
+	{"sessions", "new", &sessionsNew},
 	{"sessions", "edit", &sessionsEdit}, {"sessions", "repos", &sessionsRepos}, {"sessions", "wake", &sessionsWake},
 	{"sessions", "stop", &sessionsStop}, {"sessions", "share", &sessionsShare}, {"sessions", "archive", &sessionsArchive},
 	{"sessions", "delete", &sessionsDelete},
 	{"send", "", &send},
+	{"shell", "", &shellCommand},
+	{"files", "list", &filesList}, {"files", "cat", &filesCat}, {"files", "get", &filesGet}, {"files", "put", &filesPut},
 	{"projects", "list", &projectsList}, {"projects", "show", &projectsShow}, {"projects", "new", &projectsNew},
 	{"projects", "edit", &projectsEdit}, {"projects", "delete", &projectsDelete},
 	{"env", "list", &envList}, {"env", "set", &envSet}, {"env", "unset", &envUnset},
+	{"providers", "list", &providersList}, {"providers", "show", &providersShow}, {"providers", "add", &providersAdd},
+	{"providers", "login", &providersLogin}, {"providers", "rename", &providersRename}, {"providers", "logout", &providersLogout},
+	{"providers", "remove", &providersRemove},
+	{"git", "status", &gitStatus}, {"git", "login", &gitLogin}, {"git", "logout", &gitLogout}, {"git", "connect", &gitConnect},
+	{"git", "repos", &gitRepos}, {"git", "rename", &gitRename}, {"git", "remove", &gitRemove}, {"git", "identity", &gitIdentity},
+	{"usage", "summary", &usageSummary}, {"usage", "sessions", &usageSessions}, {"usage", "providers", &usageProviders},
+	{"usage", "models", &usageModels}, {"usage", "daily", &usageDaily},
+	{"billing", "status", &billingStatus}, {"billing", "history", &billingHistory}, {"billing", "buy", &billingBuy},
+	{"billing", "terms", &billingTerms},
+	{"account", "show", &accountShow}, {"account", "password", &accountPassword},
+	{"config", "", &configCommand},
 }
 
 // lookup is noun's verb, or with verb "", the noun's first.
@@ -122,7 +142,7 @@ func Help(out io.Writer, noun string) error {
 		if noun != "" && v.noun != noun {
 			continue
 		}
-		if v.noun != heading && v.noun != "send" {
+		if v.noun != heading && v.verb != "" {
 			heading = v.noun
 			fmt.Fprintf(out, "\n%s\n", strings.ToUpper(heading))
 		}
@@ -212,6 +232,17 @@ func listFlag(fs *flag.FlagSet, c *call, name, usage string) {
 
 func boolFlag(fs *flag.FlagSet, c *call, name, usage string) {
 	c.values[name] = fs.Bool(name, false, usage)
+}
+
+// piped reports whether input comes from a pipe or a file, not a terminal
+// (or nothing at all).
+func (c *call) piped() bool {
+	f, ok := c.in.(*os.File)
+	if !ok {
+		return c.in != nil
+	}
+	info, err := f.Stat()
+	return err == nil && (info.Mode()&os.ModeNamedPipe != 0 || info.Mode().IsRegular())
 }
 
 // terminal is the input's terminal, if it is one.

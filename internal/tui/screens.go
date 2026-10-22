@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/barad-io/barad/internal/api"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -30,7 +31,7 @@ func (a *app) View() tea.View {
 		v.WindowTitle = sessionName(a.conv.session) + " — Barad"
 	}
 	v.ProgramStatus = &tea.ProgramStatus{App: "barad", Title: "Barad", State: "idle"}
-	if n := a.countAll(groupRunning); n > 0 {
+	if n := a.countAll(api.Running); n > 0 {
 		v.ProgramStatus.State = "working"
 		v.ProgramStatus.Message = fmt.Sprintf("%d working", n)
 	}
@@ -47,7 +48,7 @@ func (a *app) compose() string {
 	case a.screen == screenImages && a.conv != nil:
 		body, foot = a.imagesView(), a.footer("← →", "previous, next", "o", "open in your viewer", "esc", "back")
 	case a.screen == screenUsage:
-		body, foot = a.usageView(), a.footer("tab", [2]string{"inference", "barad"}[a.usageTab], "esc", "back")
+		body, foot = a.usageView(), a.footer("tab", [2]string{"inference", "barad"}[a.usageTab], "← →", "7 · 30 · 90 days", "esc", "back")
 	default:
 		body, foot = a.homeView()
 	}
@@ -193,7 +194,7 @@ func (a *app) usageView() []string {
 	if b := a.balance; b != nil {
 		detail = Line{S("credits  ", quiet), S(money(b.BalanceUSDNanos), Fg(groundText).Bold(true)), S("  left", quiet)}
 	}
-	out := bar(a.prefs.Theme, a.w, []string{a.projectName(a.projectID())}, "Usage", Line{S("last 30 days", quiet)}, detail, -1)
+	out := bar(a.prefs.Theme, a.w, []string{a.projectName(a.projectID())}, "Usage", Line{S(fmt.Sprintf("last %d days", a.days), quiet)}, detail, -1)
 	out = append(out, blank())
 
 	// the two parts, the open one underlined in vermilion
@@ -224,6 +225,12 @@ func (a *app) usageView() []string {
 	var values []float64
 	var title, note string
 	var unit func(float64) string
+	// two lists under the chart: what the totals are made of
+	type entry struct{ label, value string }
+	var parts [2]struct {
+		title string
+		rows  []entry
+	}
 	switch a.usageTab {
 	case 0:
 		t := ws.Totals
@@ -238,6 +245,21 @@ func (a *app) usageView() []string {
 		}
 		title, note = "CREDITS USED EACH DAY", "Sleeping workspaces are free."
 		unit = func(v float64) string { return money(int64(v)) }
+		parts[0].title, parts[1].title = "BY SESSION", "BALANCE ACTIVITY"
+		for _, w := range ws.Workspaces {
+			name := "a deleted session"
+			if s, ok := a.session(w.SessionID); ok {
+				name = sessionName(s)
+			}
+			parts[0].rows = append(parts[0].rows, entry{name, money(w.ChargedUSDNanos) + "  ·  " + fmt.Sprintf("%dh %02dm", w.BilledMinutes/60, w.BilledMinutes%60)})
+		}
+		for _, e := range ws.BalanceActivity {
+			amount := money(e.AmountUSDNanos)
+			if e.AmountUSDNanos > 0 {
+				amount = "+" + amount
+			}
+			parts[1].rows = append(parts[1].rows, entry{strings.ReplaceAll(e.Kind, "_", " "), amount + "  ·  " + clock(e.EffectiveAt, a.now)})
+		}
 	default:
 		t := r.Totals
 		cached := 0.0
@@ -254,6 +276,48 @@ func (a *app) usageView() []string {
 		}
 		title, note = "TOKENS EACH DAY", "Barad does not charge for inference; your model providers bill it."
 		unit = func(v float64) string { return tokens(int64(v)) }
+		parts[0].title, parts[1].title = "BY PROVIDER", "BY MODEL"
+		for _, b := range r.Providers {
+			name := b.ProviderResourceName
+			if name == "" {
+				name = providerName(string(b.Provider))
+			}
+			parts[0].rows = append(parts[0].rows, entry{name, tokens(b.Metrics.ProcessedTokens) + "  ·  " + money(b.Metrics.ActualCost.Nanodollars())})
+		}
+		for _, b := range r.Models {
+			parts[1].rows = append(parts[1].rows, entry{b.Model, tokens(b.Metrics.ProcessedTokens) + "  ·  " + money(b.Metrics.ActualCost.Nanodollars())})
+		}
+	}
+	listed := 0
+	for _, p := range parts {
+		listed = max(listed, min(5, len(p.rows)))
+	}
+	var lists []string // the two lists, side by side
+	if listed > 0 {
+		half := (w - 4) / 2
+		row := func(i int) string {
+			var l Line
+			for c, p := range parts {
+				cell := Line{}
+				switch {
+				case i < 0:
+					cell = Line{S(p.title, SFaint.Bold(true))}
+				case i < len(p.rows) && i < 5:
+					e := p.rows[i]
+					cell = spread(Line{S(ansi.Truncate(e.label, half-ansi.StringWidth(e.value)-3, "…"), SText)}, Line{S(e.value, SMuted)}, half)
+				}
+				if c > 0 {
+					l = append(l, gap(4))
+				}
+				l = append(l, cell...)
+				l = append(l, gap(half-cell.Width()))
+			}
+			return at(l)
+		}
+		lists = append(lists, blank(), row(-1))
+		for i := range listed {
+			lists = append(lists, row(i))
+		}
 	}
 
 	// the figures, side by side, each on a rule
@@ -281,7 +345,7 @@ func (a *app) usageView() []string {
 	out = append(out, at(spread(Line{S(title, SFaint.Bold(true))}, Line{S("peak  ", SFaint), S(unit(top), SSec)}, w)), blank())
 
 	// the chart: one bar a day, as tall as the screen allows
-	h := max(4, a.h-1-len(out)-4)
+	h := max(4, a.h-1-len(out)-4-len(lists))
 	n := len(values)
 	barW := func(i int) int { return max(1, (i+1)*(w+1)/n-i*(w+1)/n-1) } // the bars share the whole width
 	for row := h - 1; row >= 0; row-- {
@@ -312,5 +376,7 @@ func (a *app) usageView() []string {
 	}
 	width--
 	axis := spread(Line{S(dates[0], SMuted)}, Line{S("today", Fg(AccentText))}, width)
-	return append(out, at(Line{S(strings.Repeat("─", width), Fg(BorderDefault))}), at(axis), blank(), at(Line{S(note, SFaint)}))
+	out = append(out, at(Line{S(strings.Repeat("─", width), Fg(BorderDefault))}), at(axis))
+	out = append(out, lists...)
+	return append(out, blank(), at(Line{S(note, SFaint)}))
 }

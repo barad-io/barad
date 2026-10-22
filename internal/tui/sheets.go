@@ -88,6 +88,9 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 			return it.run(a)
 		case "esc":
 			mn.confirm = nil
+			if len(mn.items) == 0 { // asked on its own, not from a menu
+				a.menu = nil
+			}
 		}
 		return nil
 	}
@@ -147,19 +150,26 @@ type signOutMsg struct{ err error }
 
 // projectMenu lists the projects, cur checked; choosing one calls pick.
 func (a *app) projectMenu(cur string, pick func(a *app, id string) tea.Cmd) *menu {
-	projects := a.projects
-	if !slices.ContainsFunc(projects, func(p wire.Project) bool { return p.ProjectID == wire.DefaultProjectID }) {
-		projects = append([]wire.Project{{ProjectID: wire.DefaultProjectID, Name: wire.DefaultProjectName}}, projects...)
-	}
 	var items []item
-	for _, p := range projects {
-		if !p.ClosingAt.IsZero() {
-			continue
-		}
-		id, name := p.ProjectID, p.Name
-		items = append(items, item{label: name, check: id == cur, run: func(a *app) tea.Cmd { return pick(a, id) }})
+	for _, p := range a.openProjects() {
+		id := p.ProjectID
+		items = append(items, item{label: p.Name, check: id == cur, run: func(a *app) tea.Cmd { return pick(a, id) }})
 	}
 	return &menu{title: "Project", items: items}
+}
+
+// openProjects is the projects sessions can join, Default among them.
+func (a *app) openProjects() []wire.Project {
+	var out []wire.Project
+	if !slices.ContainsFunc(a.projects, func(p wire.Project) bool { return p.ProjectID == wire.DefaultProjectID }) {
+		out = append(out, wire.Project{ProjectID: wire.DefaultProjectID, Name: wire.DefaultProjectName})
+	}
+	for _, p := range a.projects {
+		if p.ClosingAt.IsZero() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type sharedMsg struct {
@@ -281,8 +291,10 @@ func (a *app) menuView() string {
 	}
 	field := append(Line{S("› ", SAccent.Bold(true))}, mn.q.Lines(inner-4, 1, SText, "type to filter", true)[0]...)
 	lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{})
-	if mn.hint != "" {
-		lines = append(lines, Line{gap(3), S(mn.hint, SMuted)})
+	if mn.hint != "" { // what is loading, or what to do: wrapped to the sheet
+		for _, l := range Wrap([]Seg{S(mn.hint, SMuted)}, inner-6) {
+			lines = append(lines, append(Line{gap(3)}, l...))
+		}
 	}
 	vis := mn.visible()
 	// The items, each group under its heading. A long list scrolls, keeping

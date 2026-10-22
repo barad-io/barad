@@ -74,12 +74,12 @@ func agentFlags(fs *flag.FlagSet, c *call) {
 }
 
 var projectsNew = command{
-	usage: "projects new NAME [--provider P [--model M] [--effort E]] [--repo OWNER/NAME]…",
+	usage: "projects new NAME [--provider P [--model M] [--effort E]] [--repo OWNER/NAME]… [--colour C]",
 	about: "make a project; its sessions start with this agent and clone these repositories",
 	flags: func(fs *flag.FlagSet, c *call) {
 		agentFlags(fs, c)
 		listFlag(fs, c, "repo", "a repository its sessions clone (repeat for more)")
-		strFlag(fs, c, "colour", "its colour: coral, amber, lime, teal, sky, indigo, violet or rose")
+		strFlag(fs, c, "colour", "its colour: "+strings.Join(wire.ProjectColours, ", "))
 	},
 	run: func(c *call) error {
 		name, err := c.arg(0, "the project's name")
@@ -106,7 +106,7 @@ var projectsNew = command{
 }
 
 var projectsEdit = command{
-	usage: "projects edit PROJECT [--name N] [--provider P [--model M] [--effort E] | --no-agent] [--add-repo R]… [--remove-repo R]…",
+	usage: "projects edit PROJECT [--name N] [--colour C] [--provider P [--model M] [--effort E] | --no-agent] [--add-repo R]… [--remove-repo R]…",
 	about: "change a project's name, agent or repositories",
 	flags: func(fs *flag.FlagSet, c *call) {
 		strFlag(fs, c, "name", "its new name")
@@ -114,7 +114,7 @@ var projectsEdit = command{
 		boolFlag(fs, c, "no-agent", "new sessions choose their agent")
 		listFlag(fs, c, "add-repo", "a repository its sessions also clone")
 		listFlag(fs, c, "remove-repo", "a repository its sessions no longer clone")
-		strFlag(fs, c, "colour", "its colour")
+		strFlag(fs, c, "colour", "its colour: "+strings.Join(wire.ProjectColours, ", "))
 	},
 	run: func(c *call) error {
 		q, err := c.arg(0, "the project")

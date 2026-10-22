@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -35,7 +36,7 @@ func pick[T any](kind, query string, all []T, id func(T) string, name func(T) st
 	}
 	switch len(matches) {
 	case 0:
-		return zero, fmt.Errorf("no %s matches %q", kind, query)
+		return zero, noMatch{kind, query}
 	case 1:
 		return matches[0], nil
 	}
@@ -45,6 +46,11 @@ func pick[T any](kind, query string, all []T, id func(T) string, name func(T) st
 	}
 	return zero, fmt.Errorf("%q could be any of: %s; use the ID", query, strings.Join(names, ", "))
 }
+
+// noMatch is pick finding nothing by the name.
+type noMatch struct{ kind, query string }
+
+func (e noMatch) Error() string { return fmt.Sprintf("no %s matches %q", e.kind, e.query) }
 
 func (c *call) project(query string) (wire.Project, error) {
 	all, err := c.api.Projects(c.ctx)
@@ -72,18 +78,37 @@ func hasDefault(ps []wire.Project) bool {
 	return false
 }
 
+// session is a session by ID or name: a live one, or failing that, an
+// archived one.
 func (c *call) session(query string) (wire.Session, error) {
 	all, err := c.api.Sessions(c.ctx)
 	if err != nil {
 		return wire.Session{}, err
 	}
-	var live []wire.Session
+	var live, archived []wire.Session
 	for _, s := range all {
-		if s.ArchivedAt.IsZero() && s.MachineStatus != wire.MachineStatusDeleting {
+		switch {
+		case s.MachineStatus == wire.MachineStatusDeleting:
+		case s.ArchivedAt.IsZero():
 			live = append(live, s)
+		default:
+			archived = append(archived, s)
 		}
 	}
-	return pick("session", query, live, func(s wire.Session) string { return s.SessionID }, sessionName)
+	s, err := pick("session", query, live, func(s wire.Session) string { return s.SessionID }, sessionName)
+	if errors.As(err, &noMatch{}) {
+		return pick("session", query, archived, func(s wire.Session) string { return s.SessionID }, sessionName)
+	}
+	return s, err
+}
+
+// live is a session that is not archived: one that can still work.
+func (c *call) live(query string) (wire.Session, error) {
+	s, err := c.session(query)
+	if err == nil && !s.ArchivedAt.IsZero() {
+		return s, fmt.Errorf("%s is archived: its workspace is gone, and it takes no messages", sessionName(s))
+	}
+	return s, err
 }
 
 // provider is a connection, by ID, name or provider type ("claude").
