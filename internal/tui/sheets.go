@@ -1,0 +1,735 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"image/color"
+	"slices"
+	"strings"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/wire"
+)
+
+// ---------------------------------------------------------------- the menu
+//
+// One menu holds every rare thing: settings with their current values, the
+// other screens, and actions. Type to filter, Enter to choose, Esc to go
+// back. A menu can instead hold one text field (Rename).
+
+type item struct {
+	label, value, key string
+	danger, check     bool
+	run               func(a *app) tea.Cmd
+	sub               func(a *app) *menu
+}
+
+type menu struct {
+	title   string
+	items   []item
+	sel     int
+	q       Editor
+	parent  *menu
+	confirm *item  // an item that asks before it acts
+	ask     string // what the confirmation says
+	hint    string // a line above the items: what is loading, or why there is nothing
+	edit    *Editor
+	submit  func(a *app, text string) tea.Cmd
+	reload  func(a *app) *menu // rebuilds the menu when what it lists arrives
+}
+
+func (mn *menu) visible() []item {
+	var out []item
+	for _, it := range mn.items {
+		if Fuzzy(mn.q.Value(), it.label) {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// showMenu shows a menu, its selection on the current choice.
+func (a *app) showMenu(mn *menu) {
+	for i, it := range mn.items {
+		if it.check {
+			mn.sel = i
+		}
+	}
+	a.menu = mn
+}
+
+// reloadMenu rebuilds the open menu when data it was waiting for arrives.
+func (a *app) reloadMenu() {
+	if mn := a.menu; mn != nil && mn.reload != nil {
+		next := mn.reload(a)
+		next.parent, next.q = mn.parent, mn.q
+		if next.q.Value() == "" {
+			a.showMenu(next)
+		} else {
+			a.menu = next
+		}
+	}
+}
+
+func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
+	mn := a.menu
+	ks := k.String()
+	if mn.confirm != nil {
+		switch ks {
+		case "enter":
+			it := *mn.confirm
+			a.menu = nil
+			return it.run(a)
+		case "esc":
+			mn.confirm = nil
+		}
+		return nil
+	}
+	if mn.edit != nil {
+		switch ks {
+		case "esc":
+			a.menu = mn.parent
+		case "enter":
+			if text := strings.TrimSpace(mn.edit.Value()); text != "" {
+				a.menu = nil
+				return mn.submit(a, text)
+			}
+		default:
+			mn.edit.Key(k)
+		}
+		return nil
+	}
+	vis := mn.visible()
+	switch ks {
+	case "esc":
+		a.menu = mn.parent
+	case "up", "ctrl+p", "shift+tab":
+		mn.sel = max(0, mn.sel-1)
+	case "down", "ctrl+n", "tab":
+		mn.sel = min(len(vis)-1, mn.sel+1)
+	case "enter":
+		if mn.sel >= len(vis) {
+			return nil
+		}
+		it := vis[mn.sel]
+		switch {
+		case it.sub != nil:
+			sub := it.sub(a)
+			sub.parent = mn
+			a.showMenu(sub)
+		case it.danger:
+			mn.confirm = &it
+		case it.run != nil:
+			a.menu = nil
+			return it.run(a)
+		}
+	default:
+		mn.q.Key(k)
+		mn.sel = 0
+	}
+	return nil
+}
+
+func (a *app) homeMenu() *menu {
+	balance := ""
+	if a.balance != nil {
+		balance = money(a.balance.BalanceUSDNanos) + " left"
+	}
+	return &menu{title: "Barad", items: []item{
+		{label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
+		{label: "Search sessions", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
+		{label: "Project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
+			return a.projectMenu(func(a *app, id string) { a.prefs.Project = id; a.sel = ""; a.savePrefs() })
+		}},
+		{label: "Usage", value: balance, run: func(a *app) tea.Cmd { a.screen = screenUsage; return a.loadUsage() }},
+		{label: "Theme", value: a.prefs.Theme, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }},
+		{label: "Sign out", danger: true, run: func(a *app) tea.Cmd {
+			return func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				return signOutMsg{a.api.SignOut(ctx)}
+			}
+		}},
+		{label: "Quit", key: "q", run: func(a *app) tea.Cmd { return tea.Quit }},
+	}, ask: "Sign out of Barad on this computer? Your sessions keep running."}
+}
+
+type signOutMsg struct{ err error }
+
+// projectMenu lists the projects; choosing one calls pick.
+func (a *app) projectMenu(pick func(a *app, id string)) *menu {
+	projects := a.projects
+	if !slices.ContainsFunc(projects, func(p wire.Project) bool { return p.ProjectID == wire.DefaultProjectID }) {
+		projects = append([]wire.Project{{ProjectID: wire.DefaultProjectID, Name: wire.DefaultProjectName}}, projects...)
+	}
+	cur := a.projectID()
+	if a.start != nil {
+		cur = a.start.project
+	}
+	var items []item
+	for _, p := range projects {
+		if !p.ClosingAt.IsZero() {
+			continue
+		}
+		id, name := p.ProjectID, p.Name
+		items = append(items, item{label: name, check: id == cur, run: func(a *app) tea.Cmd { pick(a, id); return nil }})
+	}
+	return &menu{title: "Project", items: items}
+}
+
+func (a *app) chatMenu() *menu {
+	c := a.conv
+	s := c.session
+	var items []item
+	if s.CurrentTurnID != "" {
+		items = append(items, item{label: "Stop the agent", key: "ctrl+x", run: func(a *app) tea.Cmd { return a.cancelTurn() }})
+	}
+	if view, ok := c.openProposal(); ok {
+		items = append(items,
+			item{label: "Approve: " + view.Proposal.Title, run: func(a *app) tea.Cmd {
+				s := a.conv.session
+				return call(func(ctx context.Context) (*wire.SessionProposalDecision, error) {
+					return a.api.ApproveProposal(ctx, s, view)
+				},
+					func(d *wire.SessionProposalDecision, err error) tea.Msg {
+						if err != nil {
+							return doneMsg{say: "Could not approve", err: err}
+						}
+						return doneMsg{say: "Approved — the new session is starting", relist: true, open: d.DestinationID}
+					})
+			}},
+			item{label: "Dismiss the proposal", run: func(a *app) tea.Cmd {
+				id := a.conv.id
+				return call(func(ctx context.Context) (struct{}, error) {
+					return struct{}{}, a.api.DismissProposal(ctx, id, view.Sequence)
+				},
+					func(_ struct{}, err error) tea.Msg { return doneMsg{say: "Dismissed", err: err, resync: true} })
+			}})
+	}
+	if s.MachineStatus == wire.MachineStatusDehydrated && !s.PendingTurn {
+		items = append(items, item{label: "Wake its computer", run: func(a *app) tea.Cmd {
+			id := a.conv.id
+			return call(func(ctx context.Context) (struct{}, error) { return struct{}{}, a.api.Wake(ctx, id) },
+				func(_ struct{}, err error) tea.Msg {
+					return doneMsg{say: "Waking", err: err, resync: true, relist: true}
+				})
+		}})
+	}
+	items = append(items, item{label: "Model", value: s.Model, sub: func(a *app) *menu { return a.modelMenu() }})
+	if efforts := a.efforts(s.ProviderResourceID, s.Model, s.SupportedReasoningEfforts); len(efforts) > 0 {
+		items = append(items, item{label: "Reasoning effort", value: effortLabel(s.ReasoningEffort), sub: func(a *app) *menu { return a.effortMenu() }})
+	}
+	pics := len(c.pictures())
+	items = append(items,
+		item{label: "Images", value: fmt.Sprint(pics), run: func(a *app) tea.Cmd { return a.openImages() }},
+		item{label: "Steps", value: a.prefs.Work.String(), key: "tab", run: func(a *app) tea.Cmd { a.prefs.Work = (a.prefs.Work + 1) % 3; a.savePrefs(); return nil }},
+		item{label: "Attach an image", key: "ctrl+v", run: func(a *app) tea.Cmd {
+			return func() tea.Msg { data, err := clipboardImage(); return clipboardMsg{data, err} }
+		}},
+		item{label: "Share a read-only link", run: func(a *app) tea.Cmd {
+			id := a.conv.id
+			return call(func(ctx context.Context) (*api.Share, error) { return a.api.Share(ctx, id, randomID("share_", 12)) },
+				func(sh *api.Share, err error) tea.Msg { return sharedMsg{sh, err} })
+		}},
+		item{label: "Rename", sub: func(a *app) *menu {
+			e := &Editor{}
+			e.Insert(sessionName(a.conv.session))
+			return &menu{title: "Rename", edit: e, submit: func(a *app, name string) tea.Cmd {
+				st := api.SettingsOf(a.conv.session)
+				st.Name = name
+				return a.updateSettings(st, "Renamed")
+			}}
+		}},
+		item{label: "Theme", value: a.prefs.Theme, run: func(a *app) tea.Cmd { a.toggleTheme(); return nil }},
+		item{label: "Back to sessions", key: "esc", run: func(a *app) tea.Cmd { a.screen, a.sel = screenHome, a.conv.id; return nil }},
+		item{label: "Archive", danger: true, run: func(a *app) tea.Cmd {
+			id := a.conv.id
+			a.screen, a.conv = screenHome, nil
+			return call(func(ctx context.Context) (*wire.Session, error) { return a.api.Archive(ctx, id) },
+				func(_ *wire.Session, err error) tea.Msg { return doneMsg{say: "Archived", err: err, relist: true} })
+		}},
+	)
+	return &menu{title: sessionName(s), items: items, ask: "Archive erases this session's computer for good. The conversation stays readable on the web."}
+}
+
+type sharedMsg struct {
+	share *api.Share
+	err   error
+}
+
+func (a *app) updateSettings(st api.Settings, say string) tea.Cmd {
+	id := a.conv.id
+	return call(func(ctx context.Context) (*wire.Session, error) { return a.api.UpdateSettings(ctx, id, st) },
+		func(s *wire.Session, err error) tea.Msg {
+			if err != nil {
+				return doneMsg{say: "Could not change the session", err: err}
+			}
+			return doneMsg{say: say, session: s, relist: true}
+		})
+}
+
+// efforts are the reasoning efforts a model takes, from its connection's
+// catalog (or, before that loads, what the session reports).
+func (a *app) efforts(provider, name string, fallback []wire.ReasoningEffort) []wire.ReasoningEffort {
+	if cat := a.catalogs[provider]; cat != nil {
+		for _, m := range cat.Models {
+			if m.Model == name {
+				if !m.SupportsReasoningEffort {
+					return nil
+				}
+				return m.ReasoningEfforts
+			}
+		}
+	}
+	return fallback
+}
+
+// effortFor keeps the effort when the model takes it, else the model's own default.
+func (a *app) effortFor(provider, name string, current wire.ReasoningEffort) wire.ReasoningEffort {
+	efforts := a.efforts(provider, name, nil)
+	if len(efforts) == 0 {
+		return ""
+	}
+	if slices.Contains(efforts, current) {
+		return current
+	}
+	if cat := a.catalogs[provider]; cat != nil {
+		for _, m := range cat.Models {
+			if m.Model == name && slices.Contains(efforts, m.DefaultReasoningEffort) {
+				return m.DefaultReasoningEffort
+			}
+		}
+	}
+	return efforts[0]
+}
+
+func effortLabel(e wire.ReasoningEffort) string {
+	if l, ok := map[wire.ReasoningEffort]string{"none": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "extra high", "max": "maximum"}[e]; ok {
+		return l
+	}
+	return string(e)
+}
+
+func (a *app) modelMenu() *menu {
+	s := a.conv.session
+	mn := &menu{title: "Model", reload: func(a *app) *menu { return a.modelMenu() }}
+	cat := a.catalogs[s.ProviderResourceID]
+	if cat == nil {
+		mn.hint = "Loading models…"
+		return mn
+	}
+	for _, m := range cat.Models {
+		name := m.Model
+		mn.items = append(mn.items, item{label: name, check: name == s.Model, run: func(a *app) tea.Cmd {
+			s := a.conv.session
+			st := api.SettingsOf(s)
+			st.Model, st.ExpectedModel = name, s.Model
+			st.ReasoningEffort = a.effortFor(s.ProviderResourceID, name, s.ReasoningEffort)
+			return a.updateSettings(st, "Model: "+name)
+		}})
+	}
+	return mn
+}
+
+func (a *app) effortMenu() *menu {
+	s := a.conv.session
+	var items []item
+	for _, e := range a.efforts(s.ProviderResourceID, s.Model, s.SupportedReasoningEfforts) {
+		items = append(items, item{label: effortLabel(e), check: e == s.ReasoningEffort, run: func(a *app) tea.Cmd {
+			st := api.SettingsOf(a.conv.session)
+			st.ReasoningEffort = e
+			return a.updateSettings(st, "Reasoning effort: "+effortLabel(e))
+		}})
+	}
+	return &menu{title: "Reasoning effort", items: items}
+}
+
+// menuView draws the open menu as a sheet: a strip of ground with its
+// title, then its filter and items on a raised body.
+func (a *app) menuView() string {
+	mn := a.menu
+	w := min(76, a.w-8)
+	inner := w - 8
+	quiet := Fg(lands[a.prefs.Theme].quiet)
+	var lines []Line
+	if mn.confirm != nil {
+		lines = append(lines, Wrap([]Seg{S(mn.ask, SSec)}, inner)...)
+		onDanger := map[string]color.Color{"night": Canvas, "paper": Raised}[a.prefs.Theme]
+		lines = append(lines, Line{}, append(append(button("enter", mn.confirm.label, onDanger, Danger), gap(2)), button("esc", "Cancel", Text, Muted)...))
+		title := Line{S("✕  ", Fg(groundDanger)), S(mn.confirm.label+"?", Fg(groundText).Bold(true))}
+		return sheet(a.prefs.Theme, title, Line{S("esc", quiet)}, lines, w, hex("#5a1f33"))
+	}
+	if mn.edit != nil {
+		field := append(Line{S("› ", SAccent.Bold(true))}, mn.edit.Lines(inner-4, SText, "", true)[0]...)
+		lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{},
+			append(append(button("enter", "Save", OnAccent, Accent), gap(2)), button("esc", "Cancel", Text, Muted)...))
+		return sheet(a.prefs.Theme, Line{S(mn.title, Fg(groundText).Bold(true))}, Line{S("esc", quiet)}, lines, w, nil)
+	}
+	field := append(Line{S("› ", SAccent.Bold(true))}, mn.q.Lines(inner-4, SText, "type to filter", true)[0]...)
+	lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{})
+	if mn.hint != "" {
+		lines = append(lines, Line{gap(3), S(mn.hint, SMuted)})
+	}
+	vis := mn.visible()
+	// a long list scrolls, keeping the selection in view
+	const most = 14
+	first := min(max(0, mn.sel-most/2), max(0, len(vis)-most))
+	for i := first; i < min(len(vis), first+most); i++ {
+		it := vis[i]
+		st := SText
+		if it.danger {
+			st = SDanger
+		}
+		l := Line{gap(2)}
+		if it.check {
+			l = Line{S("✓ ", SOk)}
+		}
+		l = append(l, S(ansi.Truncate(it.label, inner-30, "…"), st))
+		right := Line{}
+		if it.value != "" {
+			right = append(right, S(ansi.Truncate(it.value, 24, "…"), SMuted))
+		}
+		if it.key != "" {
+			right = append(right, gap(3), S(it.key, SFaint))
+		}
+		if it.sub != nil {
+			right = append(right, S(" ›", SMuted))
+		}
+		l = spread(append(Line{gap(1)}, l...), append(right, gap(1)), inner)
+		if i == mn.sel {
+			l[1].Style = l[1].Style.Bold(true)
+			l = on(l, Muted)
+			l[0] = S("▍", Fg(Accent).Background(Muted))
+		}
+		lines = append(lines, l)
+	}
+	if len(vis) == 0 && mn.hint == "" {
+		lines = append(lines, Line{gap(3), S("Nothing matches.", SMuted)})
+	}
+	if len(vis) > most {
+		lines = append(lines, Line{gap(3), S(fmt.Sprintf("%d of %d", min(len(vis), first+most), len(vis)), SFaint)})
+	}
+	return sheet(a.prefs.Theme, Line{S(ansi.Truncate(mn.title, inner-6, "…"), Fg(groundText).Bold(true))}, Line{S("esc", quiet)}, lines, w, nil)
+}
+
+// ---------------------------------------------------------------- a new session
+
+// A starter is the sheet that starts a session: what to work on, then the
+// agent, repository and project it starts with. It begins from the
+// project's defaults, as the web form does.
+type starter struct {
+	task     Editor
+	field    int // the focused row: 0 the task, then agent, effort, repository, project
+	provider string
+	model    string
+	effort   wire.ReasoningEffort
+	repo     *api.RepositoryRequest
+	project  string
+	busy     bool
+}
+
+const (
+	fieldTask = iota
+	fieldAgent
+	fieldEffort
+	fieldRepo
+	fieldProject
+)
+
+// newSession opens the sheet, starting from the current project.
+func (a *app) newSession(prompt string) tea.Cmd {
+	st := &starter{}
+	st.task.Insert(prompt)
+	a.start = st
+	a.applyProject(a.projectID())
+	var cmds []tea.Cmd
+	if a.repos == nil {
+		cmds = append(cmds, call(a.api.Repositories, func(r []api.Repository, err error) tea.Msg { return reposMsg{r, err} }))
+	}
+	for _, p := range a.providers { // every connection's models, for the agent picker
+		if p.Ready {
+			cmds = append(cmds, a.loadCatalog(p.ResourceID))
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+// applyProject takes a project's starting agent and first repository.
+func (a *app) applyProject(id string) {
+	st := a.start
+	st.project, st.repo = id, nil
+	var project wire.Project
+	for _, p := range a.projects {
+		if p.ProjectID == id {
+			project = p
+		}
+	}
+	if len(project.Repositories) > 0 {
+		r := project.Repositories[0]
+		st.repo = &api.RepositoryRequest{SourceID: r.SourceID, Repository: r.Repository}
+	}
+	if ag := project.Agent; ag != nil && a.ready(ag.ProviderResourceID) {
+		st.provider, st.model, st.effort = ag.ProviderResourceID, ag.Model, ag.ReasoningEffort
+	} else if !a.ready(st.provider) {
+		st.provider, st.model, st.effort = a.usualProvider(), "", ""
+	}
+	st.settle(a)
+}
+
+func (a *app) ready(provider string) bool {
+	return slices.ContainsFunc(a.providers, func(p wire.ProviderView) bool { return p.ResourceID == provider && p.Ready })
+}
+
+// usualProvider is the connection your newest session uses, or the first ready one.
+func (a *app) usualProvider() string {
+	var newest wire.Session
+	for _, s := range a.sessions {
+		if a.ready(s.ProviderResourceID) && s.CreatedAt.After(newest.CreatedAt) {
+			newest = s
+		}
+	}
+	if newest.ProviderResourceID != "" {
+		return newest.ProviderResourceID
+	}
+	for _, p := range a.providers {
+		if p.Ready {
+			return p.ResourceID
+		}
+	}
+	return ""
+}
+
+// settle makes the model and effort valid for the connection's catalog,
+// once it has loaded.
+func (st *starter) settle(a *app) {
+	cat := a.catalogs[st.provider]
+	if cat == nil {
+		return
+	}
+	if !slices.ContainsFunc(cat.Models, func(m wire.ModelCapabilities) bool { return m.Model == st.model }) {
+		st.model = cat.DefaultModel
+	}
+	st.effort = a.effortFor(st.provider, st.model, st.effort)
+}
+
+func (a *app) providerOf(id string) wire.ProviderView {
+	for _, p := range a.providers {
+		if p.ResourceID == id {
+			return p
+		}
+	}
+	return wire.ProviderView{}
+}
+
+func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
+	st := a.start
+	if st.busy {
+		if k.String() == "esc" {
+			a.start = nil
+		}
+		return nil
+	}
+	rows := []int{fieldTask, fieldAgent, fieldEffort, fieldRepo, fieldProject}
+	if len(a.efforts(st.provider, st.model, nil)) == 0 {
+		rows = slices.DeleteFunc(rows, func(r int) bool { return r == fieldEffort })
+	}
+	i := max(0, slices.Index(rows, st.field))
+	switch k.String() {
+	case "esc":
+		a.start = nil
+		return nil
+	case "tab", "down":
+		if k.String() == "tab" || st.field != fieldTask {
+			st.field = rows[(i+1)%len(rows)]
+			return nil
+		}
+	case "shift+tab", "up":
+		if k.String() == "shift+tab" || st.field != fieldTask {
+			st.field = rows[(i+len(rows)-1)%len(rows)]
+			return nil
+		}
+	case "enter":
+		switch st.field {
+		case fieldTask:
+			return a.begin()
+		case fieldAgent:
+			a.showMenu(a.agentMenu())
+		case fieldEffort:
+			var items []item
+			for _, e := range a.efforts(st.provider, st.model, nil) {
+				items = append(items, item{label: effortLabel(e), check: e == st.effort, run: func(a *app) tea.Cmd { a.start.effort = e; return nil }})
+			}
+			a.showMenu(&menu{title: "Reasoning effort", items: items})
+		case fieldRepo:
+			a.showMenu(a.repoMenu())
+		case fieldProject:
+			a.showMenu(a.projectMenu(func(a *app, id string) { a.applyProject(id) }))
+		}
+		return nil
+	}
+	if st.field == fieldTask {
+		st.task.Key(k)
+	}
+	return nil
+}
+
+// agentMenu chooses a connection's model: the connections, each opening
+// its models (or the models directly when there is one connection).
+func (a *app) agentMenu() *menu {
+	var ready []wire.ProviderView
+	for _, p := range a.providers {
+		if p.Ready {
+			ready = append(ready, p)
+		}
+	}
+	modelsOf := func(p wire.ProviderView) func(a *app) *menu {
+		var build func(a *app) *menu
+		build = func(a *app) *menu {
+			mn := &menu{title: p.Name, reload: build}
+			cat := a.catalogs[p.ResourceID]
+			if cat == nil {
+				mn.hint = "Loading models…"
+				return mn
+			}
+			for _, m := range cat.Models {
+				name := m.Model
+				mn.items = append(mn.items, item{label: name, check: a.start.provider == p.ResourceID && a.start.model == name, run: func(a *app) tea.Cmd {
+					a.start.provider, a.start.model = p.ResourceID, name
+					a.start.settle(a)
+					return nil
+				}})
+			}
+			return mn
+		}
+		return build
+	}
+	if len(ready) == 1 {
+		return modelsOf(ready[0])(a)
+	}
+	var items []item
+	for _, p := range ready {
+		p := p
+		items = append(items, item{label: p.Name, value: providerName(string(p.ProviderType)), check: p.ResourceID == a.start.provider,
+			sub: modelsOf(p)})
+	}
+	mn := &menu{title: "Agent", items: items}
+	if len(items) == 0 {
+		mn.hint = "No provider is connected. Connect one on the web, under Providers."
+	}
+	return mn
+}
+
+func (a *app) repoMenu() *menu {
+	mn := &menu{title: "Repository", reload: func(a *app) *menu { return a.repoMenu() }}
+	cur := ""
+	if a.start.repo != nil {
+		cur = a.start.repo.Repository
+	}
+	mn.items = append(mn.items, item{label: "None — a blank workspace", check: cur == "", run: func(a *app) tea.Cmd { a.start.repo = nil; return nil }})
+	if a.repos == nil {
+		mn.hint = "Loading repositories…"
+		return mn
+	}
+	for _, r := range a.repos {
+		r := r
+		mn.items = append(mn.items, item{label: r.FullName, value: r.DefaultBranch, check: strings.EqualFold(r.FullName, cur), run: func(a *app) tea.Cmd {
+			a.start.repo = &api.RepositoryRequest{SourceID: r.SourceID, Repository: r.FullName}
+			return nil
+		}})
+	}
+	return mn
+}
+
+// begin creates the session, then sends it the task.
+func (a *app) begin() tea.Cmd {
+	st := a.start
+	task := strings.TrimSpace(st.task.Value())
+	switch {
+	case task == "":
+		return nil
+	case st.provider == "" || st.model == "":
+		a.say("Choose an agent first")
+		a.toastBad = true
+		return nil
+	}
+	st.busy = true
+	in := api.NewSession{ProviderResourceID: st.provider, Model: st.model, ReasoningEffort: st.effort, ProjectID: st.project}
+	if st.repo != nil {
+		in.Repositories = []api.RepositoryRequest{*st.repo}
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		s, err := a.api.CreateSession(ctx, in)
+		if err != nil {
+			return createdMsg{err: err}
+		}
+		_, err = a.api.SendMessage(ctx, s.SessionID, randomID("msg_", 8), task, nil)
+		return createdMsg{session: s, prompt: task, err: err}
+	}
+}
+
+// startView draws the new session sheet.
+func (a *app) startView() string {
+	st := a.start
+	w := min(88, a.w-8)
+	inner := w - 8
+	var lines []Line
+	field := st.task.Lines(inner-6, SText, "What should the new session work on?", st.field == fieldTask && a.menu == nil)
+	for i, l := range field {
+		lead := gap(2)
+		if i == 0 {
+			lead = S("› ", SAccent.Bold(true))
+		}
+		row := append(Line{gap(1), lead}, l...)
+		lines = append(lines, on(append(row, gap(inner-row.Width())), Muted))
+	}
+	lines = append(lines, Line{})
+
+	p := a.providerOf(st.provider)
+	mark, mc := providerMark(string(p.ProviderType))
+	agent := Line{S(mark+" ", Fg(mc)), S(st.model, SText), S("  ·  "+p.Name, SMuted)}
+	if st.provider == "" {
+		agent = Line{S("no provider connected", SDanger)}
+	} else if st.model == "" {
+		agent = Line{S(Spinner[a.frame%10]+" ", SAgent), S("loading models", SMuted)}
+	}
+	repo := Line{S("none", SMuted), S("  ·  a blank workspace", SFaint)}
+	if st.repo != nil {
+		repo = Line{S(st.repo.Repository, SText), S("  ·  default branch", SMuted)}
+	}
+	rows := []struct {
+		field int
+		k     string
+		v     Line
+	}{
+		{fieldAgent, "AGENT", agent},
+		{fieldEffort, "EFFORT", Line{S(effortLabel(st.effort), SText)}},
+		{fieldRepo, "REPOSITORY", repo},
+		{fieldProject, "PROJECT", Line{S(a.projectName(st.project), SText), S("  ·  its variables and defaults", SMuted)}},
+	}
+	for _, r := range rows {
+		if r.field == fieldEffort && len(a.efforts(st.provider, st.model, nil)) == 0 {
+			continue
+		}
+		l := append(Line{gap(1), S(PadRight(r.k, 14), SFaint.Bold(true))}, r.v...)
+		if st.field == r.field {
+			l = spread(l, Line{S("enter  change", SMuted), gap(1)}, inner)
+			l = on(l, Muted)
+			l[0] = S("▍", Fg(Accent).Background(Muted))
+		}
+		lines = append(lines, l)
+	}
+	lines = append(lines, Line{})
+	if st.busy {
+		lines = append(lines, Line{S(Spinner[a.frame%10]+"  ", SAgent), S("Starting the session", SSec)})
+	} else {
+		lines = append(lines, append(append(button("enter", "Start", OnAccent, Accent), gap(2)), button("tab", "Next field", Text, Muted)...))
+	}
+	quiet := Fg(lands[a.prefs.Theme].quiet)
+	return sheet(a.prefs.Theme, Line{S("New session", Fg(groundText).Bold(true))}, Line{S(a.projectName(st.project), quiet)}, lines, w, nil)
+}
