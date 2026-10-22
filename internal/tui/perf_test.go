@@ -1,40 +1,11 @@
 package tui
 
 import (
-	"fmt"
-	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-
-	"github.com/barad-io/barad/wire"
 )
-
-// long adds a session with a long history: many exchanges, each a run of
-// work with long outputs and a reply with code, as real sessions grow.
-func (f *fakeAPI) long(exchanges int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	at := fakeStart.Add(-48 * time.Hour)
-	fs := &fakeSession{s: wire.Session{SessionID: "ses_long", Name: "A long session", ProviderResourceID: "prov_claude", Provider: "claude", Model: "claude-opus-5",
-		MachineStatus: wire.MachineStatusHydrated, ContextWindowTokens: 200_000, ProjectID: "proj_acme", CreatedAt: at, UpdatedAt: at},
-		turns: map[string]wire.Turn{}, proposals: map[int64]wire.SessionProposalView{}}
-	output := strings.Repeat("ok  \tacme/pkg/something\t0.123s\n", 200)
-	for i := range exchanges {
-		fs.user(fmt.Sprintf("Step %d: look at the failing build and fix what you find. Keep the change small.", i), at, nil)
-		t := fs.turn(fmt.Sprintf("turn_%d", i), at)
-		for j := range 12 {
-			at = at.Add(10 * time.Second)
-			fs.think(t, "Check what the build says before changing anything, then look at the package it names.", at)
-			fs.tool(t, "bash", map[string]any{"command": fmt.Sprintf("go test ./... -run Test%d", j)}, map[string]any{"exit_code": 0, "output": output}, at, 2*time.Second)
-			fs.tool(t, "read", map[string]any{"file_path": "/workspace/web/checkout/cart.go"}, map[string]any{"output": output}, at, 100*time.Millisecond)
-		}
-		fs.reply(t, "Fixed. The build broke because **cart.go** read `total` without the lock.\n\n```go\nfunc (c *Cart) Total() int {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\treturn c.total\n}\n```\n\n- one\n- two\n- three", at)
-		fs.finish(t, wire.TurnStatusCompleted, nil, at)
-	}
-	f.list = append(f.list, fs)
-}
 
 // TestTypingStaysFast holds the app to a frame budget: a key press in a long
 // conversation, and its frame, take under half a frame at 60 Hz (8 ms), even
@@ -42,7 +13,7 @@ func (f *fakeAPI) long(exchanges int) {
 // transcript every frame took 56 ms here.
 func TestTypingStaysFast(t *testing.T) {
 	d := newDriver(t)
-	d.f.long(150)
+	d.f.Long(150)
 	d.run(d.a.list())
 	d.openSession("long session")
 	d.sees("A long session")

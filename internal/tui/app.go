@@ -89,6 +89,8 @@ type app struct {
 	repos             []api.Repository
 	sessionRepos      map[string][]wire.SessionGitRepository // what each session's Git credentials reach
 	instructions      map[string]*wire.WorkspaceInstructions // each session's agent instruction files
+	envs              map[string]*wire.EnvironmentView       // variables, by "sessions/ID" or "projects/ID"
+	branches          map[string]*wire.GitBranches           // by source and repository
 	usage             *wire.UsageReport
 	workspace         *wire.WorkspaceUsage
 	balance           *api.Balance
@@ -148,6 +150,7 @@ func Run(client *api.Client, version string) error {
 
 func newApp(client *api.Client, g Graphics) *app {
 	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]wire.SessionGitRepository{}, instructions: map[string]*wire.WorkspaceInstructions{},
+		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{},
 		reported: map[string]string{}, pics: map[string]*Picture{}, picErr: map[string]string{}, picLoading: map[string]bool{}, md: map[mdKey][]Line{}}
 	a.loadPrefs()
 	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
@@ -280,6 +283,7 @@ type (
 		resync  bool
 		open    string // a session to open
 		session *wire.Session
+		account bool // reload the projects and providers
 	}
 )
 
@@ -496,6 +500,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, a.fail("Could not load your account", msg.err)
 		}
 		a.projects, a.providers = msg.projects, msg.providers
+		a.reloadMenu()
 	case catalogMsg:
 		if msg.err != nil {
 			return a, a.fail("Could not load models", msg.err)
@@ -632,7 +637,32 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.openSession(msg.open)
 			cmds = append(cmds, a.sync())
 		}
+		if msg.account {
+			cmds = append(cmds, a.loadAccount())
+		}
 		return a, tea.Batch(cmds...)
+	case projectMadeMsg:
+		a.projects = append(a.projects, *msg.p)
+		a.prefs.Project, a.sel = msg.p.ProjectID, ""
+		a.savePrefs()
+		a.say("Made " + msg.p.Name + ": set its agent and repositories in the menu")
+		return a, a.loadAccount()
+	case envMsg:
+		if msg.err != nil {
+			delete(a.envs, msg.key) // read it afresh
+			return a, a.fail("Could not change the environment", msg.err)
+		}
+		a.envs[msg.key] = msg.v
+		if msg.say != "" {
+			a.say(msg.say)
+		}
+		a.reloadMenu()
+	case branchesMsg:
+		if msg.err != nil {
+			return a, a.fail("Could not list the branches", msg.err)
+		}
+		a.branches[msg.key] = msg.b
+		a.reloadMenu()
 	case tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
 		return a, a.mouse(msg.(tea.MouseMsg))
 	case tea.MouseWheelMsg:
@@ -675,7 +705,7 @@ func (a *app) synced(msg syncMsg) tea.Cmd {
 	c.syncing = false
 	if msg.err != nil {
 		if api.IsCode(msg.err, "not_found") || isStatus(msg.err, 404) {
-			a.conv, a.screen = nil, screenHome
+			a.conv, a.screen, a.menu = nil, screenHome, nil
 			return tea.Batch(a.fail("That session is gone", msg.err), a.list())
 		}
 		return a.fail("Could not sync the session", msg.err)

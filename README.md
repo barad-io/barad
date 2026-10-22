@@ -39,13 +39,32 @@ Signing in never asks for your password. `barad login` shows a code such as `BCD
 - **The footer** says how many sessions need you and how many are working, and briefly when one finishes.
 - **Your messages**: Ctrl+P and Ctrl+N jump to your previous and next message, as the web app's arrows do.
 - **One menu** (`?`, or Ctrl+K) for everything else, in groups: what needs you now (stop the agent, approve or dismiss a proposed session, wake it); the conversation (copy the last reply, images, steps, attach an image, a read-only share link); the session's settings under its name (rename, model, reasoning effort, fast mode, project, repositories its Git credentials reach, details and agent instructions, archive, delete); and Barad's own (usage, settings: theme, providers, account).
-- **New session** (`n`) starts from your project's agent, repository and effort.
+- **New session** (`n`) starts from your project's agent, effort and repositories; choose others, each repository at a branch, and the variables it receives.
+- **Projects**, in the menu at home: show another, make one, and set the shown one's name, agent, effort, repositories and variables, or delete it.
+- **Variables** of a session (in its menu) or a project: add one, a secret (typed in dots and never shown again), change a value, remove one.
 - **Images**: screenshots the agent took and images you attached. Attach one by dropping the file on the terminal or with Ctrl+V. Text pasted past 64 KB goes as a text attachment.
 - **Usage**: tokens, workspace time and spend over 30 days.
 
 The footer always lists the keys that work on the current screen.
 
 Pictures use the kitty graphics protocol where the terminal draws its Unicode placeholders (kitty, Ghostty) and truecolor half blocks elsewhere, Rex included. `BARAD_GRAPHICS=kitty` or `blocks` overrides the choice. Two themes, night and paper, set the terminal's colours while barad runs, so it looks the same whatever your terminal theme is.
+
+## Without the app
+
+Everything the app does to sessions, projects and their variables is also a command, for scripts and quick changes. `barad help` lists them all; `--json` prints what a command returns, and `--yes` skips a confirmation.
+
+```sh
+barad projects new Payments --provider claude --model claude-opus-5 --effort high --repo acme/api
+barad env set STRIPE_KEY --secret --project payments     # the value is read unseen, or from stdin
+barad sessions new "Upgrade stripe-go to v86" --project payments --repo acme/web@release --env MODE=test
+barad sessions                                           # NAME  STATE  PROJECT  MODEL  ACTIVE  ID
+barad send "stripe" "Run the integration tests too"
+barad sessions edit stripe --fast on --project ops
+barad sessions repos stripe --add acme/infra
+barad sessions archive stripe --yes
+```
+
+Sessions, projects and provider connections are named by ID, or by name: exactly in any case, or by a part only one of them has.
 
 ## Files and settings
 
@@ -59,7 +78,7 @@ barad keeps its files in your config directory (`~/.config/barad` on Linux, `~/L
 
 ## Not here yet
 
-Files and the terminal, a session's environment variables and repository access, and account settings (providers, GitHub, projects, billing). Use the web app at [app.barad.io](https://app.barad.io) for those.
+Files and the terminal; provider connections and source control (adding, renaming, removing); billing (adding credits, terms, usage by workspace and model); device preferences and changing your password. They are coming, in that order of need; until then use the web app at [app.barad.io](https://app.barad.io).
 
 ## Building
 

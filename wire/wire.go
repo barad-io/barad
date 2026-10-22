@@ -190,6 +190,34 @@ type SessionGitRepository struct {
 	CanonicalPath       string `json:"canonical_path"`
 }
 
+// EnvironmentVariable is a variable agent commands and terminal shells
+// receive. A secret's value is never sent back: it reads as empty.
+type EnvironmentVariable struct {
+	Name   string `json:"name"`
+	Secret bool   `json:"secret"`
+	Value  string `json:"value,omitempty"`
+}
+
+// EnvironmentView is a session's or a project's variables at a revision.
+type EnvironmentView struct {
+	Revision  int64                 `json:"revision"`
+	Variables []EnvironmentVariable `json:"variables"`
+}
+
+// EnvironmentMutation sets and removes variables, if the environment is
+// still at ExpectedRevision.
+type EnvironmentMutation struct {
+	ExpectedRevision int64                 `json:"expected_revision"`
+	SetVariables     []EnvironmentVariable `json:"set_variables"`
+	RemoveVariables  []string              `json:"remove_variables"`
+}
+
+// GitBranches are a repository's branches, and which is its default.
+type GitBranches struct {
+	DefaultBranch string   `json:"default_branch"`
+	Branches      []string `json:"branches"`
+}
+
 // WorkspaceInstructionFile is an instruction file the agent read, and how
 // much of it.
 type WorkspaceInstructionFile struct {
@@ -223,6 +251,7 @@ type ProjectRepository struct {
 type Project struct {
 	ProjectID    string              `json:"project_id"`
 	Name         string              `json:"name"`
+	Colour       string              `json:"colour"`
 	Agent        *ProjectAgent       `json:"agent,omitempty"`
 	Repositories []ProjectRepository `json:"repositories"`
 	ClosingAt    time.Time           `json:"closing_at,omitzero"`

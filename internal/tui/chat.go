@@ -71,14 +71,16 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		a.savePrefs()
 		return nil
 	case "ctrl+k":
-		return a.openChatMenu()
+		a.menu = a.chatMenu()
+		return nil
 	case "ctrl+p":
 		return a.jump(-1)
 	case "ctrl+n":
 		return a.jump(1)
 	case "?":
 		if empty {
-			return a.openChatMenu()
+			a.menu = a.chatMenu()
+			return nil
 		}
 	case "ctrl+v":
 		return func() tea.Msg {

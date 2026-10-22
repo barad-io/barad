@@ -127,11 +127,12 @@ func (c *Client) UpdateSettings(ctx context.Context, sessionID string, in Settin
 
 // NewSession is what a session starts with.
 type NewSession struct {
-	ProviderResourceID string               `json:"provider_resource_id"`
-	Model              string               `json:"model,omitempty"`
-	ReasoningEffort    wire.ReasoningEffort `json:"reasoning_effort,omitempty"`
-	ProjectID          string               `json:"project_id,omitempty"`
-	Repositories       []RepositoryRequest  `json:"repositories,omitempty"`
+	ProviderResourceID string                     `json:"provider_resource_id"`
+	Model              string                     `json:"model,omitempty"`
+	ReasoningEffort    wire.ReasoningEffort       `json:"reasoning_effort,omitempty"`
+	ProjectID          string                     `json:"project_id,omitempty"`
+	Repositories       []RepositoryRequest        `json:"repositories,omitempty"`
+	Environment        []wire.EnvironmentVariable `json:"environment,omitempty"`
 }
 
 func (c *Client) CreateSession(ctx context.Context, in NewSession) (*wire.Session, error) {
@@ -166,6 +167,72 @@ func (c *Client) Projects(ctx context.Context) ([]wire.Project, error) {
 	}
 	err := c.Do(ctx, http.MethodGet, "/projects", nil, &out)
 	return out.Projects, err
+}
+
+// ProjectSettings are what a project is: its name, colour, the agent its new
+// sessions start with, and the repositories they clone. Saving replaces all
+// of them.
+type ProjectSettings struct {
+	Name         string                   `json:"name"`
+	Colour       string                   `json:"colour"`
+	Agent        *wire.ProjectAgent       `json:"agent"`
+	Repositories []wire.ProjectRepository `json:"repositories"`
+}
+
+// SettingsOfProject is p's current settings, to change one of.
+func SettingsOfProject(p wire.Project) ProjectSettings {
+	return ProjectSettings{Name: p.Name, Colour: p.Colour, Agent: p.Agent, Repositories: append([]wire.ProjectRepository{}, p.Repositories...)}
+}
+
+func (c *Client) CreateProject(ctx context.Context, in ProjectSettings) (*wire.Project, error) {
+	var out wire.Project
+	err := c.Do(ctx, http.MethodPost, "/projects", in, &out)
+	return &out, err
+}
+
+func (c *Client) UpdateProject(ctx context.Context, projectID string, in ProjectSettings) (*wire.Project, error) {
+	var out wire.Project
+	err := c.Do(ctx, http.MethodPut, "/projects/"+escape(projectID), in, &out)
+	return &out, err
+}
+
+// DeleteProject closes a project: its sessions move to Default; no session,
+// transcript or workspace is deleted.
+func (c *Client) DeleteProject(ctx context.Context, projectID string) error {
+	return c.Do(ctx, http.MethodDelete, "/projects/"+escape(projectID), nil, nil)
+}
+
+// An EnvironmentOwner is whose variables they are: a session's or a project's.
+type EnvironmentOwner struct {
+	Kind string // "sessions" or "projects"
+	ID   string
+}
+
+func (o EnvironmentOwner) path() string { return "/" + o.Kind + "/" + escape(o.ID) + "/environment" }
+
+func (c *Client) Environment(ctx context.Context, o EnvironmentOwner) (*wire.EnvironmentView, error) {
+	var out wire.EnvironmentView
+	err := c.Do(ctx, http.MethodGet, o.path(), nil, &out)
+	return &out, err
+}
+
+func (c *Client) ChangeEnvironment(ctx context.Context, o EnvironmentOwner, in wire.EnvironmentMutation) (*wire.EnvironmentView, error) {
+	if in.SetVariables == nil {
+		in.SetVariables = []wire.EnvironmentVariable{}
+	}
+	if in.RemoveVariables == nil {
+		in.RemoveVariables = []string{}
+	}
+	var out wire.EnvironmentView
+	err := c.Do(ctx, http.MethodPut, o.path(), in, &out)
+	return &out, err
+}
+
+// Branches lists a repository's branches through the Git source that reaches it.
+func (c *Client) Branches(ctx context.Context, sourceID, repository string) (*wire.GitBranches, error) {
+	var out wire.GitBranches
+	err := c.Do(ctx, http.MethodGet, "/account/git-sources/"+escape(sourceID)+"/branches?repository="+url.QueryEscape(repository), nil, &out)
+	return &out, err
 }
 
 func (c *Client) DismissProposal(ctx context.Context, sessionID string, sequence int64) error {

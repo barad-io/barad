@@ -41,7 +41,10 @@ type menu struct {
 	hint    string // a line above the items: what is loading, or why there is nothing
 	edit    *Editor
 	submit  func(a *app, text string) tea.Cmd
+	about   string             // what an edit field takes, shown when it is empty
+	mask    bool               // the edit field is a secret: it shows dots
 	reload  func(a *app) *menu // rebuilds the menu when what it lists arrives
+	load    tea.Cmd            // fetches what the menu lists, when it opens
 }
 
 func (mn *menu) visible() []item {
@@ -64,16 +67,13 @@ func (a *app) showMenu(mn *menu) {
 	a.menu = mn
 }
 
-// reloadMenu rebuilds the open menu when data it was waiting for arrives.
+// reloadMenu rebuilds the open menu when what it shows changes, keeping
+// your place in it.
 func (a *app) reloadMenu() {
 	if mn := a.menu; mn != nil && mn.reload != nil {
 		next := mn.reload(a)
-		next.parent, next.q = mn.parent, mn.q
-		if next.q.Value() == "" {
-			a.showMenu(next)
-		} else {
-			a.menu = next
-		}
+		next.parent, next.q, next.sel = mn.parent, mn.q, max(0, min(mn.sel, len(next.items)-1)) // where you were
+		a.menu = next
 	}
 }
 
@@ -95,6 +95,7 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 		switch ks {
 		case "esc":
 			a.menu = mn.parent
+			a.reloadMenu()
 		case "enter":
 			if text := strings.TrimSpace(mn.edit.Value()); text != "" {
 				a.menu = nil
@@ -109,6 +110,7 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 	switch ks {
 	case "esc":
 		a.menu = mn.parent
+		a.reloadMenu()
 	case "up", "ctrl+p", "shift+tab":
 		mn.sel = max(0, mn.sel-1)
 	case "down", "ctrl+n", "tab":
@@ -123,6 +125,7 @@ func (a *app) menuKey(k tea.KeyPressMsg) tea.Cmd {
 			sub := it.sub(a)
 			sub.parent = mn
 			a.showMenu(sub)
+			return sub.load
 		case it.danger:
 			mn.confirm = &it
 		case it.run != nil && it.stay:
@@ -267,7 +270,11 @@ func (a *app) menuView() string {
 		return sheet(a.prefs.Theme, title, Line{S("esc", quiet)}, lines, w, hex("#5a1f33"))
 	}
 	if mn.edit != nil {
-		field := append(Line{S("› ", SAccent.Bold(true))}, mn.edit.Lines(inner-4, 1, SText, "", true)[0]...)
+		shown := mn.edit
+		if mn.mask { // a secret shows a dot for each character
+			shown = &Editor{Text: []rune(strings.Repeat("•", len(mn.edit.Text))), Pos: mn.edit.Pos}
+		}
+		field := append(Line{S("› ", SAccent.Bold(true))}, shown.Lines(inner-4, 1, SText, mn.about, true)[0]...)
 		lines = append(lines, on(append(append(Line{gap(1)}, field...), gap(inner-field.Width()-1)), Muted), Line{},
 			append(append(button("enter", "Save", OnAccent, Accent), gap(2)), button("esc", "Cancel", Text, Muted)...))
 		return sheet(a.prefs.Theme, Line{S(mn.title, Fg(groundText).Bold(true))}, Line{S("esc", quiet)}, lines, w, nil)
@@ -357,11 +364,12 @@ func (a *app) menuView() string {
 // project's defaults, as the web form does.
 type starter struct {
 	task     Editor
-	field    int // the focused row: 0 the task, then agent, effort, repository, project
+	field    int // the focused row: 0 the task, then agent, effort, repositories, environment, project
 	provider string
 	model    string
 	effort   wire.ReasoningEffort
-	repo     *api.RepositoryRequest
+	repos    []api.RepositoryRequest    // cloned when the workspace is made, each at its branch ("" its default)
+	env      []wire.EnvironmentVariable // what its agent's commands and shells receive
 	project  string
 	busy     bool
 }
@@ -371,6 +379,7 @@ const (
 	fieldAgent
 	fieldEffort
 	fieldRepo
+	fieldEnv
 	fieldProject
 )
 
@@ -392,19 +401,13 @@ func (a *app) newSession(prompt string) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// applyProject takes a project's starting agent and first repository.
+// applyProject takes a project's starting agent and its repositories.
 func (a *app) applyProject(id string) {
 	st := a.start
-	st.project, st.repo = id, nil
-	var project wire.Project
-	for _, p := range a.projects {
-		if p.ProjectID == id {
-			project = p
-		}
-	}
-	if len(project.Repositories) > 0 {
-		r := project.Repositories[0]
-		st.repo = &api.RepositoryRequest{SourceID: r.SourceID, Repository: r.Repository}
+	st.project, st.repos = id, nil
+	project := a.project(id)
+	for _, r := range project.Repositories {
+		st.repos = append(st.repos, api.RepositoryRequest{SourceID: r.SourceID, Repository: r.Repository})
 	}
 	if ag := project.Agent; ag != nil && a.ready(ag.ProviderResourceID) {
 		st.provider, st.model, st.effort = ag.ProviderResourceID, ag.Model, ag.ReasoningEffort
@@ -467,7 +470,7 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
-	rows := []int{fieldTask, fieldAgent, fieldEffort, fieldRepo, fieldProject}
+	rows := []int{fieldTask, fieldAgent, fieldEffort, fieldRepo, fieldEnv, fieldProject}
 	if len(a.efforts(st.provider, st.model, nil)) == 0 {
 		rows = slices.DeleteFunc(rows, func(r int) bool { return r == fieldEffort })
 	}
@@ -491,7 +494,13 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		case fieldTask:
 			return a.begin()
 		case fieldAgent:
-			a.showMenu(a.agentMenu())
+			mn := a.agentMenu(st.provider, st.model, func(a *app, provider, model string) tea.Cmd {
+				a.start.provider, a.start.model = provider, model
+				a.start.settle(a)
+				return nil
+			})
+			a.showMenu(mn)
+			return mn.load
 		case fieldEffort:
 			var items []item
 			for _, e := range a.efforts(st.provider, st.model, nil) {
@@ -499,7 +508,20 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 			}
 			a.showMenu(&menu{title: "Reasoning effort", items: items})
 		case fieldRepo:
-			a.showMenu(a.repoMenu())
+			mn := a.startReposMenu()
+			a.showMenu(mn)
+			return mn.load
+		case fieldEnv:
+			a.showMenu(a.envMenu("Environment", "The new session's agent commands and terminal shells receive these.",
+				func(a *app) []wire.EnvironmentVariable { return a.start.env },
+				func(a *app, v wire.EnvironmentVariable) tea.Cmd {
+					a.start.env = append(slices.DeleteFunc(a.start.env, func(x wire.EnvironmentVariable) bool { return x.Name == v.Name }), v)
+					return nil
+				},
+				func(a *app, name string) tea.Cmd {
+					a.start.env = slices.DeleteFunc(a.start.env, func(x wire.EnvironmentVariable) bool { return x.Name == name })
+					return nil
+				}))
 		case fieldProject:
 			a.showMenu(a.projectMenu(st.project, func(a *app, id string) tea.Cmd { a.applyProject(id); return nil }))
 		}
@@ -509,73 +531,6 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		st.task.Key(k, a.taskWidth())
 	}
 	return nil
-}
-
-// agentMenu chooses a connection's model: the connections, each opening
-// its models (or the models directly when there is one connection).
-func (a *app) agentMenu() *menu {
-	var ready []wire.ProviderView
-	for _, p := range a.providers {
-		if p.Ready {
-			ready = append(ready, p)
-		}
-	}
-	modelsOf := func(p wire.ProviderView) func(a *app) *menu {
-		var build func(a *app) *menu
-		build = func(a *app) *menu {
-			mn := &menu{title: p.Name, reload: build}
-			cat := a.catalogs[p.ResourceID]
-			if cat == nil {
-				mn.hint = "Loading models…"
-				return mn
-			}
-			for _, m := range cat.Models {
-				name := m.Model
-				mn.items = append(mn.items, item{label: name, check: a.start.provider == p.ResourceID && a.start.model == name, run: func(a *app) tea.Cmd {
-					a.start.provider, a.start.model = p.ResourceID, name
-					a.start.settle(a)
-					return nil
-				}})
-			}
-			return mn
-		}
-		return build
-	}
-	if len(ready) == 1 {
-		return modelsOf(ready[0])(a)
-	}
-	var items []item
-	for _, p := range ready {
-		p := p
-		items = append(items, item{label: p.Name, value: providerName(string(p.ProviderType)), check: p.ResourceID == a.start.provider,
-			sub: modelsOf(p)})
-	}
-	mn := &menu{title: "Agent", items: items}
-	if len(items) == 0 {
-		mn.hint = "No provider is connected. Connect one on the web, under Providers."
-	}
-	return mn
-}
-
-func (a *app) repoMenu() *menu {
-	mn := &menu{title: "Repository", reload: func(a *app) *menu { return a.repoMenu() }}
-	cur := ""
-	if a.start.repo != nil {
-		cur = a.start.repo.Repository
-	}
-	mn.items = append(mn.items, item{label: "None — a blank workspace", check: cur == "", run: func(a *app) tea.Cmd { a.start.repo = nil; return nil }})
-	if a.repos == nil {
-		mn.hint = "Loading repositories…"
-		return mn
-	}
-	for _, r := range a.repos {
-		r := r
-		mn.items = append(mn.items, item{label: r.FullName, value: r.DefaultBranch, check: strings.EqualFold(r.FullName, cur), run: func(a *app) tea.Cmd {
-			a.start.repo = &api.RepositoryRequest{SourceID: r.SourceID, Repository: r.FullName}
-			return nil
-		}})
-	}
-	return mn
 }
 
 // begin creates the session, then sends it the task.
@@ -591,10 +546,7 @@ func (a *app) begin() tea.Cmd {
 		return nil
 	}
 	st.busy = true
-	in := api.NewSession{ProviderResourceID: st.provider, Model: st.model, ReasoningEffort: st.effort, ProjectID: st.project}
-	if st.repo != nil {
-		in.Repositories = []api.RepositoryRequest{*st.repo}
-	}
+	in := api.NewSession{ProviderResourceID: st.provider, Model: st.model, ReasoningEffort: st.effort, ProjectID: st.project, Repositories: st.repos, Environment: st.env}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -637,8 +589,24 @@ func (a *app) startView() string {
 		agent = Line{S(Spinner[a.frame%10]+" ", SAgent), S("loading models", SMuted)}
 	}
 	repo := Line{S("none", SMuted), S("  ·  a blank workspace", SFaint)}
-	if st.repo != nil {
-		repo = Line{S(st.repo.Repository, SText), S("  ·  default branch", SMuted)}
+	if len(st.repos) > 0 {
+		var names []string
+		for _, r := range st.repos {
+			n := r.Repository
+			if r.RequestedRef != "" {
+				n += " @" + r.RequestedRef
+			}
+			names = append(names, n)
+		}
+		repo = Line{S(ansi.Truncate(strings.Join(names, ", "), inner-30, "…"), SText)}
+	}
+	env := Line{S("none", SMuted)}
+	if len(st.env) > 0 {
+		var names []string
+		for _, v := range st.env {
+			names = append(names, v.Name)
+		}
+		env = Line{S(ansi.Truncate(strings.Join(names, ", "), inner-30, "…"), SText)}
 	}
 	rows := []struct {
 		field int
@@ -647,7 +615,8 @@ func (a *app) startView() string {
 	}{
 		{fieldAgent, "AGENT", agent},
 		{fieldEffort, "EFFORT", Line{S(effortLabel(st.effort), SText)}},
-		{fieldRepo, "REPOSITORY", repo},
+		{fieldRepo, "REPOSITORIES", repo},
+		{fieldEnv, "ENVIRONMENT", env},
 		{fieldProject, "PROJECT", Line{S(a.projectName(st.project), SText), S("  ·  its variables and defaults", SMuted)}},
 	}
 	for _, r := range rows {

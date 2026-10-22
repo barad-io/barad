@@ -6,6 +6,8 @@
 //	barad logout     sign out on this computer
 //	barad version    the release this is
 //	barad update     replace barad with its newest release
+//	barad help       every command, including those that change sessions,
+//	                 projects and their variables without the app
 //
 // Credentials live in the user config directory (~/.config/barad on Linux),
 // readable only by you. BARAD_API_URL points it at another stack;
@@ -25,6 +27,7 @@ import (
 	"time"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/cli"
 	"github.com/barad-io/barad/internal/tui"
 	"github.com/barad-io/barad/internal/update"
 )
@@ -72,10 +75,18 @@ func run(args []string) error {
 	case "update":
 		return selfUpdate()
 	case "help", "-h", "--help":
-		fmt.Println("usage: barad [login | logout | update | version]")
-		return nil
+		fmt.Print("usage: barad [COMMAND]\n\n  barad            the app (it signs you in first)\n  barad login      sign in: approve this computer in your browser\n  barad logout     sign out on this computer\n  barad update     replace barad with its newest release\n  barad version    the release this is\n")
+		return cli.Help(os.Stdout, "")
 	}
-	return fmt.Errorf("unknown command %q (try: barad, barad login, barad logout, barad update, barad version)", command)
+	if cli.Known(command) {
+		if !client.SignedIn() {
+			return errors.New("you are signed out; run barad login")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		return cli.Run(ctx, client, args, os.Stdin, os.Stdout)
+	}
+	return fmt.Errorf("unknown command %q; barad help lists them", command)
 }
 
 // selfUpdate replaces this barad with the newest release, once its signed

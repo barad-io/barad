@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/fakeapi"
 	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
@@ -27,15 +29,15 @@ import (
 type driver struct {
 	t *testing.T
 	a *app
-	f *fakeAPI
+	f *fakeapi.API
 }
 
 func newDriver(t *testing.T) *driver {
 	frameEvery = 0
 	t.Setenv("BARAD_THEME", "night")
-	f := newFakeAPI(0)
-	t.Cleanup(f.srv.Close)
-	d := &driver{t: t, a: newApp(f.signIn(t, t.TempDir()), GraphicsBlocks), f: f}
+	f := fakeapi.New(0)
+	t.Cleanup(f.Srv.Close)
+	d := &driver{t: t, a: newApp(f.SignIn(t, t.TempDir()), GraphicsBlocks), f: f}
 	d.send(tea.WindowSizeMsg{Width: 150, Height: 50})
 	d.run(d.a.Init())
 	return d
@@ -130,9 +132,9 @@ func (d *driver) reads(want ...string) {
 }
 
 func (d *driver) fake(id string) wire.Session {
-	d.f.mu.Lock()
-	defer d.f.mu.Unlock()
-	return d.f.find(id).s
+	d.f.Mu.Lock()
+	defer d.f.Mu.Unlock()
+	return d.f.Find(id).S
 }
 
 // openSession finds a session by searching for it.
@@ -167,7 +169,7 @@ func TestConversationShowsWorkFoldedThenUnfolded(t *testing.T) {
 	d.reads("thought", "The failure is intermittent", "ran", "go test ./checkout/ -race -count=20", "FAIL: TestCartTotals",
 		"edited", "/workspace/web/checkout/cart.go", "+1 −0", "captured", "ok    acme/checkout", "6 lines")
 	if d.a.pics["shot/12"] == nil {
-		t.Fatalf("the screenshot was not loaded: %v %v", d.a.picErr, d.f.calls)
+		t.Fatalf("the screenshot was not loaded: %v %v", d.a.picErr, d.f.Calls)
 	}
 
 	d.keys("tab") // full output
@@ -196,21 +198,21 @@ func TestSendingAMessageShowsTheAgentsAnswer(t *testing.T) {
 
 func TestStreamedTextShowsUntilItIsCommitted(t *testing.T) {
 	c := newConversation(wire.Session{SessionID: "s"})
-	fs := &fakeSession{s: wire.Session{SessionID: "s", CurrentTurnID: "t1"}, turns: map[string]wire.Turn{}}
-	fs.user("hello", time.Now(), nil)
-	fs.turn("t1", time.Now())
-	fs.event("t1", "st", wire.EventKindModelDelta, map[string]any{"delta": "Hel"})
-	fs.event("t1", "st", wire.EventKindModelDelta, map[string]any{"delta": "lo there"})
-	c.applySync(&api.Sync{Session: fs.s, Items: fs.items, Events: fs.events, EventNextCursor: fs.ev, TranscriptNextCursor: fs.seq})
+	fs := &fakeapi.Session{S: wire.Session{SessionID: "s", CurrentTurnID: "t1"}, Turns: map[string]wire.Turn{}}
+	fs.User("hello", time.Now(), nil)
+	fs.Turn("t1", time.Now())
+	fs.Event("t1", "st", wire.EventKindModelDelta, map[string]any{"delta": "Hel"})
+	fs.Event("t1", "st", wire.EventKindModelDelta, map[string]any{"delta": "lo there"})
+	c.applySync(&api.Sync{Session: fs.S, Items: fs.Items, Events: fs.Events, EventNextCursor: fs.Ev, TranscriptNextCursor: fs.Seq})
 	exs := c.exchanges()
 	last := exs[len(exs)-1].parts
 	if p := last[len(last)-1]; p.kind != partText || !p.live || p.text != "Hello there" {
 		t.Fatalf("live part = %+v", p)
 	}
-	fs.reply("t1", "Hello there.", time.Now())
-	fs.items[len(fs.items)-1].StreamID = "st"
-	fs.finish("t1", wire.TurnStatusCompleted, nil, time.Now())
-	c.applySync(&api.Sync{Session: fs.s, Items: fs.items[1:], EventNextCursor: fs.ev, TranscriptNextCursor: fs.seq})
+	fs.Reply("t1", "Hello there.", time.Now())
+	fs.Items[len(fs.Items)-1].StreamID = "st"
+	fs.Finish("t1", wire.TurnStatusCompleted, nil, time.Now())
+	c.applySync(&api.Sync{Session: fs.S, Items: fs.Items[1:], EventNextCursor: fs.Ev, TranscriptNextCursor: fs.Seq})
 	if c.liveText != "" {
 		t.Fatalf("live text %q survived its commit", c.liveText)
 	}
@@ -221,18 +223,18 @@ func TestStreamedTextShowsUntilItIsCommitted(t *testing.T) {
 }
 
 func TestExchangesPairCallsWithResultsAndEndTurns(t *testing.T) {
-	fs := &fakeSession{s: wire.Session{SessionID: "s"}, turns: map[string]wire.Turn{}}
+	fs := &fakeapi.Session{S: wire.Session{SessionID: "s"}, Turns: map[string]wire.Turn{}}
 	now := time.Now()
-	fs.user("one", now, nil)
-	fs.turn("t1", now)
-	fs.tool("t1", "bash", map[string]any{"command": "make"}, map[string]any{"exit_code": 2, "output": "boom"}, now, time.Second)
-	fs.finish("t1", wire.TurnStatusFailed, &wire.ErrorInfo{Message: "it broke"}, now)
-	fs.user("two", now, nil)
-	fs.turn("t2", now)
-	fs.reply("t2", "ok", now)
-	fs.finish("t2", wire.TurnStatusCancelled, nil, now)
-	c := newConversation(fs.s)
-	c.applySync(&api.Sync{Session: fs.s, Items: fs.items, Turns: []wire.Turn{fs.turns["t1"], fs.turns["t2"]}})
+	fs.User("one", now, nil)
+	fs.Turn("t1", now)
+	fs.Tool("t1", "bash", map[string]any{"command": "make"}, map[string]any{"exit_code": 2, "output": "boom"}, now, time.Second)
+	fs.Finish("t1", wire.TurnStatusFailed, &wire.ErrorInfo{Message: "it broke"}, now)
+	fs.User("two", now, nil)
+	fs.Turn("t2", now)
+	fs.Reply("t2", "ok", now)
+	fs.Finish("t2", wire.TurnStatusCancelled, nil, now)
+	c := newConversation(fs.S)
+	c.applySync(&api.Sync{Session: fs.S, Items: fs.Items, Turns: []wire.Turn{fs.Turns["t1"], fs.Turns["t2"]}})
 	exs := c.exchanges()
 	if len(exs) != 2 || exs[0].user.text != "one" || exs[1].user.text != "two" {
 		t.Fatalf("exchanges = %+v", exs)
@@ -282,19 +284,42 @@ func TestMenuRenamesChangesModelAndArchives(t *testing.T) {
 func TestNewSessionStartsWithTheProjectsDefaults(t *testing.T) {
 	d := newDriver(t)
 	d.keys("n")
-	d.sees("New session", "AGENT", "claude-opus-5", "Claude Max", "EFFORT", "high", "REPOSITORY", "acme/web", "PROJECT", "Acme")
-	d.keys("tab", "tab", "tab", "enter") // the repository picker
-	d.sees("None — a blank workspace", "acme/infra")
+	d.sees("New session", "AGENT", "claude-opus-5", "Claude Max", "EFFORT", "high", "REPOSITORIES", "acme/web", "ENVIRONMENT", "none", "PROJECT", "Acme")
+
+	// Repositories: add acme/infra, and clone acme/web at a branch.
+	d.keys("tab", "tab", "tab", "enter")
+	d.sees("Cloned once, when the workspace is made", "✓ acme/web", "main (default)", "acme/infra")
 	d.keys("infra", "enter")
-	d.sees("acme/infra")
+	d.sees("✓ acme/infra")
+	d.keys("ctrl+u", "web", "enter") // open acme/web
+	d.sees("BRANCH", "main", "default", "release", "spike/queue", "Leave it out")
+	d.keys("release", "enter")
+	d.sees("acme/web", "release")
+	d.keys("esc")
+	d.sees("acme/web @release, acme/infra")
+
+	// Environment: a variable and a secret, the secret's value in dots.
+	d.keys("tab", "enter")
+	d.keys("variable", "enter", "MODE=test", "enter")
+	d.sees("MODE")
+	d.keys("enter", "secret", "enter", "TOKEN", "enter", "s3cr3t")
+	d.sees("••••••")
+	d.misses("s3cr3t")
+	d.keys("enter")
+	d.sees("MODE, TOKEN")
+
 	d.keys("tab", "tab", "Write a changelog", "enter") // around to the task
 	d.sees("Write a changelog", "Done. I made the change")
 	s := d.a.conv.session
 	if s.Model != "claude-opus-5" || s.ReasoningEffort != "high" || s.ProjectID != "proj_acme" {
 		t.Fatalf("session = %+v", s)
 	}
-	if repos := d.f.find(s.SessionID).repos; len(repos) != 1 || repos[0] != "acme/infra" {
-		t.Fatalf("repositories = %v", repos)
+	created := d.f.Find(s.SessionID).Created
+	repos, _ := json.Marshal(created["repositories"])
+	env, _ := json.Marshal(created["environment"])
+	if string(repos) != `[{"repository":"acme/web","requested_ref":"release","source_id":"src_1"},{"repository":"acme/infra","source_id":"src_1"}]` ||
+		string(env) != `[{"name":"MODE","secret":false,"value":"test"},{"name":"TOKEN","secret":true,"value":"s3cr3t"}]` {
+		t.Fatalf("started with %s and %s", repos, env)
 	}
 }
 
@@ -315,15 +340,15 @@ func TestAttachingAnImageUploadsItWithTheMessage(t *testing.T) {
 	d := newDriver(t)
 	d.openSession("checkout")
 	path := filepath.Join(t.TempDir(), "mock.png")
-	if err := os.WriteFile(path, picture(320, 200, 3), 0o600); err != nil {
+	if err := os.WriteFile(path, fakeapi.Picture(320, 200, 3), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	d.send(tea.PasteMsg{Content: path})
 	d.sees("▣ mock.png", "320×200", "it uploads when you send")
 	d.keys("Does it look like this?", "enter")
-	d.f.mu.Lock()
-	stored := len(d.f.media)
-	d.f.mu.Unlock()
+	d.f.Mu.Lock()
+	stored := len(d.f.Media)
+	d.f.Mu.Unlock()
 	if stored != 1 {
 		t.Fatalf("%d images uploaded", stored)
 	}
@@ -367,12 +392,12 @@ func TestLongPastesGoAsATextAttachment(t *testing.T) {
 		t.Fatal("the paste went into the message too")
 	}
 	d.keys("Why does this fail?", "enter")
-	d.f.mu.Lock()
+	d.f.Mu.Lock()
 	var got []byte
-	for _, data := range d.f.media {
+	for _, data := range d.f.Media {
 		got = data
 	}
-	d.f.mu.Unlock()
+	d.f.Mu.Unlock()
 	if string(got) != long {
 		t.Fatalf("uploaded %d bytes, want %d", len(got), len(long))
 	}
@@ -398,9 +423,9 @@ func TestEveryScreenFitsSmallWindows(t *testing.T) {
 }
 
 func TestSignInWithADeviceCode(t *testing.T) {
-	f := newFakeAPI(0)
-	t.Cleanup(f.srv.Close)
-	client := f.signIn(t, t.TempDir())
+	f := fakeapi.New(0)
+	t.Cleanup(f.Srv.Close)
+	client := f.SignIn(t, t.TempDir())
 	if err := client.SignOut(context.Background()); err != nil || client.SignedIn() {
 		t.Fatalf("sign out: %v, still signed in %v", err, client.SignedIn())
 	}
@@ -416,8 +441,8 @@ func TestSignInWithADeviceCode(t *testing.T) {
 	if err := client.FinishSignIn(ctx, started); err != nil {
 		t.Fatal(err)
 	}
-	if !client.SignedIn() || client.Email() != "you@example.com" || f.polls != 2 {
-		t.Fatalf("signed in %v as %q after %d polls", client.SignedIn(), client.Email(), f.polls)
+	if !client.SignedIn() || client.Email() != "you@example.com" || f.Polls != 2 {
+		t.Fatalf("signed in %v as %q after %d polls", client.SignedIn(), client.Email(), f.Polls)
 	}
 	// The stored session is the one the app uses.
 	if _, err := client.Sessions(ctx); err != nil {
@@ -501,10 +526,10 @@ func TestFinishedSessionsAreAnnouncedBriefly(t *testing.T) {
 	d.a.online = true // the driver has no update socket
 	d.openSession("checkout")
 	d.sees("1 need you", "1 working") // the failed SDK upgrade; the cron move
-	d.f.mu.Lock()
-	cron := d.f.find("ses_cron")
-	cron.finish("turn_c1", wire.TurnStatusCompleted, nil, time.Now())
-	d.f.mu.Unlock()
+	d.f.Mu.Lock()
+	cron := d.f.Find("ses_cron")
+	cron.Finish("turn_c1", wire.TurnStatusCompleted, nil, time.Now())
+	d.f.Mu.Unlock()
 	d.send(dirtyMsg(api.Dirty{Summaries: []string{"ses_cron"}}))
 	d.sees("Move the billing cron to the queue is done") // in place of the counts, briefly
 	d.a.toastAt = d.a.toastAt.Add(-4 * time.Second)
@@ -591,7 +616,7 @@ func TestLinksInRepliesAndMessagesAreClickable(t *testing.T) {
 
 func TestCtrlPAndCtrlNJumpBetweenYourMessages(t *testing.T) {
 	d := newDriver(t)
-	d.f.long(6)
+	d.f.Long(6)
 	d.run(d.a.list())
 	d.openSession("long session")
 	d.screen()
@@ -661,14 +686,14 @@ func TestTheMenuGroupsBySubjectAndChangesRepositories(t *testing.T) {
 	d.keys("repositories", "enter")
 	d.sees("Gives the session's Git credentials access", "✓ acme/web", "acme/api")
 	d.keys("acme/api", "enter")
-	if got := d.f.find("ses_checkout").repos; !slices.Equal(got, []string{"acme/web", "acme/api"}) {
+	if got := d.f.Find("ses_checkout").Repos; !slices.Equal(got, []string{"acme/web", "acme/api"}) {
 		t.Fatalf("repositories = %v", got)
 	}
 	d.sees("Gave access to acme/api", "repo  acme/web, acme/api")
 	d.keys("?", "repositories", "enter", "acme/web", "enter")
 	d.sees("Take away access", "its clone in the workspace stays")
 	d.keys("enter")
-	if got := d.f.find("ses_checkout").repos; !slices.Equal(got, []string{"acme/api"}) {
+	if got := d.f.Find("ses_checkout").Repos; !slices.Equal(got, []string{"acme/api"}) {
 		t.Fatalf("repositories = %v", got)
 	}
 
@@ -681,7 +706,7 @@ func TestTheMenuGroupsBySubjectAndChangesRepositories(t *testing.T) {
 	d.keys("?", "project", "enter")
 	d.sees("Default", "Acme", "Ops")
 	d.keys("ops", "enter")
-	if got := d.f.find("ses_checkout").s.ProjectID; got != "proj_ops" {
+	if got := d.f.Find("ses_checkout").S.ProjectID; got != "proj_ops" {
 		t.Fatalf("project = %q", got)
 	}
 	d.sees("Moved to Ops")
@@ -691,14 +716,14 @@ func TestFastModeAndDeleteFromTheSessionMenu(t *testing.T) {
 	d := newDriver(t)
 	d.openSession("payments")
 	d.keys("?", "fast", "enter")
-	if !d.f.find("ses_sdk").s.FastMode {
+	if !d.f.Find("ses_sdk").S.FastMode {
 		t.Fatal("fast mode is off")
 	}
 	d.sees("Fast mode on")
 	d.keys("?", "delete", "enter")
 	d.sees("Delete?", "permanently removes the session")
 	d.keys("enter")
-	if d.f.find("ses_sdk").s.MachineStatus != wire.MachineStatusDeleting {
+	if d.f.Find("ses_sdk").S.MachineStatus != wire.MachineStatusDeleting {
 		t.Fatal("the session was not deleted")
 	}
 	d.misses("Upgrade the payments SDK")
@@ -731,4 +756,70 @@ func TestEveryCellIsPaintedInTheTheme(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestProjectsAreMadeAndSetUpFromTheMenu(t *testing.T) {
+	d := newDriver(t)
+	d.keys("?")
+	d.sees("SESSIONS", "Show a project", "New project", "PROJECT  ·  Acme", "Agent", "claude-opus-5", "Repositories", "Environment", "Delete")
+	d.keys("new project", "enter", "Payments", "enter")
+	d.sees("Made Payments", "No sessions here yet")
+	if d.a.projectID() == "proj_acme" {
+		t.Fatal("the new project is not shown")
+	}
+
+	// Its agent, effort and repositories.
+	d.keys("?", "agent", "enter")
+	d.sees("Claude Max", "OpenAI", "None: each session chooses")
+	d.keys("openai", "enter", "enter")
+	d.keys("?", "repositories", "enter")
+	d.sees("New sessions in this project clone these")
+	d.keys("api", "enter", "esc", "esc")
+	p := d.f.Projects[len(d.f.Projects)-1]
+	if p.Name != "Payments" || p.Agent == nil || p.Agent.Model != "gpt-5.5" || p.Agent.ReasoningEffort != "medium" || describeRepos(p.Repositories) != "acme/api" {
+		t.Fatalf("project %+v", p)
+	}
+
+	// Its variables.
+	d.keys("?", "environment", "enter", "a variable", "enter", "STAGE=prod", "enter")
+	d.sees("Set STAGE")
+	if env := d.f.Environments["projects/"+p.ProjectID]; env == nil || len(env.Variables) != 1 || env.Variables[0].Value != "prod" {
+		t.Fatalf("environment %+v", env)
+	}
+
+	// Deleting it moves you back.
+	d.keys("?", "delete", "enter")
+	d.sees("Delete Payments?", "Its sessions move to Default")
+	d.keys("enter")
+	d.sees("Deleted Payments")
+	if d.f.Projects[len(d.f.Projects)-1].ClosingAt.IsZero() {
+		t.Fatal("the project was not deleted")
+	}
+}
+
+func TestASessionsVariablesChangeFromItsMenu(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	d.keys("?", "environment", "enter")
+	d.sees("Its agent's commands and terminal shells receive these", "A variable", "A secret")
+	d.keys("secret", "enter", "API_KEY", "enter", "hunter2", "enter")
+	d.sees("Set API_KEY")
+	d.keys("?", "environment", "enter")
+	d.sees("API_KEY", "secret")
+	d.misses("hunter2")
+	d.keys("api_key", "enter", "remove", "enter")
+	d.sees("Remove API_KEY?")
+	d.keys("enter")
+	d.sees("Removed API_KEY")
+	if env := d.f.Environments["sessions/ses_checkout"]; len(env.Variables) != 0 {
+		t.Fatalf("environment %+v", env.Variables)
+	}
+}
+
+func describeRepos(rs []wire.ProjectRepository) string {
+	var names []string
+	for _, r := range rs {
+		names = append(names, r.Repository)
+	}
+	return strings.Join(names, ", ")
 }

@@ -20,11 +20,13 @@ func (a *app) homeMenu() *menu {
 	items := []item{
 		{group: "SESSIONS", label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
 		{group: "SESSIONS", label: "Search sessions", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
-		{group: "SESSIONS", label: "Project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
+		{group: "SESSIONS", label: "Show a project", value: a.projectName(a.projectID()), sub: func(a *app) *menu {
 			return a.projectMenu(a.projectID(), func(a *app, id string) tea.Cmd { a.prefs.Project = id; a.sel = ""; a.savePrefs(); return nil })
 		}},
+		{group: "SESSIONS", label: "New project", sub: func(a *app) *menu { return a.newProject() }},
 	}
-	return &menu{title: "Barad", items: append(items, a.baradItems()...)}
+	items = append(items, a.projectItems()...)
+	return &menu{title: "Barad", items: append(items, a.baradItems()...), reload: func(a *app) *menu { return a.homeMenu() }}
 }
 
 // baradItems are the account's own: usage, settings, quit.
@@ -131,7 +133,7 @@ func (a *app) chatMenu() *menu {
 	)
 	items = append(items, a.sessionItems()...)
 	items = append(items, item{group: "BARAD", label: "Back to sessions", key: "esc", run: func(a *app) tea.Cmd { a.screen, a.sel = screenHome, a.conv.id; return nil }})
-	return &menu{title: sessionName(s), items: append(items, a.baradItems()...)}
+	return &menu{title: sessionName(s), items: append(items, a.baradItems()...), reload: func(a *app) *menu { return a.chatMenu() }}
 }
 
 // sessionItems are the open session's settings, under its name.
@@ -177,6 +179,10 @@ func (a *app) sessionItems() []item {
 			return a.projectMenu(projectOf(a.conv.session), func(a *app, id string) tea.Cmd { return a.moveSession(id) })
 		}},
 		item{group: group, label: "Repositories", value: repos, sub: func(a *app) *menu { return a.repositoriesMenu() }},
+		item{group: group, label: "Environment", sub: func(a *app) *menu {
+			return a.ownerEnvMenu(api.EnvironmentOwner{Kind: "sessions", ID: a.conv.id},
+				"Its agent's commands and terminal shells receive these, live, with the project's.")
+		}},
 		item{group: group, label: "Details", sub: func(a *app) *menu { return a.detailsMenu() }},
 		item{group: group, label: "Archive", danger: true, ask: "Archive erases this session's workspace and its published pages. The conversation stays. You cannot undo this.",
 			run: func(a *app) tea.Cmd {
@@ -232,7 +238,7 @@ func (a *app) moveSession(projectID string) tea.Cmd {
 // that access; the workspace's files are never touched.
 func (a *app) repositoriesMenu() *menu {
 	id := a.conv.id
-	mn := &menu{title: "Repositories", reload: func(a *app) *menu { return a.repositoriesMenu() },
+	mn := &menu{title: "Repositories", reload: func(a *app) *menu { return a.repositoriesMenu() }, load: a.loadRepos(),
 		hint: "Gives the session's Git credentials access. The workspace's files stay as they are."}
 	attached := map[string]wire.SessionGitRepository{}
 	for _, r := range a.sessionRepos[id] {
@@ -274,24 +280,6 @@ type reposChangedMsg struct {
 	err     error
 }
 
-// openChatMenu opens the session's menu, fetching what its submenus list
-// if it has not been fetched: your repositories and the agent's
-// instruction files.
-func (a *app) openChatMenu() tea.Cmd {
-	a.menu = a.chatMenu()
-	var cmds []tea.Cmd
-	if a.repos == nil {
-		cmds = append(cmds, call(a.api.Repositories, func(r []api.Repository, err error) tea.Msg { return reposMsg{r, err} }))
-	}
-	if id := a.conv.id; a.instructions[id] == nil {
-		cmds = append(cmds, call(func(ctx context.Context) (*wire.WorkspaceInstructions, error) {
-			return a.api.WorkspaceInstructions(ctx, id)
-		},
-			func(w *wire.WorkspaceInstructions, err error) tea.Msg { return instructionsMsg{id, w, err} }))
-	}
-	return tea.Batch(cmds...)
-}
-
 // instructionsMsg brings a session's instruction files.
 type instructionsMsg struct {
 	id  string
@@ -303,7 +291,12 @@ type instructionsMsg struct {
 // instruction files the agent reads.
 func (a *app) detailsMenu() *menu {
 	s := a.conv.session
-	mn := &menu{title: "Details", reload: func(a *app) *menu { return a.detailsMenu() }}
+	id := s.SessionID
+	mn := &menu{title: "Details", reload: func(a *app) *menu { return a.detailsMenu() },
+		load: call(func(ctx context.Context) (*wire.WorkspaceInstructions, error) {
+			return a.api.WorkspaceInstructions(ctx, id)
+		},
+			func(w *wire.WorkspaceInstructions, err error) tea.Msg { return instructionsMsg{id, w, err} })}
 	add := func(group, label, value string, run func(a *app) tea.Cmd) {
 		mn.items = append(mn.items, item{group: group, label: label, value: value, run: run})
 	}
