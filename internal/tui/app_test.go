@@ -157,7 +157,7 @@ func TestHomeListsSessionsByWhatTheyNeed(t *testing.T) {
 	}
 	// Another project, with p.
 	d.keys("p")
-	d.sees("Show a project", "1 need you")
+	d.sees("Projects", "SHOW A PROJECT", "1 need you", "New project", "PROJECT  ·  Acme")
 	d.keys("Ops", "enter")
 	d.sees("Rotate the staging keys", "Ops")
 	d.misses("Fix the flaky checkout test")
@@ -765,10 +765,10 @@ func TestEveryCellIsPaintedInTheTheme(t *testing.T) {
 	}
 }
 
-func TestProjectsAreMadeAndSetUpFromTheMenu(t *testing.T) {
+func TestProjectsAreMadeAndSetUpWithP(t *testing.T) {
 	d := newDriver(t)
-	d.keys("?")
-	d.sees("SESSIONS", "Show a project", "New project", "PROJECT  ·  Acme", "Agent", "claude-opus-5", "Repositories", "Environment", "Delete")
+	d.keys("p")
+	d.sees("Projects", "Acme", "Ops", "New project", "PROJECT  ·  Acme", "Agent", "claude-opus-5", "Repositories", "Environment", "Delete")
 	d.keys("new project", "enter", "Payments", "enter")
 	d.sees("Made Payments", "No sessions here yet")
 	if d.a.projectID() == "proj_acme" {
@@ -776,10 +776,10 @@ func TestProjectsAreMadeAndSetUpFromTheMenu(t *testing.T) {
 	}
 
 	// Its agent, effort and repositories.
-	d.keys("?", "agent", "enter")
+	d.keys("p", "agent", "enter")
 	d.sees("Claude Max", "OpenAI", "None: each session chooses")
 	d.keys("openai", "enter", "enter")
-	d.keys("?", "repositories", "enter")
+	d.keys("p", "repositories", "enter")
 	d.sees("New sessions in this project clone these")
 	d.keys("api", "enter", "esc", "esc")
 	p := d.f.Projects[len(d.f.Projects)-1]
@@ -788,14 +788,14 @@ func TestProjectsAreMadeAndSetUpFromTheMenu(t *testing.T) {
 	}
 
 	// Its variables.
-	d.keys("?", "environment", "enter", "a variable", "enter", "STAGE=prod", "enter")
+	d.keys("p", "environment", "enter", "a variable", "enter", "STAGE=prod", "enter")
 	d.sees("Set STAGE")
 	if env := d.f.Environments["projects/"+p.ProjectID]; env == nil || len(env.Variables) != 1 || env.Variables[0].Value != "prod" {
 		t.Fatalf("environment %+v", env)
 	}
 
 	// Deleting it moves you back.
-	d.keys("?", "delete", "enter")
+	d.keys("p", "delete", "enter")
 	d.sees("Delete Payments?", "Its sessions move to Default")
 	d.keys("enter")
 	d.sees("Deleted Payments")

@@ -110,6 +110,38 @@ func (a *app) projectItems() []item {
 	return items
 }
 
+// projectsMenu is where projects live, on p at home: each project with its
+// sessions and what needs you there (Enter shows it), making a new one, and
+// the shown project's own settings.
+func (a *app) projectsMenu() *menu {
+	sessions, needs := map[string]int{}, map[string]int{}
+	for _, s := range a.sessions {
+		sessions[projectOf(s)]++
+		if a.standing(s).Group == api.NeedsYou {
+			needs[projectOf(s)]++
+		}
+	}
+	mn := &menu{title: "Projects", reload: func(a *app) *menu { return a.projectsMenu() }}
+	for _, p := range a.openProjects() {
+		id, value := p.ProjectID, plural(sessions[p.ProjectID], "session")
+		if n := needs[id]; n > 0 {
+			value = fmt.Sprintf("%d need you  ·  %s", n, value)
+		}
+		mn.items = append(mn.items, item{group: "SHOW A PROJECT", label: p.Name, value: value, check: id == a.projectID(),
+			run: func(a *app) tea.Cmd { a.showProject(id); return nil }})
+	}
+	mn.items = append(mn.items, item{group: "SHOW A PROJECT", label: "New project", sub: func(a *app) *menu { return a.newProject() }})
+	mn.items = append(mn.items, a.projectItems()...)
+	return mn
+}
+
+// moveMenu moves a session to another project.
+func (a *app) moveMenu(s wire.Session) *menu {
+	mn := a.projectMenu(projectOf(s), func(a *app, id string) tea.Cmd { return a.moveSession(s, id) })
+	mn.title = "Move " + sessionName(s) + " to"
+	return mn
+}
+
 // newProject asks for a name and makes the project, showing it.
 func (a *app) newProject() *menu {
 	return &menu{title: "New project", edit: &Editor{}, about: "its name", submit: func(a *app, name string) tea.Cmd {

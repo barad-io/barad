@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -52,7 +54,7 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	case "p":
-		a.showMenu(a.showProjectMenu())
+		a.showMenu(a.projectsMenu())
 		return nil
 	case "R":
 		if unread := a.unreadHere(); len(unread) > 0 {
@@ -75,6 +77,10 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 	case "r":
 		if s := o[a.pos(o)]; s.ArchivedAt.IsZero() && s.LatestTerminalTurnID != "" {
 			a.toggleRead(s)
+		}
+	case "m":
+		if s := o[a.pos(o)]; s.ArchivedAt.IsZero() {
+			a.showMenu(a.moveMenu(s))
 		}
 	case "a":
 		if s := o[a.pos(o)]; s.ArchivedAt.IsZero() {
@@ -139,22 +145,32 @@ func (a *app) unreadHere() []wire.Session {
 	return out
 }
 
-// showProjectMenu picks the project the home screen lists, each with what
-// needs you there.
-func (a *app) showProjectMenu() *menu {
-	needs := map[string]int{}
-	for _, s := range a.sessions {
-		if a.standing(s).Group == api.NeedsYou {
-			needs[projectOf(s)]++
+// switcher is every session in every project but the open one, what needs
+// you first, as the home screen orders them: type a name to narrow it, Enter
+// to open one.
+func (a *app) switcher() *menu {
+	list := slices.Clone(a.sessions)
+	sort.SliceStable(list, func(i, j int) bool {
+		gi, gj := a.standing(list[i]).Group, a.standing(list[j]).Group
+		if gi != gj {
+			return gi < gj
 		}
+		return activityAt(list[i]).After(activityAt(list[j]))
+	})
+	mn := &menu{title: "Switch to a session"}
+	for _, s := range list {
+		if a.screen == screenChat && a.conv != nil && s.SessionID == a.conv.id {
+			continue
+		}
+		st := a.standing(s)
+		value := a.projectName(projectOf(s))
+		if st.Group != api.Resting {
+			value = st.Word + "  ·  " + value
+		}
+		mn.items = append(mn.items, item{group: groupLabel[st.Group], label: sessionName(s), value: value, run: func(a *app) tea.Cmd { return a.open(s.SessionID) }})
 	}
-	mn := &menu{title: "Show a project"}
-	for _, p := range a.openProjects() {
-		id, value := p.ProjectID, ""
-		if n := needs[id]; n > 0 {
-			value = fmt.Sprintf("%d need you", n)
-		}
-		mn.items = append(mn.items, item{label: p.Name, value: value, check: id == a.projectID(), run: func(a *app) tea.Cmd { a.showProject(id); return nil }})
+	if len(mn.items) == 0 {
+		mn.hint = "No other session yet."
 	}
 	return mn
 }
@@ -322,7 +338,7 @@ func (a *app) homeView() ([]string, string) {
 		if unread > 0 {
 			keys = append(keys, "R", "mark read")
 		}
-		foot = a.footer(append(keys, "p", "project", "tab", "archived", "?", "menu")...)
+		foot = a.footer(append(keys, "p", "projects", "tab", "archived", "?", "menu")...)
 	}
 	return append(head, out...), foot
 }

@@ -43,6 +43,9 @@ func (a *app) key(k tea.KeyPressMsg) tea.Cmd {
 		return a.menuKey(k)
 	case a.start != nil:
 		return a.startKey(k)
+	case ks == "ctrl+s":
+		a.menu = a.switcher()
+		return nil
 	}
 	switch a.screen {
 	case screenHome:
@@ -349,7 +352,7 @@ func (a *app) chatView() ([]string, string) {
 	if a.conv.session.CurrentTurnID != "" {
 		keys = append(keys, "ctrl+x", "stop")
 	}
-	keys = append(keys, "?", "menu")
+	keys = append(keys, "ctrl+s", "switch", "?", "menu")
 	return out, a.footer(keys...)
 }
 
@@ -425,8 +428,8 @@ func (a *app) footer(keys ...string) string {
 		if a.toastBad {
 			mark = S("✕  ", SDanger)
 		}
-		room := a.width() - l.Width() - 10
-		right = Line{mark, S(ansi.Truncate(a.toast, max(10, room), "…"), st)}
+		// what just happened outranks the keys: they give way first (below)
+		right = Line{mark, S(ansi.Truncate(a.toast, max(10, a.width()*2/3), "…"), st)}
 	case !a.online && a.listed:
 		right = Line{S("○ ", SFaint), S("reconnecting", SMuted)}
 	case a.screen == screenHome && update.Newer(a.prefs.Latest, a.version):
@@ -594,7 +597,10 @@ func (a *app) transcript() (out []string, yours []int) {
 	// drawn anew. Only the rows this frame used are kept.
 	y, m, d := a.now.Date()
 	kept := make(map[laidKey][]string, len(exs))
-	for _, ex := range exs {
+	for i, ex := range exs {
+		if i > 0 { // three rows between exchanges; none under the last, above the composer
+			out = append(out, blank(), blank(), blank())
+		}
 		still := !ex.moving
 		for _, p := range ex.pics {
 			still = still && (a.pics[p.key] != nil || a.picErr[p.key] != "")
@@ -723,7 +729,6 @@ func (a *app) exchange(ex exchange, w int) []Line {
 			add(0, Line{}, a.workingLine(p))
 		}
 	}
-	add(0, Line{}, Line{}, Line{})
 	return rows
 }
 

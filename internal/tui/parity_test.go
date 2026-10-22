@@ -167,3 +167,70 @@ func TestUsageRanges(t *testing.T) {
 	d.keys("tab")
 	d.sees("BY PROVIDER", "Claude Max", "BY MODEL", "claude-opus-5")
 }
+
+func TestSwitchingSessionsWithCtrlS(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("checkout")
+	ctrlS := tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl}
+	d.send(ctrlS)
+	d.sees("Switch to a session", "NEEDS YOU", "Upgrade the payments SDK", "failed  ·  Acme", "RUNNING", "Rotate the staging keys", "Ops")
+	if slices.ContainsFunc(d.a.menu.items, func(it item) bool { return it.label == "Fix the flaky checkout test" }) {
+		t.Fatal("the open session is offered")
+	}
+	// Typing narrows it, across projects; Enter opens the one chosen.
+	d.keys("stag")
+	d.misses("Upgrade the payments SDK")
+	d.keys("enter")
+	if d.a.menu != nil || d.a.screen != screenChat || d.a.conv.id != "ses_other" {
+		t.Fatalf("opened %v", d.a.conv)
+	}
+	// From home too; Esc leaves it.
+	d.keys("esc")
+	d.send(ctrlS)
+	d.sees("Fix the flaky checkout test")
+	d.keys("esc")
+	if d.a.menu != nil {
+		t.Fatal("esc did not close the switcher")
+	}
+}
+
+func TestMovingASessionToAnotherProject(t *testing.T) {
+	d := newDriver(t)
+	d.keys("/", "flaky", "enter", "esc")
+	d.keys("m")
+	d.sees("Move Fix the flaky checkout test to", "Default", "Acme", "Ops")
+	d.keys("ops", "enter")
+	if got := d.f.Find("ses_checkout").S.ProjectID; got != "proj_ops" {
+		t.Fatalf("project = %q", got)
+	}
+	d.sees("Moved to Ops")
+	d.misses("Fix the flaky checkout test")
+	// The menu says so too, by its key.
+	d.keys("?")
+	d.sees("Move to a project", "Projects: show, make, set up")
+}
+
+// The newest exchange sits right above the composer: one blank row between
+// them, as between the bar and the transcript, not the space between
+// exchanges.
+func TestTheWorkingLineSitsAboveTheComposer(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("cron")
+	lines := strings.Split(d.screen(), "\n")
+	working, composer := -1, -1
+	for i, l := range lines {
+		switch {
+		case strings.Contains(l, "working") && strings.Contains(l, "step"):
+			working = i
+		case strings.Contains(l, "› ") && composer < 0 && working >= 0:
+			composer = i
+		}
+	}
+	if working < 0 || composer < 0 {
+		t.Fatalf("working at %d, composer at %d:\n%s", working, composer, strings.Join(lines, "\n"))
+	}
+	// the composer's block starts with a padding row above its text
+	if gap := composer - working; gap > 3 {
+		t.Fatalf("%d rows between the working line and the composer's text:\n%s", gap-1, strings.Join(lines[working:composer+1], "\n"))
+	}
+}

@@ -19,6 +19,7 @@ func (a *app) homeMenu() *menu {
 	items := []item{
 		{group: "SESSIONS", label: "New session", key: "n", run: func(a *app) tea.Cmd { return a.newSession("") }},
 		{group: "SESSIONS", label: "Search every project", key: "/", run: func(a *app) tea.Cmd { a.filter = &Editor{}; return nil }},
+		{group: "SESSIONS", label: "Switch to a session", key: "ctrl+s", sub: func(a *app) *menu { return a.switcher() }},
 	}
 	if unread := a.unreadHere(); len(unread) > 0 {
 		items = append(items, item{group: "SESSIONS", label: fmt.Sprintf("Mark %d read", len(unread)), key: "R", run: func(a *app) tea.Cmd {
@@ -32,8 +33,7 @@ func (a *app) homeMenu() *menu {
 	}
 	items = append(items,
 		item{group: "SESSIONS", label: shelf, key: "tab", run: func(a *app) tea.Cmd { a.shelf, a.sel = !a.shelf, ""; return nil }},
-		item{group: "SESSIONS", label: "Show a project", key: "p", value: a.projectName(a.projectID()), sub: func(a *app) *menu { return a.showProjectMenu() }},
-		item{group: "SESSIONS", label: "New project", sub: func(a *app) *menu { return a.newProject() }},
+		item{group: "SESSIONS", label: "Projects: show, make, set up", key: "p", value: a.projectName(a.projectID()), sub: func(a *app) *menu { return a.projectsMenu() }},
 	)
 	// the selected session's own, by their keys
 	if o := a.order(); len(o) > 0 && !a.shelf {
@@ -46,12 +46,12 @@ func (a *app) homeMenu() *menu {
 			}
 			items = append(items, item{group: group, label: label, key: "r", run: func(a *app) tea.Cmd { a.toggleRead(s); return nil }})
 		}
-		items = append(items, item{group: group, label: "Open", key: "enter", run: func(a *app) tea.Cmd { return a.open(s.SessionID) }})
+		items = append(items, item{group: group, label: "Open", key: "enter", run: func(a *app) tea.Cmd { return a.open(s.SessionID) }},
+			item{group: group, label: "Move to a project", key: "m", value: a.projectName(projectOf(s)), sub: func(a *app) *menu { return a.moveMenu(s) }})
 		archive := a.archiveItem(s.SessionID, group)
 		archive.key = "a"
 		items = append(items, archive)
 	}
-	items = append(items, a.projectItems()...)
 	return &menu{title: "Barad", items: append(items, a.baradItems()...), reload: func(a *app) *menu { return a.homeMenu() }}
 }
 
@@ -131,6 +131,7 @@ func (a *app) chatMenu() *menu {
 		}},
 	)
 	items = append(items, a.sessionItems()...)
+	items = append(items, item{group: "BARAD", label: "Switch to a session", key: "ctrl+s", sub: func(a *app) *menu { return a.switcher() }})
 	items = append(items, item{group: "BARAD", label: "Back to sessions", key: "esc", run: func(a *app) tea.Cmd { a.screen, a.sel = screenHome, a.conv.id; return nil }})
 	return &menu{title: sessionName(s), items: append(items, a.baradItems()...), reload: func(a *app) *menu { return a.chatMenu() }}
 }
@@ -177,9 +178,7 @@ func (a *app) sessionItems() []item {
 		repos = fmt.Sprint(len(r))
 	}
 	items = append(items,
-		item{group: group, label: "Project", value: a.projectName(projectOf(s)), sub: func(a *app) *menu {
-			return a.projectMenu(projectOf(a.conv.session), func(a *app, id string) tea.Cmd { return a.moveSession(id) })
-		}},
+		item{group: group, label: "Move to a project", value: a.projectName(projectOf(s)), sub: func(a *app) *menu { return a.moveMenu(a.conv.session) }},
 		item{group: group, label: "Repositories", value: repos, sub: func(a *app) *menu { return a.repositoriesMenu() }},
 		item{group: group, label: "Environment", sub: func(a *app) *menu {
 			return a.ownerEnvMenu(api.EnvironmentOwner{Kind: "sessions", ID: a.conv.id},
@@ -245,9 +244,10 @@ func (a *app) wake() tea.Cmd {
 		})
 }
 
-func (a *app) moveSession(projectID string) tea.Cmd {
-	id := a.conv.id
-	if projectID == projectOf(a.conv.session) {
+// moveSession moves a session to a project.
+func (a *app) moveSession(s wire.Session, projectID string) tea.Cmd {
+	id := s.SessionID
+	if projectID == projectOf(s) {
 		return nil
 	}
 	return call(func(ctx context.Context) (*wire.Session, error) { return a.api.MoveSession(ctx, id, projectID) },
