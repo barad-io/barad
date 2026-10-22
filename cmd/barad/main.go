@@ -2,26 +2,24 @@
 // everything the web app does with them.
 //
 //	barad            the app (signs you in first if needed)
-//	barad login      sign in with your email and password
+//	barad login      sign in: approve this computer in the web app
 //	barad logout     sign out on this computer
 //	barad version    the release this is
 //
 // Credentials live in the user config directory (~/.config/barad on Linux),
-// readable only by you. BARAD_API_URL, BARAD_COGNITO_URL and
-// BARAD_COGNITO_CLIENT_ID point it at another stack; BARAD_THEME=night|paper
-// and BARAD_GRAPHICS=kitty|blocks override what it detects.
+// readable only by you. BARAD_API_URL points it at another stack;
+// BARAD_THEME=night|paper and BARAD_GRAPHICS=kitty|blocks override what it
+// detects.
 package main
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"os/exec"
+	"os/signal"
+	"runtime"
 	"time"
-
-	"golang.org/x/term"
 
 	"github.com/barad-io/barad/internal/api"
 	"github.com/barad-io/barad/internal/tui"
@@ -74,57 +72,50 @@ func run(args []string) error {
 	return fmt.Errorf("unknown command %q (try: barad, barad login, barad logout, barad version)", command)
 }
 
-// login asks for an email and password and signs in, choosing a new
-// password first for an invited account.
+// login signs in with a device code: it opens the web app, where you are
+// already signed in, at a page asking you to approve this computer, and waits
+// for your answer. Your password never passes through the command line.
 func login(client *api.Client) error {
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return errors.New("signing in needs a terminal")
-	}
-	in := bufio.NewReader(os.Stdin)
-	fmt.Println("Sign in to Barad")
-	fmt.Print("Email: ")
-	email, err := in.ReadString('\n')
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	host, _ := os.Hostname()
+	device := fmt.Sprintf("barad on %s (%s/%s)", host, runtime.GOOS, runtime.GOARCH)
+	started, err := client.StartSignIn(ctx, device)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not start signing in: %w", err)
 	}
-	password, err := secret("Password: ")
-	if err != nil {
-		return err
+	fmt.Printf("Sign in to Barad in your browser and approve this code:\n\n    %s\n\n", started.UserCode)
+	if openBrowser(started.VerificationURL) == nil {
+		fmt.Printf("If no browser opened, go to %s\n", started.VerificationURL)
+	} else {
+		fmt.Printf("Open %s\n", started.VerificationURL)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	err = client.SignIn(ctx, strings.TrimSpace(email), password)
-	var challenge *api.NewPasswordRequired
-	if errors.As(err, &challenge) {
-		fmt.Println("This account needs a password of your own.")
-		next, err := secret("New password: ")
-		if err != nil {
-			return err
-		}
-		again, err := secret("New password again: ")
-		if err != nil {
-			return err
-		}
-		if next != again {
-			return errors.New("the passwords differ")
-		}
-		err = client.SetNewPassword(ctx, challenge, next)
-		if err != nil {
-			return err
-		}
-	} else if err != nil {
+	fmt.Println("Waiting for you to approve it…")
+	if err := client.FinishSignIn(ctx, started); err != nil {
 		return err
 	}
 	if err := client.InitializeAccount(ctx); err != nil {
 		return err
 	}
-	fmt.Printf("Signed in as %s.\n", client.Email())
+	if email := client.Email(); email != "" {
+		fmt.Printf("Signed in as %s.\n", email)
+	} else {
+		fmt.Println("Signed in.")
+	}
 	return nil
 }
 
-func secret(prompt string) (string, error) {
-	fmt.Print(prompt)
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	return string(b), err
+// openBrowser opens url in the default browser, without waiting for it.
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Start()
 }

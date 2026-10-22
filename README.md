@@ -20,10 +20,12 @@ gh attestation verify "$(command -v barad)" --repo barad-io/barad \
 
 ```sh
 barad            # signs you in the first time, then opens the app
-barad login      # sign in with your Barad email and password
+barad login      # sign in: approve this computer in your browser
 barad logout     # sign out on this computer
 barad version
 ```
+
+Signing in never asks for your password. `barad login` shows a code such as `BCDF-GHJK` and opens Barad in your browser, where you are already signed in. Check that the page shows the same code and your computer's name, then approve it. barad gets a session of its own, which `barad logout` revokes. On a computer without a browser, open the link it prints anywhere you are signed in to Barad.
 
 - **Home**: your project's sessions, grouped by what they need from you: a reply you have not read or a failure, then what is running, then the rest.
 - **A session**: your messages on the right, the agent's replies on the left. Its work folds into one row when a run ends; **Tab** shows the steps, then their full output. Replies stream in as the agent writes them.
@@ -38,13 +40,13 @@ Pictures use the kitty graphics protocol where the terminal supports it (kitty, 
 
 ## Files and settings
 
-barad keeps its files in your config directory (`~/.config/barad` on Linux, `~/Library/Application Support/barad` on macOS), readable only by you: `credentials.json` holds your sign-in tokens and `prefs.json` your theme, project and what you have read. `barad logout` revokes the tokens and deletes the file.
+barad keeps its files in your config directory (`~/.config/barad` on Linux, `~/Library/Application Support/barad` on macOS), readable only by you: `credentials.json` holds its session and `prefs.json` your theme, project and what you have read. `barad logout` revokes the session and deletes the file.
 
 | Variable | |
 |---|---|
 | `BARAD_THEME` | `night` or `paper` |
 | `BARAD_GRAPHICS` | `kitty` or `blocks` |
-| `BARAD_API_URL`, `BARAD_COGNITO_URL`, `BARAD_COGNITO_CLIENT_ID` | another Barad stack |
+| `BARAD_API_URL` | another Barad stack |
 
 ## Not here yet
 

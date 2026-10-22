@@ -10,7 +10,6 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/yuin/goldmark v1.8.6
 	golang.org/x/image v0.47.0
-	golang.org/x/term v0.47.0
 )
 
 require (
