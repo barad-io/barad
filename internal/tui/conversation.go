@@ -19,6 +19,7 @@ type conversation struct {
 	id        string
 	session   wire.Session
 	items     []wire.TranscriptItem // by sequence
+	read      map[int64]readItem    // each item's payload, read once as it arrives
 	turns     map[string]wire.Turn
 	proposals map[int64]wire.SessionProposalView // by tool result sequence
 	pending   []api.PendingMessage               // held by the server, not yet in the transcript
@@ -45,7 +46,7 @@ type conversation struct {
 func (c *conversation) changed() { c.derived = false }
 
 func newConversation(s wire.Session) *conversation {
-	return &conversation{id: s.SessionID, session: s, turns: map[string]wire.Turn{}, proposals: map[int64]wire.SessionProposalView{}}
+	return &conversation{id: s.SessionID, session: s, read: map[int64]readItem{}, turns: map[string]wire.Turn{}, proposals: map[int64]wire.SessionProposalView{}}
 }
 
 // merge takes items in, keeping sequence order and dropping duplicates.
@@ -57,6 +58,7 @@ func (c *conversation) merge(items []wire.TranscriptItem) {
 	for _, it := range items {
 		if !seen[it.Sequence] {
 			c.items = append(c.items, it)
+			c.read[it.Sequence] = readPayload(it)
 			seen[it.Sequence] = true
 		}
 	}
@@ -264,35 +266,17 @@ func (c *conversation) derive() []exchange {
 	lastOfTurn := map[string]int{} // exchange index holding each turn's last item
 	for i := range c.items {
 		it := &c.items[i]
+		r := c.read[it.Sequence]
 		switch it.Kind {
 		case wire.ItemKindUser:
-			var p wire.UserPromptPayload
-			_ = json.Unmarshal(it.Payload, &p)
-			if p.Text == "" {
-				_ = json.Unmarshal(it.Payload, &p.Text) // a bare string
-			}
-			out = append(out, exchange{user: &userMessage{text: p.Text, media: p.Media, at: it.CreatedAt}})
+			out = append(out, exchange{user: &userMessage{text: r.text, media: r.media, at: it.CreatedAt}})
 		case wire.ItemKindReasoning:
-			if text := reasoningSummary(it.Payload); text != "" {
-				r := runFor(it.TurnID)
-				r.steps = append(r.steps, &step{kind: "reasoning", call: it, think: text})
+			if r.text != "" {
+				run := runFor(it.TurnID)
+				run.steps = append(run.steps, &step{kind: "reasoning", call: it, think: r.text})
 			}
 		case wire.ItemKindToolCall:
-			var p struct {
-				Kind         string          `json:"kind"`
-				Arguments    json.RawMessage `json:"arguments"`
-				RawArguments string          `json:"raw_arguments"` // arguments that were not JSON
-			}
-			_ = json.Unmarshal(it.Payload, &p)
-			var args map[string]any
-			_ = json.Unmarshal(p.Arguments, &args)
-			if args == nil && p.RawArguments != "" {
-				args = map[string]any{"arguments": p.RawArguments}
-			}
-			s := &step{kind: strings.ToLower(p.Kind), call: it, args: args}
-			if s.kind == "" {
-				s.kind = "tool"
-			}
+			s := &step{kind: r.kind, call: it, args: r.args}
 			if it.ToolCallID != "" {
 				calls[it.ToolCallID] = s
 			}
@@ -300,37 +284,24 @@ func (c *conversation) derive() []exchange {
 				ex := current()
 				ex.parts = append(ex.parts, part{kind: partProposal, turnID: it.TurnID, call: it, steps: []*step{s}})
 			} else {
-				r := runFor(it.TurnID)
-				r.steps = append(r.steps, s)
+				run := runFor(it.TurnID)
+				run.steps = append(run.steps, s)
 			}
 		case wire.ItemKindToolResult:
 			if s, ok := calls[it.ToolCallID]; ok && it.ToolCallID != "" {
 				s.result = it
 				break
 			}
-			r := runFor(it.TurnID)
-			r.steps = append(r.steps, &step{kind: "tool", result: it})
-		case wire.ItemKindAssistant:
-			if text := payloadText(it.Payload); text != "" {
+			run := runFor(it.TurnID)
+			run.steps = append(run.steps, &step{kind: "tool", result: it})
+		case wire.ItemKindAssistant, wire.ItemKindProviderOutput:
+			if r.text != "" {
 				ex := current()
-				ex.parts = append(ex.parts, part{kind: partText, turnID: it.TurnID, text: text})
-			}
-		case wire.ItemKindProviderOutput:
-			if text := providerMessageText(it.Payload); text != "" {
-				ex := current()
-				ex.parts = append(ex.parts, part{kind: partText, turnID: it.TurnID, text: text})
+				ex.parts = append(ex.parts, part{kind: partText, turnID: it.TurnID, text: r.text})
 			}
 		case wire.ItemKindContextCompaction:
-			var p struct {
-				Status string `json:"status"`
-			}
-			_ = json.Unmarshal(it.Payload, &p)
-			note := "Context compacted"
-			if p.Status == "failed" {
-				note = "Context compaction failed"
-			}
 			ex := current()
-			ex.parts = append(ex.parts, part{kind: partCompaction, text: note})
+			ex.parts = append(ex.parts, part{kind: partCompaction, text: r.text})
 		}
 		if it.TurnID != "" && len(out) > 0 {
 			lastOfTurn[it.TurnID] = len(out) - 1
@@ -444,6 +415,60 @@ func (c *conversation) settle(ex *exchange) {
 		}
 	}
 	ex.sum = h.Sum64()
+}
+
+// readItem is what the conversation shows of an item's payload.
+type readItem struct {
+	text  string // a message, a reasoning summary, a reply, a compaction's note
+	media []wire.PromptMediaRef
+	kind  string // a tool call's
+	args  map[string]any
+}
+
+// readPayload reads an item's payload, once, as it arrives: frames derive
+// the exchanges from what it read.
+func readPayload(it wire.TranscriptItem) readItem {
+	var r readItem
+	switch it.Kind {
+	case wire.ItemKindUser:
+		var p wire.UserPromptPayload
+		_ = json.Unmarshal(it.Payload, &p)
+		if p.Text == "" {
+			_ = json.Unmarshal(it.Payload, &p.Text) // a bare string
+		}
+		r.text, r.media = p.Text, p.Media
+	case wire.ItemKindReasoning:
+		r.text = reasoningSummary(it.Payload)
+	case wire.ItemKindToolCall:
+		var p struct {
+			Kind         string          `json:"kind"`
+			Arguments    json.RawMessage `json:"arguments"`
+			RawArguments string          `json:"raw_arguments"` // arguments that were not JSON
+		}
+		_ = json.Unmarshal(it.Payload, &p)
+		_ = json.Unmarshal(p.Arguments, &r.args)
+		if r.args == nil && p.RawArguments != "" {
+			r.args = map[string]any{"arguments": p.RawArguments}
+		}
+		r.kind = strings.ToLower(p.Kind)
+		if r.kind == "" {
+			r.kind = "tool"
+		}
+	case wire.ItemKindAssistant:
+		r.text = payloadText(it.Payload)
+	case wire.ItemKindProviderOutput:
+		r.text = providerMessageText(it.Payload)
+	case wire.ItemKindContextCompaction:
+		var p struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal(it.Payload, &p)
+		r.text = "Context compacted"
+		if p.Status == "failed" {
+			r.text = "Context compaction failed"
+		}
+	}
+	return r
 }
 
 func payloadText(raw json.RawMessage) string {

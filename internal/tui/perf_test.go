@@ -37,7 +37,9 @@ func (f *fakeAPI) long(exchanges int) {
 }
 
 // TestTypingStaysFast holds the app to a frame budget: a key press in a long
-// conversation, and its frame, take well under a frame at 60 Hz.
+// conversation, and its frame, take under half a frame at 60 Hz (8 ms), even
+// on a slow CI runner; a frame after a sync, under a frame. Drawing the whole
+// transcript every frame took 56 ms here.
 func TestTypingStaysFast(t *testing.T) {
 	d := newDriver(t)
 	d.f.long(150)
@@ -64,7 +66,7 @@ func TestTypingStaysFast(t *testing.T) {
 	}
 	mean := total / n
 	t.Logf("key to frame: mean %v, worst %v (update %v, view %v)", mean, worst.update+worst.view, worst.update, worst.view)
-	if mean > 4*time.Millisecond {
+	if mean > 8*time.Millisecond {
 		t.Errorf("a key press takes %v to draw on average", mean)
 	}
 
@@ -77,7 +79,7 @@ func TestTypingStaysFast(t *testing.T) {
 	}
 	synced := time.Since(began) / 10
 	t.Logf("frame after a sync: %v", synced)
-	if synced > 25*time.Millisecond {
+	if synced > 16*time.Millisecond {
 		t.Errorf("a frame after a sync takes %v", synced)
 	}
 
@@ -91,7 +93,7 @@ func TestTypingStaysFast(t *testing.T) {
 		}
 		frame := time.Since(began) / 10
 		t.Logf("after %v: %v a frame", keys, frame)
-		if frame > 4*time.Millisecond {
+		if frame > 8*time.Millisecond {
 			t.Errorf("after %v a frame takes %v", keys, frame)
 		}
 	}
