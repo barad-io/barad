@@ -16,12 +16,17 @@ gh attestation verify "$(command -v barad)" --repo barad-io/barad \
   --signer-workflow barad-io/barad/.github/workflows/release.yml
 ```
 
+### Updating
+
+`barad update` replaces barad with the newest release. The release workflow signs each release's `SHA256SUMS` with an Ed25519 key that only it can use (`SHA256SUMS.sig`; the key lives in the repository's `release` environment, open to `v*` tags alone). barad carries the public half, [`internal/update/release-signing.pem`](internal/update/release-signing.pem), and installs a download only when the signed checksums vouch for it. Once a day the home screen looks up the newest release and mentions it, quietly, when it is newer than yours; it never updates on its own.
+
 ## Using it
 
 ```sh
 barad            # signs you in the first time, then opens the app
 barad login      # sign in: approve this computer in your browser
 barad logout     # sign out on this computer
+barad update     # replace barad with the newest release
 barad version
 ```
 

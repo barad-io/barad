@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -52,6 +53,10 @@ type prefs struct {
 	Project  string            `json:"project"`
 	Work     work              `json:"work"`
 	Reviewed map[string]string `json:"reviewed"` // session → the newest finished turn you have seen
+	// The newest release, as last looked up (at most daily): the home
+	// screen mentions it while it is newer than the one running.
+	Latest          string    `json:"latest"`
+	LatestCheckedAt time.Time `json:"latest_checked_at"`
 }
 
 // An attachment is a file waiting to go with the next message: an image,
@@ -65,6 +70,7 @@ type attachment struct {
 
 type app struct {
 	api      *api.Client
+	version  string // the release running, or "dev"
 	w, h     int
 	gfx      Graphics
 	frame    int
@@ -121,9 +127,11 @@ type mdKey struct {
 	width int
 }
 
-// Run starts the app for a signed-in client and returns when you quit.
-func Run(client *api.Client) error {
+// Run starts the app for a signed-in client and returns when you quit;
+// version is the release it is.
+func Run(client *api.Client, version string) error {
 	a := newApp(client, DetectGraphics())
+	a.version = version
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p := tea.NewProgram(a, tea.WithFPS(120)) // a key shows within 8 ms of its frame
@@ -254,6 +262,10 @@ type (
 		data []byte
 		err  error
 	}
+	latestMsg struct {
+		tag string
+		err error
+	}
 	mastMsg struct {
 		key string
 		p   *Picture
@@ -270,7 +282,16 @@ type (
 )
 
 func (a *app) Init() tea.Cmd {
-	return tea.Batch(tick(), a.list(), a.loadAccount(), tea.Raw(ansi.ClearProgramStatusID("barad")))
+	return tea.Batch(tick(), a.list(), a.loadAccount(), a.checkLatest(), tea.Raw(ansi.ClearProgramStatusID("barad")))
+}
+
+// checkLatest looks up the newest release, at most once a day, for a
+// release build.
+func (a *app) checkLatest() tea.Cmd {
+	if !update.Released(a.version) || a.now.Sub(a.prefs.LatestCheckedAt) < 24*time.Hour {
+		return nil
+	}
+	return call(update.Latest, func(tag string, err error) tea.Msg { return latestMsg{tag, err} })
 }
 
 // frameEvery is how often the app draws a frame: spinners, the bar's sweep
@@ -550,6 +571,11 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.attachImage("pasted.png", msg.data)
+	case latestMsg:
+		if msg.err == nil { // offline: ask again next time
+			a.prefs.Latest, a.prefs.LatestCheckedAt = msg.tag, a.now
+			a.savePrefs()
+		}
 	case mastMsg:
 		a.mastBusy = false
 		a.mast, a.mastKey = msg.p, msg.key

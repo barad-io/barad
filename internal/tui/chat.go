@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -355,6 +356,8 @@ func (a *app) footer(keys ...string) string {
 		right = Line{mark, S(ansi.Truncate(a.toast, max(10, room), "…"), st)}
 	case !a.online && a.listed:
 		right = Line{S("○ ", SFaint), S("reconnecting", SMuted)}
+	case a.screen == screenHome && update.Newer(a.prefs.Latest, a.version):
+		right = Line{S(a.prefs.Latest+" is out  ·  ", SFaint), S("barad update", SMuted)}
 	case a.screen != screenHome: // the cover says it at home
 		if n := a.countAll(groupNeedsYou); n > 0 {
 			right = append(right, S("● ", SAccent), S(fmt.Sprintf("%d need you", n), SMuted))

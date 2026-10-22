@@ -1,6 +1,7 @@
-# A tag v* builds barad for every platform from that commit, attests the build's
-# provenance (SLSA, signed through Sigstore with this workflow's identity), and
-# publishes the binaries, SHA256SUMS and install.sh as the release.
+# A tag v* builds barad for every platform from that commit, signs SHA256SUMS
+# with the release key (SHA256SUMS.sig, which `barad update` checks), attests
+# the build's provenance (SLSA, signed through Sigstore with this workflow's
+# identity), and publishes it all with install.sh as the release.
 name: release
 
 on:
@@ -12,6 +13,7 @@ permissions: {}
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: release # holds RELEASE_SIGNING_KEY; only v* tags may deploy to it
     permissions:
       contents: write     # create the release
       id-token: write     # sign the attestation
@@ -40,6 +42,19 @@ jobs:
           sed "s/__VERSION__/$VERSION/" install.sh > dist/install.sh
           (cd dist && sha256sum -- * > SHA256SUMS)
           cat dist/SHA256SUMS
+      - name: Sign the checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          key=$(mktemp)
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/SHA256SUMS | base64 -w0 > dist/SHA256SUMS.sig
+          rm -f "$key"
+          # what barad update checks: the signature against the key barad carries
+          sig=$(mktemp)
+          base64 -d dist/SHA256SUMS.sig > "$sig"
+          openssl pkeyutl -verify -pubin -inkey internal/update/release-signing.pem -rawin -in dist/SHA256SUMS -sigfile "$sig"
+          rm -f "$sig"
       - name: Attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -51,5 +66,7 @@ jobs:
         run: |
           gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "barad $VERSION" \
             --notes "Install: \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh | sh\`
+
+          Update: \`barad update\`
 
           Verify a download: \`gh attestation verify barad-linux-amd64 --repo $GITHUB_REPOSITORY\`"

@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/update"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -622,4 +625,27 @@ func TestCtrlPAndCtrlNJumpBetweenYourMessages(t *testing.T) {
 	if d.a.scroll != 0 {
 		t.Fatalf("past your last message ctrl+n leaves the view %d rows up", d.a.scroll)
 	}
+}
+
+func TestHomeMentionsANewerRelease(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://github.com/barad-io/barad/releases/tag/v0.5.0")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+	prev := update.Releases
+	update.Releases = srv.URL
+	defer func() { update.Releases = prev }()
+
+	d := newDriver(t)
+	d.a.online = true  // the driver has no update socket
+	d.misses("is out") // a development build never looks
+	d.a.version = "v0.4.0"
+	d.run(d.a.checkLatest())
+	d.sees("v0.5.0 is out  ·  barad update")
+	if d.a.checkLatest() != nil {
+		t.Fatal("it looked again within a day")
+	}
+	d.a.version = "v0.5.0"
+	d.misses("is out")
 }
