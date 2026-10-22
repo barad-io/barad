@@ -51,7 +51,7 @@ func (a *app) compose() string {
 	case a.screen == screenImages && a.conv != nil:
 		body, foot = a.imagesView(), a.footer("← →", "previous, next", "o", "open in your viewer", "esc", "back")
 	case a.screen == screenUsage:
-		body, foot = a.usageView(), a.footer("esc", "back")
+		body, foot = a.usageView(), a.footer("tab", [2]string{"inference", "barad"}[a.usageTab], "esc", "back")
 	default:
 		body, foot = a.homeView()
 	}
@@ -186,76 +186,114 @@ func tokens(n int64) string {
 	return fmt.Sprint(n)
 }
 
-// usageView is the account's last 30 days: four figures on cards, then the
-// daily spend as a bar chart.
+// usageView is the account's last 30 days in the web app's two parts:
+// Barad, the workspace time your credits pay for, and Inference, the tokens
+// your model providers bill. Tab switches between them; the chart takes the
+// height that is left.
 func (a *app) usageView() []string {
 	w := a.width()
 	quiet := Fg(lands[a.prefs.Theme].quiet)
 	detail := Line{S("loading", quiet)}
 	if b := a.balance; b != nil {
-		detail = Line{S("balance ", quiet), S(money(b.BalanceUSDNanos), Fg(groundText).Bold(true))}
+		detail = Line{S("credits  ", quiet), S(money(b.BalanceUSDNanos), Fg(groundText).Bold(true)), S("  left", quiet)}
 	}
 	out := bar(a.prefs.Theme, a.w, []string{a.projectName(a.projectID())}, "Usage", Line{S("last 30 days", quiet)}, detail, -1)
 	out = append(out, blank())
+
+	// the two parts, the open one underlined in vermilion
+	names := [2][2]string{{"BARAD", "workspace time, paid with your credits"}, {"INFERENCE", "tokens, billed by your model providers"}}
+	var tabs, under Line
+	for i, n := range names {
+		if i > 0 {
+			tabs, under = append(tabs, gap(6)), append(under, S(strings.Repeat("─", 6), Fg(BorderSubtle)))
+		}
+		label := Line{S(n[0], SFaint.Bold(true))}
+		rule := S(strings.Repeat("─", ansi.StringWidth(n[0])), Fg(BorderSubtle))
+		if i == a.usageTab {
+			label = Line{S(n[0], Fg(AccentText).Bold(true)), S("   "+n[1], SMuted)}
+			rule = S(strings.Repeat("━", ansi.StringWidth(n[0])), SAccent)
+		}
+		tabs = append(tabs, label...)
+		under = append(under, rule, S(strings.Repeat("─", label.Width()-ansi.StringWidth(rule.Text)), Fg(BorderSubtle)))
+	}
+	under = append(under, S(strings.Repeat("─", max(0, w-under.Width())), Fg(BorderSubtle)))
+	out = append(out, at(tabs), at(under), blank())
+
 	r, ws := a.usage, a.workspace
-	if r == nil || ws == nil {
+	if r == nil || ws == nil || a.balance == nil {
 		return append(out, at(Line{gap(2), S(Spinner[a.frame%10]+"  ", SAgent), S("Loading usage", SMuted)}))
 	}
-	t := r.Totals
-	cached := 0.0
-	if t.InputTokens > 0 {
-		cached = float64(t.CachedInputTokens) / float64(t.InputTokens)
+	var cards [][3]string
+	var dates []string
+	var values []float64
+	var title, note string
+	var unit func(float64) string
+	switch a.usageTab {
+	case 0:
+		t := ws.Totals
+		cards = [][3]string{
+			{"CREDITS LEFT", money(a.balance.BalanceUSDNanos), "they pay for workspace time"},
+			{"RUNNING TIME", fmt.Sprintf("%dh %02dm", t.BilledMinutes/60, t.BilledMinutes%60), "billed by the started minute"},
+			{"CREDITS USED", money(t.ChargedUSDNanos), money(t.ChargedUSDNanos/max(1, int64(len(ws.Daily)))) + " a day on average"},
+			{"WORKSPACE RUNS", fmt.Sprint(t.Runs), "times a computer woke to work"},
+		}
+		for _, d := range ws.Daily {
+			dates, values = append(dates, d.Date), append(values, float64(d.ChargedUSDNanos))
+		}
+		title, note = "CREDITS USED EACH DAY", "Sleeping workspaces are free."
+		unit = func(v float64) string { return money(int64(v)) }
+	default:
+		t := r.Totals
+		cached := 0.0
+		if t.InputTokens > 0 {
+			cached = float64(t.CachedInputTokens) / float64(t.InputTokens)
+		}
+		cards = [][3]string{
+			{"PROCESSED TOKENS", tokens(t.ProcessedTokens), fmt.Sprintf("%d%% of input cached", int(cached*100+0.5))},
+			{"DIRECT API COST", money(t.ActualCost.Nanodollars()), "reported by providers, or priced"},
+			{"EQUIVALENT API VALUE", money(t.APIEquivalentCost.Nanodollars()), "an estimate, not what you paid"},
+		}
+		for _, d := range r.Daily {
+			dates, values = append(dates, d.Date), append(values, float64(d.Metrics.ProcessedTokens))
+		}
+		title, note = "TOKENS EACH DAY", "Barad does not charge for inference; your model providers bill it."
+		unit = func(v float64) string { return tokens(int64(v)) }
 	}
-	actual, list := t.ActualCost.Nanodollars(), t.APIEquivalentCost.Nanodollars()
-	saved := ""
-	if list > 0 {
-		saved = fmt.Sprintf("list price, saved %d%%", int(100*(1-float64(actual)/float64(list))+0.5))
-	}
-	hours := ws.Totals.BilledMinutes / 60
-	cards := [][3]string{
-		{"TOKENS", tokens(t.ProcessedTokens), fmt.Sprintf("%d%% cached", int(cached*100+0.5))},
-		{"WORKSPACE TIME", fmt.Sprintf("%dh %02dm", hours, ws.Totals.BilledMinutes%60), fmt.Sprintf("%s across %d runs", money(ws.Totals.ChargedUSDNanos), ws.Totals.Runs)},
-		{"API COST", money(actual), "what you paid"},
-		{"API EQUIVALENT", money(list), saved},
-	}
-	cw := (w - 3*2) / len(cards)
-	var slabs [][]Line
-	for _, c := range cards {
-		slabs = append(slabs, slab([]Line{{S(c[0], SFaint.Bold(true))}, {}, {S(c[1], SText.Bold(true))}, {S(ansi.Truncate(c[2], cw-6, "…"), SMuted)}}, Raised, cw, 3))
-	}
-	for row := range slabs[0] {
+
+	// the figures, side by side, each on a rule
+	cw := (w - 2*(len(cards)-1)) / len(cards)
+	for row := range 3 {
 		var l Line
-		for i, sl := range slabs {
+		for i, c := range cards {
+			cell := [3]Line{{S(c[0], SFaint.Bold(true))}, {S(c[1], SText.Bold(true))}, {S(ansi.Truncate(c[2], cw-4, "…"), SMuted)}}[row]
 			if i > 0 {
 				l = append(l, gap(2))
 			}
-			l = append(l, sl[row]...)
+			l = append(l, S(ruleMark, Fg(AccentText)))
+			l = append(append(l, cell...), gap(cw-2-cell.Width()))
 		}
 		out = append(out, at(l))
 	}
-	out = append(out, blank(), blank(), at(Line{S("DAILY SPEND", SFaint.Bold(true)), gap(3), S("API cost and workspace time per day", SMuted)}), blank())
-	days := make([]float64, len(r.Daily))
-	for i, d := range r.Daily {
-		days[i] = float64(d.Metrics.ActualCost.Nanodollars())
-		if i < len(ws.Daily) && ws.Daily[i].Date == d.Date {
-			days[i] += float64(ws.Daily[i].ChargedUSDNanos)
-		}
+	out = append(out, blank(), blank())
+	if len(values) == 0 {
+		return append(out, at(Line{S("Nothing in these days.", SMuted)}))
 	}
-	if len(days) == 0 {
-		return append(out, at(Line{S("Nothing spent in these days.", SMuted)}))
-	}
-	const h = 6
-	bw := max(1, (w-6)/len(days)-1)
 	top := 0.0
-	for _, d := range days {
-		top = math.Max(top, d)
+	for _, v := range values {
+		top = math.Max(top, v)
 	}
+	out = append(out, at(spread(Line{S(title, SFaint.Bold(true))}, Line{S("peak  ", SFaint), S(unit(top), SSec)}, w)), blank())
+
+	// the chart: one bar a day, as tall as the screen allows
+	h := max(4, a.h-1-len(out)-4)
+	n := len(values)
+	barW := func(i int) int { return max(1, (i+1)*(w+1)/n-i*(w+1)/n-1) } // the bars share the whole width
 	for row := h - 1; row >= 0; row-- {
 		var l Line
-		for i, d := range days {
+		for i, v := range values {
 			eighths := 0
 			if top > 0 {
-				eighths = int(d / top * h * 8)
+				eighths = int(v / top * float64(h*8))
 			}
 			c := " "
 			switch {
@@ -265,15 +303,18 @@ func (a *app) usageView() []string {
 				c = string([]rune("▁▂▃▄▅▆▇█")[eighths-row*8-1])
 			}
 			st := SAgent
-			if i == len(days)-1 {
+			if i == len(values)-1 {
 				st = SAccent // today
 			}
-			l = append(l, S(strings.Repeat(c, bw), st), gap(1))
+			l = append(l, S(strings.Repeat(c, barW(i)), st), gap(1))
 		}
 		out = append(out, at(l))
 	}
-	width := len(days)*(bw+1) - 1
-	axis := spread(Line{S(r.Daily[0].Date, SMuted)}, Line{S("today", Fg(AccentText))}, width)
-	return append(out, at(Line{S(strings.Repeat("─", width), Fg(BorderDefault))}), at(axis), blank(),
-		at(Line{S("peak ", SFaint), S(money(int64(top)), SSec), S(" a day", SFaint)}))
+	width := 0
+	for i := range n {
+		width += barW(i) + 1
+	}
+	width--
+	axis := spread(Line{S(dates[0], SMuted)}, Line{S("today", Fg(AccentText))}, width)
+	return append(out, at(Line{S(strings.Repeat("─", width), Fg(BorderDefault))}), at(axis), blank(), at(Line{S(note, SFaint)}))
 }

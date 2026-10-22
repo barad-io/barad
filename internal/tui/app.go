@@ -101,18 +101,19 @@ type app struct {
 	cancelRequestedOn string               // the turn you asked to stop
 
 	// Where you are.
-	screen screen
-	sel    string // the selected session on the home screen
-	conv   *conversation
-	comp   Editor
-	attach []attachment
-	note   string // the last thing the composer has to say about attachments
-	scroll int    // transcript rows above the bottom
-	filter *Editor
-	start  *starter // the new session sheet
-	menu   *menu
-	imgIdx int
-	span   *span // text selected with the mouse
+	screen   screen
+	sel      string // the selected session on the home screen
+	conv     *conversation
+	comp     Editor
+	attach   []attachment
+	note     string // the last thing the composer has to say about attachments
+	scroll   int    // transcript rows above the bottom
+	filter   *Editor
+	start    *starter // the new session sheet
+	menu     *menu
+	imgIdx   int
+	usageTab int   // 0 Barad, 1 inference
+	span     *span // text selected with the mouse
 }
 
 type mdKey struct {

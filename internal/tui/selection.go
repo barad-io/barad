@@ -181,7 +181,7 @@ func selected(grid uv.ScreenBuffer, s span) string {
 			case c == nil:
 				b.WriteByte(' ')
 			case c.Content == "":
-			case strings.ContainsRune(c.Content, 0x10EEEE) || strings.ContainsAny(c.Content, "▄▀▐▌▍"):
+			case strings.ContainsRune(c.Content, 0x10EEEE) || strings.ContainsAny(c.Content, "▄▀▐▌▍▏"): // surfaces' edges, rules, pictures
 				b.WriteByte(' ')
 			default:
 				b.WriteString(c.Content)

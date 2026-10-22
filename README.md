@@ -32,7 +32,8 @@ Signing in never asks for your password. `barad login` shows a code such as `BCD
 - **The message box**: Shift+Enter starts a new line; the arrow keys move through what you have written, Home and End to the line's ends.
 - **Select and copy**: drag across any text to copy it; the copy leaves out the app's frames and indent. A click on a link opens it in your browser.
 - **The footer** says how many sessions need you and how many are working, and briefly when one finishes.
-- **One menu** (`?`, or Ctrl+P) for everything else: stop the agent, approve or dismiss a proposed session, model, reasoning effort, images, copy the last reply, a read-only share link, rename, theme and archive.
+- **Your messages**: Ctrl+P and Ctrl+N jump to your previous and next message, as the web app's arrows do.
+- **One menu** (`?`, or Ctrl+K) for everything else: stop the agent, approve or dismiss a proposed session, model, reasoning effort, images, copy the last reply, a read-only share link, rename, theme and archive.
 - **New session** (`n`) starts from your project's agent, repository and effort.
 - **Images**: screenshots the agent took and images you attached. Attach one by dropping the file on the terminal or with Ctrl+V. Text pasted past 64 KB goes as a text attachment.
 - **Usage**: tokens, workspace time and spend over 30 days.

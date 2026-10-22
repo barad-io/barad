@@ -244,6 +244,7 @@ var (
 	groundOk     = hex("#8bcca1")
 	groundDanger = hex("#f28eab")
 	groundAccent = hex("#fd9a73")
+	groundWarn   = hex("#e0b25c")
 )
 
 // bar is the top of a screen: a full-width strip of ground with where you

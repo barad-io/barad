@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"math"
 	"net/http"
 	"os"
@@ -48,8 +49,11 @@ func (a *app) key(k tea.KeyPressMsg) tea.Cmd {
 	case screenImages:
 		return a.imagesKey(k)
 	case screenUsage:
-		if ks == "esc" || ks == "q" || ks == "left" {
+		switch ks {
+		case "esc", "q":
 			a.screen = screenHome
+		case "tab", "shift+tab", "left", "right":
+			a.usageTab = 1 - a.usageTab
 		}
 	}
 	return nil
@@ -65,9 +69,13 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 		a.prefs.Work = (a.prefs.Work + 1) % 3
 		a.savePrefs()
 		return nil
-	case "ctrl+p", "ctrl+k":
+	case "ctrl+k":
 		a.menu = a.chatMenu()
 		return nil
+	case "ctrl+p":
+		return a.jump(-1)
+	case "ctrl+n":
+		return a.jump(1)
 	case "?":
 		if empty {
 			a.menu = a.chatMenu()
@@ -103,10 +111,39 @@ func (a *app) chatKey(k tea.KeyPressMsg) tea.Cmd {
 // scrollBy moves the transcript by n rows (up is positive), and loads
 // earlier messages when you reach the top.
 func (a *app) scrollBy(n int) tea.Cmd {
-	lines := len(a.transcript())
-	top := max(0, lines-a.chatRows())
+	lines, _ := a.transcript()
+	top := max(0, len(lines)-a.chatRows())
 	a.scroll = min(max(0, a.scroll+n), top)
 	if a.scroll >= top-a.h/2 {
+		return a.loadOlder()
+	}
+	return nil
+}
+
+// jump scrolls to your previous (dir < 0) or next message, setting it at the
+// top of the transcript, as the web app's arrows do. Past your last message
+// is the newest; before your first, earlier messages load.
+func (a *app) jump(dir int) tea.Cmd {
+	lines, yours := a.transcript()
+	vh := a.chatRows()
+	top := max(0, len(lines)-vh-a.scroll) // the row at the top of the view
+	target := -1
+	for i := range yours {
+		y := yours[i]
+		if dir < 0 {
+			y = yours[len(yours)-1-i]
+		}
+		if dir < 0 && y < top || dir > 0 && y > top {
+			target = y
+			break
+		}
+	}
+	switch {
+	case target >= 0:
+		return a.scrollBy(len(lines) - vh - target - a.scroll)
+	case dir > 0:
+		a.scroll = 0
+	default:
 		return a.loadOlder()
 	}
 	return nil
@@ -227,7 +264,7 @@ func (a *app) chatView() ([]string, string) {
 	w := a.width()
 	top := append(a.sessionBar(), blank())
 	bottom := a.composer()
-	lines := a.transcript()
+	lines, _ := a.transcript()
 	vh := a.chatRows()
 	end := len(lines) - min(a.scroll, max(0, len(lines)-vh))
 	view := lines[max(0, end-vh):end]
@@ -237,14 +274,15 @@ func (a *app) chatView() ([]string, string) {
 	}
 	out = append(out, view...)
 	if a.scroll > 0 {
-		out[len(out)-1] = at(spread(nil, pill(Line{S("↓ newer below · pgdn", SSec)}, Muted), w))
+		out[len(out)-1] = at(spread(nil, Line{S("↓ ", SAgent), S("newer below", SSec), S("  pgdn", SFaint)}, w))
 	}
 	out = append(out, blank())
 	out = append(out, bottom...)
-	keys := []string{"enter", "send", "esc", "sessions", "tab", [...]string{"show steps", "full output", "fold steps"}[a.prefs.Work], "?", "menu"}
+	keys := []string{"enter", "send", "esc", "sessions", "tab", [...]string{"show steps", "full output", "fold steps"}[a.prefs.Work], "ctrl+p ctrl+n", "your messages"}
 	if a.conv.session.CurrentTurnID != "" {
-		keys = []string{"enter", "send", "esc", "sessions", "tab", [...]string{"show steps", "full output", "fold steps"}[a.prefs.Work], "ctrl+x", "stop", "?", "menu"}
+		keys = append(keys, "ctrl+x", "stop")
 	}
+	keys = append(keys, "?", "menu")
 	return out, a.footer(keys...)
 }
 
@@ -314,7 +352,7 @@ func (a *app) footer(keys ...string) string {
 			mark = S("✕  ", SDanger)
 		}
 		room := a.width() - l.Width() - 10
-		right = pill(Line{mark, S(ansi.Truncate(a.toast, max(10, room), "…"), st)}, Raised)
+		right = Line{mark, S(ansi.Truncate(a.toast, max(10, room), "…"), st)}
 	case !a.online && a.listed:
 		right = Line{S("○ ", SFaint), S("reconnecting", SMuted)}
 	case a.screen != screenHome: // the cover says it at home
@@ -328,13 +366,17 @@ func (a *app) footer(keys ...string) string {
 			right = append(right, S(Spinner[a.frame%10]+" ", SAgent), S(fmt.Sprintf("%d working", n), SMuted))
 		}
 	}
+	for len(keys) > 2 && l.Width()+right.Width()+4 > a.width() { // a narrow window keeps the first keys
+		keys = keys[:len(keys)-2]
+		l = l[:len(l)-3]
+	}
 	return at(spread(l, right, a.width()))
 }
 
 // ---------------------------------------------------------------- the bar
 
-// statusPill is a session's state on the bar: a pill in its hue. The pills
-// use the night tints in both themes, because the ground is dark in both.
+// statusPill is a session's state on the bar, in its hue. It uses the night
+// hues in both themes, because the ground is dark in both.
 func (a *app) statusPill(s wire.Session) Line {
 	quiet := Fg(lands[a.prefs.Theme].quiet)
 	st := a.standing(s)
@@ -350,13 +392,13 @@ func (a *app) statusPill(s wire.Session) Line {
 		if t, ok := a.conv.turns[s.CurrentTurnID]; ok && word == "working" {
 			el = "  " + dur(a.now.Sub(t.CreatedAt).Truncate(time.Second))
 		}
-		return pill(Line{S(Spinner[a.frame%10]+" ", Fg(groundAgent)), S(word, Fg(groundAgent).Bold(true)), S(el, Fg(groundSec))}, hex("#132b3d"))
+		return Line{S(Spinner[a.frame%10]+" ", Fg(groundAgent)), S(word, Fg(groundAgent).Bold(true)), S(el, Fg(groundSec))}
 	case "ready":
-		return pill(Line{S("● ", Fg(groundOk)), S(word, Fg(groundOk).Bold(true))}, hex("#152c1e"))
+		return Line{S("● ", Fg(groundOk)), S(word, Fg(groundOk).Bold(true))}
 	case "asks you":
-		return pill(Line{S("◆ ", Fg(groundAccent)), S(word, Fg(groundAccent).Bold(true))}, hex("#3e2015"))
+		return Line{S("◆ ", Fg(groundAccent)), S(word, Fg(groundAccent).Bold(true))}
 	case "failed":
-		return pill(Line{S("✕ ", Fg(groundDanger)), S(word, Fg(groundDanger).Bold(true))}, hex("#3a1b24"))
+		return Line{S("✕ ", Fg(groundDanger)), S(word, Fg(groundDanger).Bold(true))}
 	}
 	return Line{S("○ "+word, quiet)}
 }
@@ -388,13 +430,17 @@ func (a *app) sessionBar(screen ...string) []string {
 			used = u.InputTokens + u.OutputTokens
 		}
 		frac := math.Min(1, float64(used)/float64(total))
-		fill := groundSec
-		if limit := s.AutoCompactTokenLimit; used >= limit && limit > 0 || frac >= 1 {
-			fill = groundAccent
+		// the fuller it is, the louder: grey, then amber from 75%, then red and bold from 90%
+		fill, figure := color.Color(groundSec), Fg(groundSec)
+		switch {
+		case frac >= 0.9:
+			fill, figure = groundDanger, Fg(groundDanger).Bold(true)
+		case frac >= 0.75:
+			fill, figure = groundWarn, Fg(groundWarn)
 		}
 		detail = append(detail, gap(5), S("context  ", quiet))
 		detail = append(detail, gauge(a.prefs.Theme, frac, 12, fill)...)
-		detail = append(detail, S(fmt.Sprintf("  %d%%", int(frac*100+0.5)), Fg(groundSec)))
+		detail = append(detail, S(fmt.Sprintf("  %d%%", int(frac*100+0.5)), figure))
 	}
 	machine := map[wire.MachineStatus]string{
 		wire.MachineStatusHydrated: "awake", wire.MachineStatusHydrating: "waking", wire.MachineStatusDehydrating: "falling asleep",
@@ -446,14 +492,14 @@ func modelName(s wire.Session) string {
 
 // ---------------------------------------------------------------- the transcript
 
-// transcript lays out the whole conversation, painted, oldest first.
-func (a *app) transcript() []string {
+// transcript lays out the whole conversation, painted, oldest first, and
+// says on which rows your messages begin.
+func (a *app) transcript() (out []string, yours []int) {
 	c := a.conv
 	w := a.width()
-	var out []string
 	switch {
 	case !c.initialized:
-		return []string{at(Line{gap(2), S(Spinner[a.frame%10]+"  ", SAgent), S("Loading the conversation", SMuted)})}
+		return []string{at(Line{gap(2), S(Spinner[a.frame%10]+"  ", SAgent), S("Loading the conversation", SMuted)})}, nil
 	case c.loadingOlder:
 		out = append(out, at(Line{gap(2), S(Spinner[a.frame%10]+"  ", SAgent), S("Loading earlier messages", SMuted)}), blank())
 	case c.hasOlder:
@@ -484,10 +530,13 @@ func (a *app) transcript() []string {
 		if still {
 			kept[k] = rows
 		}
+		if ex.user != nil {
+			yours = append(yours, len(out))
+		}
 		out = append(out, rows...)
 	}
 	a.laid = kept
-	return out
+	return out, yours
 }
 
 // laidKey is what an exchange's painted rows depend on, besides the
@@ -550,7 +599,7 @@ func (a *app) exchange(ex exchange, w int) []Line {
 		}
 		s := c.session
 		mark, mc := providerMark(string(s.Provider))
-		add(0, Line{S(mark+" ", Fg(mc)), S(strings.ToLower(providerName(string(s.Provider))), SAgent.Bold(true)), S("  "+s.Model, SMuted)})
+		add(0, Line{S(mark+" ", Fg(mc)), S(strings.ToLower(providerName(string(s.Provider))), SSec.Bold(true)), S("  "+s.Model, SFaint)})
 	}
 	lastRun := map[string]int{}
 	for i, p := range ex.parts {
@@ -580,41 +629,43 @@ func (a *app) exchange(ex exchange, w int) []Line {
 					msg += "  (" + f.Code + ")"
 				}
 			}
-			body := []Line{{S("✕  ", SDanger), S(title, SDanger.Bold(true))}}
-			body = append(body, Indent(Wrap([]Seg{S(msg, SSec)}, aw-9), 3)...)
-			add(0, Line{})
-			add(0, slab(body, DangerSurf, aw, 3)...)
+			add(0, Line{}, Line{S("✕  ", SDanger), S(title, SDanger.Bold(true))})
+			add(0, ruled(Wrap([]Seg{S(msg, SSec)}, aw-2), Danger)...)
 		case partEnd:
-			add(0, Line{}, a.ending(*p.turn))
+			add(0, Line{}, a.ending(*p.turn, w))
 		case partProposal:
 			add(0, Line{})
-			add(0, slab(a.proposal(p, aw-6), AccentSurface, aw, 3)...)
+			add(0, a.proposal(p, aw)...)
+		}
+	}
+	for _, p := range ex.parts {
+		if p.working {
+			add(0, Line{}, a.workingLine(p))
 		}
 	}
 	add(0, Line{}, Line{}, Line{})
 	return rows
 }
 
-// ending is the line under a turn's answer: how it ended, when, and how
-// long it took.
-func (a *app) ending(t wire.Turn) Line {
+// ending is the rule under a turn's answer, w cells long: how it ended,
+// when, and how long it took.
+func (a *app) ending(t wire.Turn, w int) Line {
 	var l Line
 	switch t.Status {
 	case wire.TurnStatusFailed:
-		l = Line{S("✕  ", SDanger), S("failed", SSec)}
+		l = Line{S("✕  ", SDanger), S("failed", SFaint)}
 	case wire.TurnStatusCancelled:
-		l = Line{S("■  ", SFaint), S("stopped at your request", SSec)}
+		l = Line{S("■  ", SFaint), S("stopped at your request", SFaint)}
 	default:
-		l = Line{S("✓  ", SOk), S("done", SSec)}
+		l = Line{S("✓  ", SFaint), S("done", SFaint)}
 	}
-	if t.CompletedAt.IsZero() {
-		return l
+	if !t.CompletedAt.IsZero() {
+		l = append(l, S("  "+clock(t.CompletedAt, a.now), SFaint))
+		if !t.CreatedAt.IsZero() && t.CompletedAt.After(t.CreatedAt) {
+			l = append(l, S("  ·  took "+dur(t.CompletedAt.Sub(t.CreatedAt).Truncate(time.Second)), SFaint))
+		}
 	}
-	l = append(l, S("  "+clock(t.CompletedAt, a.now), SMuted))
-	if !t.CreatedAt.IsZero() && t.CompletedAt.After(t.CreatedAt) {
-		l = append(l, S("  ·  took "+dur(t.CompletedAt.Sub(t.CreatedAt).Truncate(time.Second)), SFaint))
-	}
-	return l
+	return append(l, S(" "+strings.Repeat("─", max(0, w-l.Width()-1)), Fg(BorderSubtle)))
 }
 
 // proposal is a session the agent wants to start, and what became of it.
@@ -629,31 +680,35 @@ func (a *app) proposal(p part, w int) []Line {
 		title, _ = p.steps[0].args["title"].(string)
 		reason, _ = p.steps[0].args["reason"].(string)
 	}
-	body := []Line{{S("◆  ", SAccent), S("proposes a new session", Fg(AccentText).Bold(true))}, {}, {gap(3), S(title, SText.Bold(true))}}
+	head, edge := Line{S("◆  ", SAccent.Bold(true)), S("proposes a new session", SAccent.Bold(true))}, Accent
+	if known && view.Decision != nil {
+		head, edge = Line{S("◆  ", SFaint), S("proposed a new session", SMuted)}, BorderDefault
+	}
+	body := []Line{{S(title, SText.Bold(true))}}
 	if reason != "" {
-		body = append(body, Indent(Wrap([]Seg{S(reason, SSec)}, w-3), 3)...)
+		body = append(body, Wrap([]Seg{S(reason, SSec)}, w-2)...)
 	}
 	if len(view.Proposal.Repositories) > 0 {
 		var names []string
 		for _, r := range view.Proposal.Repositories {
 			names = append(names, r.Repository)
 		}
-		body = append(body, Line{gap(3), S("repositories  ", SFaint), S(strings.Join(names, ", "), SSec)})
+		body = append(body, Line{S("repositories  ", SFaint), S(strings.Join(names, ", "), SSec)})
 	}
 	body = append(body, Line{})
 	switch {
 	case !known && p.result != nil:
-		body = append(body, Line{gap(3), S(readResult(p.result).failure("new_session"), SMuted)})
+		body = append(body, Line{S(readResult(p.result).failure("new_session"), SMuted)})
 	case !known:
-		body = append(body, Line{gap(3), S(Spinner[a.frame%10]+" ", SAgent), S("proposing", SMuted)})
+		body = append(body, Line{S(Spinner[a.frame%10]+" ", SAgent), S("proposing", SMuted)})
 	case view.Decision == nil:
-		body = append(body, Line{gap(3), S("Approve or dismiss it from the menu: ", SMuted), S("?", SSec.Bold(true))})
+		body = append(body, Line{S("Approve or dismiss it from the menu: ", SMuted), S("?", SSec.Bold(true))})
 	case view.Decision.Status == "approved":
-		body = append(body, Line{gap(3), S("✓  ", SOk), S("Approved — the new session started", SSec)})
+		body = append(body, Line{S("✓  ", SOk), S("Approved — the new session started", SSec)})
 	default:
-		body = append(body, Line{gap(3), S("Dismissed", SMuted)})
+		body = append(body, Line{S("Dismissed", SMuted)})
 	}
-	return body
+	return append([]Line{head}, ruled(body, edge)...)
 }
 
 // markdown lays out agent prose, remembering the layout: View runs every frame.
@@ -752,59 +807,101 @@ func (a *app) run(p part, last bool, w int) []Line {
 		took = 0
 	}
 	took = took.Truncate(time.Second)
-	count := fmt.Sprintf("%d steps", calls)
-	if calls == 1 {
-		count = "1 step"
-	}
 	failed := last && hasTurn && t.Status == wire.TurnStatusFailed
 	cancelled := last && hasTurn && t.Status == wire.TurnStatusCancelled
+	count := fmt.Sprintf(" · %d steps", calls)
+	if calls == 1 {
+		count = " · 1 step"
+	}
+	// Finished work needs nothing from you: it is all one quiet grey.
 	var row Line
 	switch {
-	case working:
-		word := "working"
-		switch {
-		case a.cancelRequestedOn == p.turnID || hasTurn && t.CancelRequested:
-			word = "stopping"
-		case c.session.MachineStatus == wire.MachineStatusHydrating:
-			word = "waking its computer"
-		case hasTurn && t.Status == wire.TurnStatusCompacting:
-			word = "compacting its context"
-		}
-		row = Line{S(Spinner[a.frame%10]+" ", SAgent), S(word, SAgent.Bold(true)), S(" · "+dur(took), SAgent)}
-		if calls > 0 {
-			row = append(row, S(" · "+count, SAgent))
-		}
 	case failed:
-		row = Line{S("▸ ", SMuted), S("stopped", SDanger), S(" after "+dur(took)+" · "+count, SMuted)}
+		row = Line{S("▸ ", SFaint), S("stopped after "+dur(took)+count, SFaint)} // the failure below says why, in red
 	case cancelled:
-		row = Line{S("▸ ", SMuted), S("cancelled", SSec), S(" after "+dur(took)+" · "+count, SMuted)}
+		row = Line{S("▸ ", SFaint), S("cancelled after "+dur(took)+count, SFaint)}
 	default:
-		row = Line{S("▸ ", SMuted), S("worked", SSec), S(" for "+dur(took)+" · "+count, SMuted)}
+		row = Line{S("▸ ", SFaint), S("worked for "+dur(took)+count, SFaint)}
 	}
 	if !working && a.prefs.Work == workFolded {
-		bg := Document
-		if failed {
-			bg = DangerSurf
-		}
-		return []Line{pill(row, bg)}
+		return []Line{row}
 	}
 	if !working {
-		row[0] = S("▾ ", SMuted)
+		row[0] = S("▾ ", SFaint)
 	}
-	body := []Line{row}
+	edge := BorderDefault
+	if failed {
+		edge = Danger
+	}
+	var body []Line
 	steps := p.steps
 	if working && a.prefs.Work == workFolded && len(steps) > 6 { // a long run shows its newest steps while it works
 		body = append(body, Line{S(fmt.Sprintf("… %d earlier steps", len(steps)-6), SFaint)})
 		steps = steps[len(steps)-6:]
 	}
-	if len(steps) > 0 {
-		body = append(body, Line{})
-	}
 	for i, s := range steps {
 		running := working && i == len(steps)-1 && s.result == nil && s.kind != "reasoning"
-		body = append(body, a.step(s, running, w-6)...)
+		body = append(body, a.step(s, running, w-2)...)
 	}
-	return slab(body, Document, w, 3)
+	if working { // what it is doing shows at the foot of the transcript (workingLine)
+		return ruled(body, edge)
+	}
+	return append([]Line{row}, ruled(body, edge)...)
+}
+
+// workingLine is the foot of a turn at work, under everything it has
+// written so far: the spinner, what it is doing, and for how long.
+func (a *app) workingLine(p part) Line {
+	c := a.conv
+	t, hasTurn := c.turns[p.turnID]
+	word := "working"
+	switch {
+	case a.cancelRequestedOn == p.turnID || hasTurn && t.CancelRequested:
+		word = "stopping"
+	case c.session.MachineStatus == wire.MachineStatusHydrating:
+		word = "waking its computer"
+	case hasTurn && t.Status == wire.TurnStatusCompacting:
+		word = "compacting its context"
+	}
+	l := Line{S(Spinner[a.frame%10]+"  ", SAgent.Bold(true)), S(word, SAgent.Bold(true))}
+	if hasTurn {
+		l = append(l, S("  "+dur(a.now.Sub(t.CreatedAt).Truncate(time.Second)), SSec))
+	}
+	calls := 0
+	for _, s := range p.steps {
+		if s.kind != "reasoning" {
+			calls++
+		}
+	}
+	switch {
+	case calls == 1:
+		l = append(l, S("  ·  1 step", SMuted))
+	case calls > 1:
+		l = append(l, S(fmt.Sprintf("  ·  %d steps", calls), SMuted))
+	}
+	return l
+}
+
+// ruled sets lines on a thin rule in c, two cells in: the run's steps, a
+// failure's reason, a proposal.
+func ruled(lines []Line, c color.Color) []Line {
+	out := make([]Line, len(lines))
+	for i, l := range lines {
+		out[i] = append(Line{S(ruleMark, Fg(c))}, l...)
+	}
+	return out
+}
+
+// ruleMark is the rule's glyph and its gap; a copy leaves it out.
+const ruleMark = "▏ "
+
+// verb is a tool's past and present tense.
+func verb(kind string) [2]string {
+	if v, ok := verbs[kind]; ok {
+		return v
+	}
+	k := strings.ReplaceAll(kind, "_", " ")
+	return [2]string{k, k}
 }
 
 // verbs are a tool's past and present tense.
@@ -840,13 +937,11 @@ func toolSummary(kind string, args map[string]any) string {
 // step lays out one step as a row of a table: the operation, its target
 // and its outcome on the right, the result beneath the target.
 func (a *app) step(s *step, running bool, w int) []Line {
-	v, ok := verbs[s.kind]
-	if !ok {
-		v = [2]string{strings.ReplaceAll(s.kind, "_", " "), strings.ReplaceAll(s.kind, "_", " ")}
-	}
-	lab := S(PadRight(v[0], labelW), SMuted)
+	// A step that has run steps back in a darker grey; the one running is bright.
+	v := verb(s.kind)
+	lab, ink := S(PadRight(v[0], labelW), SFaint), SFaint
 	if running {
-		lab = S(PadRight(v[1], labelW), SAgent)
+		lab, ink = S(PadRight(v[1], labelW), SAgent.Bold(true)), SText
 	}
 	tw := w - labelW
 	under := func(out []Line, ls ...Line) []Line {
@@ -856,7 +951,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 		return out
 	}
 	if s.kind == "reasoning" {
-		lines := Wrap([]Seg{S(strings.TrimSpace(s.think), SSec.Italic(true))}, tw)
+		lines := Wrap([]Seg{S(strings.TrimSpace(s.think), SFaint.Italic(true))}, tw)
 		if a.prefs.Work != workFull && len(lines) > 2 {
 			lines = append(lines[:2:2], Line{S("…", SFaint)})
 		}
@@ -872,18 +967,18 @@ func (a *app) step(s *step, running bool, w int) []Line {
 	var outcome Line
 	switch {
 	case running:
-		outcome = Line{S(Spinner[a.frame%10], SAgent)}
+		outcome = Line{S(Spinner[a.frame%10], SAgent.Bold(true))}
 	case s.result == nil:
 		outcome = Line{S("·", SFaint)}
 	case r.cancelled:
-		outcome = Line{S("cancelled", SMuted)}
+		outcome = Line{S("cancelled", SFaint)}
 	case failure != "":
-		outcome = Line{S("✕", SDanger)}
+		outcome = Line{S("✕", SFaint)}
 	case s.kind == "edit":
 		add, del := editCounts(s.args)
-		outcome = Line{S(fmt.Sprintf("+%d", add), SOk), S(" ", SText), S(fmt.Sprintf("−%d", del), SDanger)}
+		outcome = Line{S(fmt.Sprintf("+%d −%d", add, del), SFaint)}
 	default:
-		outcome = Line{S("✓", SOk)}
+		outcome = Line{S("✓", SFaint)}
 	}
 	if s.call != nil && s.result != nil {
 		outcome = append(Line{S(dur(s.result.CreatedAt.Sub(s.call.CreatedAt).Truncate(100*time.Millisecond))+"  ", SFaint)}, outcome...)
@@ -892,7 +987,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 	if i := strings.IndexByte(target, '\n'); i >= 0 {
 		target = target[:i] + " …"
 	}
-	out := []Line{spread(Line{lab, S(ansi.Truncate(target, max(4, tw-outcome.Width()-2), "…"), SSec)}, outcome, w)}
+	out := []Line{spread(Line{lab, S(ansi.Truncate(target, max(4, tw-outcome.Width()-2), "…"), ink)}, outcome, w)}
 	if a.prefs.Work == workFolded && !running || s.result == nil || r.cancelled {
 		return out
 	}
@@ -900,7 +995,7 @@ func (a *app) step(s *step, running bool, w int) []Line {
 	clip := func(o string) string { return ansi.Truncate(strings.ReplaceAll(o, "\t", "  "), tw-1, "…") }
 	text := strings.TrimRight(r.output(), "\n")
 	if failure != "" && text == "" { // a failure with output shows the output; one without, why
-		lines := Wrap([]Seg{S(failure, SDanger)}, tw-1)
+		lines := Wrap([]Seg{S(failure, SMuted)}, tw-1)
 		if a.prefs.Work != workFull && len(lines) > 3 {
 			lines = lines[:3]
 		}
@@ -929,13 +1024,12 @@ func (a *app) step(s *step, running bool, w int) []Line {
 				if d[1] == "" {
 					continue
 				}
-				fg, bg := SDanger, DangerSurf
+				fg := SDanger
 				if d[0] == "+" {
-					fg, bg = SOk, SuccessSurf
+					fg = SOk
 				}
 				for _, l := range strings.Split(strings.TrimSuffix(d[1], "\n"), "\n") {
-					text := clip(d[0] + " " + l)
-					out = under(out, Line{S(text+strings.Repeat(" ", max(0, tw-ansi.StringWidth(text))), fg.Background(bg))})
+					out = under(out, Line{S(clip(d[0]+" "+l), fg)})
 				}
 			}
 		}
@@ -953,14 +1047,11 @@ func (a *app) step(s *step, running bool, w int) []Line {
 		return out
 	}
 	output := strings.Split(text, "\n")
-	tone := func(o string) lipgloss.Style {
-		switch {
-		case strings.Contains(o, "FAIL") || strings.Contains(o, "panic:") || strings.Contains(o, "Error"):
-			return SDanger.Bold(true)
-		case strings.HasPrefix(o, "ok ") || strings.HasPrefix(o, "PASS"):
-			return SOk
+	tone := func(o string) lipgloss.Style { // a failure reads a shade brighter in the grey
+		if strings.Contains(o, "FAIL") || strings.Contains(o, "panic:") || strings.Contains(o, "Error") {
+			return SMuted
 		}
-		return SMuted
+		return SFaint
 	}
 	if a.prefs.Work == workFull {
 		const most = 400
@@ -992,7 +1083,7 @@ func codeLines(content, ext string, w int) []Line {
 		more = fmt.Sprintf("… %d more lines", len(lines)-200)
 		lines = lines[:200]
 	}
-	out := CodeBlock(strings.Join(lines, "\n"), strings.TrimPrefix(ext, "."), w, Subtle)
+	out := CodeBlock(strings.Join(lines, "\n"), strings.TrimPrefix(ext, "."), w)
 	if more != "" {
 		out = append(out, Line{S(more, SFaint)})
 	}

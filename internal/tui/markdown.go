@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"image/color"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -51,26 +50,30 @@ func (r *mdRenderer) block(n ast.Node, width int) []Line {
 	case *ast.Paragraph, *ast.TextBlock:
 		return Wrap(r.inline(n, SText), width)
 	case *ast.Heading:
-		segs := r.inline(n, SText.Bold(true))
-		if n.Level == 1 {
-			return Wrap(segs, width)
+		// A title outranks everything else in the prose: the top two levels
+		// in the accent, the rest bright; below the first, small capitals.
+		st := Fg(AccentText).Bold(true)
+		if n.Level > 2 {
+			st = SText.Bold(true)
 		}
-		// a kicker: small, uppercase, quiet
+		segs := r.inline(n, st)
 		for i := range segs {
-			segs[i].Text = strings.ToUpper(segs[i].Text)
-			segs[i].Style = Fg(TextMuted).Bold(true)
+			if n.Level > 1 {
+				segs[i].Text = strings.ToUpper(segs[i].Text)
+			}
+			segs[i].Style = st
 		}
 		return Wrap(segs, width)
 	case *ast.ThematicBreak:
 		return []Line{{S(strings.Repeat("─", width), Fg(BorderDefault))}}
 	case *ast.FencedCodeBlock:
-		return CodeBlock(r.lines(n), string(n.Language(r.src)), width, Subtle)
+		return CodeBlock(r.lines(n), string(n.Language(r.src)), width)
 	case *ast.CodeBlock:
-		return CodeBlock(r.lines(n), "", width, Subtle)
+		return CodeBlock(r.lines(n), "", width)
 	case *ast.Blockquote:
 		var out []Line
 		for _, l := range r.blocks(n, width-2) {
-			out = append(out, append(Line{S("▎ ", Fg(BorderDefault))}, recolor(l, TextSec)...))
+			out = append(out, append(Line{S("▎ ", Fg(BorderDefault))}, quiet(l)...))
 		}
 		return out
 	case *ast.List:
@@ -83,13 +86,13 @@ func (r *mdRenderer) block(n ast.Node, width int) []Line {
 	return nil
 }
 
-// recolor gives a line's default-coloured text another colour.
-func recolor(l Line, c color.Color) Line {
+// quiet greys a quotation's plain text out and slants it.
+func quiet(l Line) Line {
 	out := make(Line, len(l))
 	for i, s := range l {
 		fg := s.Style.GetForeground()
 		if _, none := fg.(lipgloss.NoColor); none || fg == Text {
-			s.Style = s.Style.Foreground(c)
+			s.Style = s.Style.Foreground(TextMuted).Italic(true)
 		}
 		out[i] = s
 	}
@@ -136,7 +139,7 @@ func (r *mdRenderer) list(n *ast.List, width int) []Line {
 		for i, l := range body {
 			lead := gap(indent)
 			if i == 0 {
-				lead = S(marker+" ", SMuted)
+				lead = S(marker+" ", SFaint)
 			}
 			out = append(out, append(Line{lead}, l...))
 		}
@@ -246,7 +249,9 @@ func (r *mdRenderer) inline(n ast.Node, base lipgloss.Style) []Seg {
 						b.Write(t.Value(r.src))
 					}
 				}
-				segs = append(segs, S(b.String(), Fg(TextSec).Background(Muted)))
+				// `things`: green, between quiet backticks
+				tick := Fg(BorderDefault)
+				segs = append(segs, S("`", tick), S(b.String(), Fg(Success)), S("`", tick))
 			case *ast.Emphasis:
 				if c.Level >= 2 {
 					walk(c, st.Bold(true))
@@ -294,10 +299,9 @@ func (r *mdRenderer) inline(n ast.Node, base lipgloss.Style) []Seg {
 	return segs
 }
 
-// CodeBlock highlights code on a surface w cells wide, with half a row of
-// padding above and below (half blocks). Nothing else shares its rows, so
-// the code copies clean.
-func CodeBlock(code, lang string, width int, bg color.Color) []Line {
+// CodeBlock highlights code w cells wide on a thin rule: no surface, so it
+// copies clean and its colours carry it.
+func CodeBlock(code, lang string, width int) []Line {
 	lexer := lexers.Get(lang)
 	if lexer == nil {
 		lexer = lexers.Analyse(code)
@@ -310,7 +314,7 @@ func CodeBlock(code, lang string, width int, bg color.Color) []Line {
 	cur := Line{}
 	it, err := lexer.Tokenise(nil, code)
 	if err != nil {
-		rows = Wrap([]Seg{S(code, SSec)}, width-4)
+		rows = Wrap([]Seg{S(code, SSec)}, width-2)
 	} else {
 		for tok := it(); tok != chroma.EOF; tok = it() {
 			for pi, p := range strings.Split(tok.Value, "\n") {
@@ -327,21 +331,12 @@ func CodeBlock(code, lang string, width int, bg color.Color) []Line {
 			rows = append(rows, cur)
 		}
 	}
-	pad := lipgloss.NewStyle().Background(bg)
-	out := []Line{{S(strings.Repeat("▄", width), Fg(bg))}}
-	for _, r := range rows {
-		l := Line{S("  ", pad)}
-		for _, s := range r {
-			l = append(l, S(s.Text, s.Style.Background(bg)))
+	for i, r := range rows {
+		if r.Width() > width-2 {
+			rows[i] = Line{S(ansi.Truncate(r.Paint(nil, 0), width-3, "…"), lipgloss.NewStyle())}
 		}
-		if w := l.Width(); w < width {
-			l = append(l, S(strings.Repeat(" ", width-w), pad))
-		} else {
-			l = Line{S(ansi.Truncate(l.Paint(bg, 0), width-1, "…"), lipgloss.NewStyle()), S(" ", pad)}
-		}
-		out = append(out, l)
 	}
-	return append(out, Line{S(strings.Repeat("▀", width), Fg(bg))})
+	return ruled(rows, BorderDefault)
 }
 
 func tokenStyle(t chroma.TokenType) lipgloss.Style {

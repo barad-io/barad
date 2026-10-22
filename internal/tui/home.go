@@ -40,7 +40,7 @@ func (a *app) homeKey(k tea.KeyPressMsg) tea.Cmd {
 	case "/":
 		a.filter = &Editor{}
 		return nil
-	case "?", "ctrl+p", "ctrl+k":
+	case "?", "ctrl+k":
 		a.menu = a.homeMenu()
 		return nil
 	case "q":

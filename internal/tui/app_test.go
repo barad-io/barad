@@ -2,8 +2,10 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +117,8 @@ func (d *driver) misses(gone ...string) {
 // reads checks the whole transcript, scrolled or not.
 func (d *driver) reads(want ...string) {
 	d.t.Helper()
-	s := ansi.Strip(strings.Join(d.a.transcript(), "\n"))
+	lines, _ := d.a.transcript()
+	s := ansi.Strip(strings.Join(lines, "\n"))
 	for _, w := range want {
 		if !strings.Contains(s, w) {
 			d.t.Fatalf("the transcript does not show %q:\n%s", w, s)
@@ -154,7 +157,7 @@ func TestConversationShowsWorkFoldedThenUnfolded(t *testing.T) {
 	d.openSession("checkout")
 	d.sees("ACME", "Fix the flaky checkout test", "✻ claude-opus-5", "high", "repo  acme/web", "context", "31%", "awake",
 		"you", "The checkout test fails about one run in five", "claude", "worked for", "5 steps",
-		"The test was flaky because Cart.Add updated total", "WHAT CHANGED", "func (c *Cart) Add(it Item) {")
+		"The test was flaky because `Cart.Add` updated `total`", "WHAT CHANGED", "func (c *Cart) Add(it Item) {")
 	d.misses("go test ./checkout/ -race -count=20")
 
 	d.keys("tab") // shown: a row per step
@@ -330,7 +333,12 @@ func TestAttachingAnImageUploadsItWithTheMessage(t *testing.T) {
 func TestUsageShowsTheMonth(t *testing.T) {
 	d := newDriver(t)
 	d.keys("?", "usage", "enter")
-	d.sees("Usage", "last 30 days", "balance $8.20", "TOKENS", "72.0M", "60% cached", "WORKSPACE TIME", "41h 12m", "API COST", "DAILY SPEND", "today")
+	d.sees("Usage", "last 30 days", "credits  $8.20  left", "BARAD   workspace time, paid with your credits", "INFERENCE",
+		"CREDITS LEFT", "RUNNING TIME", "41h 12m", "CREDITS USED", "$1.84", "WORKSPACE RUNS", "61", "CREDITS USED EACH DAY", "today", "Sleeping workspaces are free.")
+	d.misses("72.0M")
+	d.keys("tab")
+	d.sees("INFERENCE   tokens, billed by your model providers", "PROCESSED TOKENS", "72.0M", "60% of input cached", "DIRECT API COST",
+		"EQUIVALENT API VALUE", "TOKENS EACH DAY", "Barad does not charge for inference")
 	d.keys("esc")
 	d.sees("NEEDS YOU")
 }
@@ -554,7 +562,7 @@ func TestDraggingSelectsAndCopiesText(t *testing.T) {
 	x1, y1 := d.at("The test runs 50 times")
 	d.send(tea.MouseClickMsg{X: x0, Y: y0, Button: tea.MouseLeft})
 	d.send(tea.MouseReleaseMsg{X: x1 + 200, Y: y1, Button: tea.MouseLeft})
-	want := "WHAT CHANGED\n\n• Cart now holds a sync.Mutex, taken by Add and Total.\n• The test runs 50 times under -race without a failure."
+	want := "WHAT CHANGED\n\n• `Cart` now holds a `sync.Mutex`, taken by `Add` and `Total`.\n• The test runs 50 times under `-race` without a failure."
 	if got := selected(d.a.grid(d.a.compose()), *d.a.span); got != want {
 		t.Fatalf("copied %q, want %q", got, want)
 	}
@@ -575,5 +583,43 @@ func TestLinksInRepliesAndMessagesAreClickable(t *testing.T) {
 	}
 	if seg := linkify("run javascript:alert(1) or file:///etc/passwd", SText); len(seg) != 1 {
 		t.Fatalf("only web addresses link: %+v", seg)
+	}
+}
+
+func TestCtrlPAndCtrlNJumpBetweenYourMessages(t *testing.T) {
+	d := newDriver(t)
+	d.f.long(6)
+	d.run(d.a.list())
+	d.openSession("long session")
+	d.screen()
+	top := func() int {
+		lines, _ := d.a.transcript()
+		return max(0, len(lines)-d.a.chatRows()-d.a.scroll)
+	}
+	_, yours := d.a.transcript()
+	if len(yours) != 6 {
+		t.Fatalf("your messages begin at rows %v", yours)
+	}
+	ctrl := func(r rune) { d.send(tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl}) }
+	start := top()
+	ctrl('p')
+	if got := top(); got >= start || !slices.Contains(yours, got) {
+		t.Fatalf("ctrl+p put row %d at the top (was %d; yours at %v)", got, start, yours)
+	}
+	ctrl('p')
+	second := top()
+	if !slices.Contains(yours, second) || d.a.scroll == 0 {
+		t.Fatalf("a second ctrl+p put row %d at the top", second)
+	}
+	d.sees(fmt.Sprintf("Step %d:", slices.Index(yours, second)))
+	ctrl('n')
+	if got := top(); got <= second {
+		t.Fatalf("ctrl+n went from %d to %d", second, got)
+	}
+	for range 6 {
+		ctrl('n')
+	}
+	if d.a.scroll != 0 {
+		t.Fatalf("past your last message ctrl+n leaves the view %d rows up", d.a.scroll)
 	}
 }
