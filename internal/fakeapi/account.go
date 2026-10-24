@@ -34,6 +34,7 @@ type account struct {
 	History   []wire.BillingEntry
 	Bought    []int64           // cents, at each checkout
 	Password  string            // the account's password, for ChangePassword
+	Activity  []string          // the sessions activity was reported for, in order
 	Flows     map[string]*flow  // provider sign-ins, by flow ID
 	Objects   map[string][]byte // what a command left, or an upload brought, by key
 	hosts     map[string]*ecdh.PrivateKey
@@ -235,7 +236,8 @@ func (f *API) serveAccount(w http.ResponseWriter, r *http.Request, parts []strin
 		route := fmt.Sprintf("route_%d", len(f.hosts))
 		f.hosts[route+"\n"+str("public_key")] = host
 		reply(201, map[string]any{"relay_url": "ws" + strings.TrimPrefix(f.Srv.URL, "http") + "/relay", "route": route, "public_key": jinn.EncodeTerminalKey(host.PublicKey())})
-	case len(parts) == 3 && parts[0] == "sessions" && parts[2] == "terminal-activity":
+	case len(parts) == 3 && parts[0] == "sessions" && parts[2] == "activity":
+		f.Activity = append(f.Activity, parts[1])
 		reply(200, map[string]string{"status": "ok"})
 	default:
 		return false

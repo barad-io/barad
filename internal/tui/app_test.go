@@ -88,6 +88,8 @@ func (d *driver) keys(keys ...string) {
 			d.send(tea.KeyPressMsg{Code: tea.KeyDown})
 		case "up":
 			d.send(tea.KeyPressMsg{Code: tea.KeyUp})
+		case "left":
+			d.send(tea.KeyPressMsg{Code: tea.KeyLeft})
 		case "ctrl+u":
 			d.send(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
 		default:

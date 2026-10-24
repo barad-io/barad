@@ -148,7 +148,7 @@ func Run(ctx context.Context, client *api.Client, sessionID string, in *os.File,
 			}
 			if time.Since(reported) > time.Minute { // typing keeps the session awake
 				reported = time.Now()
-				go func() { _ = client.TerminalActivity(ctx, sessionID) }()
+				go func() { _ = client.Activity(ctx, sessionID) }()
 			}
 		}
 	}()

@@ -355,8 +355,9 @@ func (c *Client) OpenTerminal(ctx context.Context, sessionID, publicKey string, 
 	return &out, err
 }
 
-// TerminalActivity keeps a session awake while you type in its terminal:
-// Barad cannot see the shell otherwise.
-func (c *Client) TerminalActivity(ctx context.Context, sessionID string) error {
-	return c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/terminal-activity", map[string]any{}, nil)
+// Activity keeps an awake session awake while you type, in its terminal or
+// a message to it: Barad cannot see either until it is sent. It sleeps ten
+// minutes after the last.
+func (c *Client) Activity(ctx context.Context, sessionID string) error {
+	return c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/activity", map[string]any{}, nil)
 }

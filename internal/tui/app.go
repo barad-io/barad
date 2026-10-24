@@ -76,6 +76,7 @@ type app struct {
 	signIn            *signIn                              // a provider sign-in in progress
 	awaiting          *awaitGitHub                         // GitHub, in the browser, finishing a step
 	paying            *wire.BillingAccount                 // the balance before a payment in the browser
+	activityAt        map[string]time.Time                 // when typing was last reported, by session
 	payUntil          time.Time
 	usage             *wire.UsageReport
 	workspace         *wire.WorkspaceUsage
@@ -139,7 +140,7 @@ func Run(client *api.Client, version string) error {
 
 func newApp(client *api.Client, g Graphics) *app {
 	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]wire.SessionGitRepository{}, instructions: map[string]*wire.WorkspaceInstructions{},
-		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{}, sourceRepos: map[string][]wire.GitHubRepository{}, users: map[string][]wire.ResourceDependency{},
+		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{}, sourceRepos: map[string][]wire.GitHubRepository{}, users: map[string][]wire.ResourceDependency{}, activityAt: map[string]time.Time{},
 		reported: map[string]string{}, pics: map[string]*Picture{}, picErr: map[string]string{}, picLoading: map[string]bool{}, md: map[mdKey][]Line{}}
 	a.prefs = prefs.Load()
 	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
@@ -617,7 +618,9 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.note = msg.err.Error()
 			return a, nil
 		}
+		before := a.draft()
 		a.attachImage("pasted.png", msg.data)
+		return a, a.drafting(before)
 	case latestMsg:
 		if msg.err == nil { // offline: ask again next time
 			a.setPrefs(func(p *prefs.Prefs) { p.Latest, p.LatestCheckedAt = msg.tag, a.now })
@@ -684,6 +687,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, a.scrollBy(-3)
 		}
 	case tea.PasteMsg:
+		before := a.draft()
 		switch {
 		case a.menu != nil:
 			if a.menu.edit != nil {
@@ -698,11 +702,48 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case a.screen == screenChat:
 			a.paste(msg.Content)
 		}
+		return a, a.drafting(before)
 	case tea.KeyPressMsg:
 		a.span = nil
-		return a, a.key(msg)
+		before := a.draft()
+		cmd := a.key(msg)
+		return a, tea.Batch(cmd, a.drafting(before))
 	}
 	return a, nil
+}
+
+// draft is what the open session's composer holds: its text and attachments.
+func (a *app) draft() string {
+	if a.conv == nil {
+		return ""
+	}
+	d := a.conv.id + "\x00" + a.comp.Value()
+	for _, at := range a.attach {
+		d += "\x00" + at.name
+	}
+	return d
+}
+
+// drafting reports activity when a key or a paste changed the open
+// session's draft: writing a message keeps its computer awake, as typing in
+// its terminal does and as on the web. At most once a minute; an asleep
+// computer stays asleep until the message is sent.
+func (a *app) drafting(before string) tea.Cmd {
+	c := a.conv
+	if c == nil || a.screen != screenChat || a.draft() == before || a.comp.Value() == "" && len(a.attach) == 0 {
+		return nil
+	}
+	s := c.session
+	if s.MachineStatus != wire.MachineStatusHydrated || !s.ArchivedAt.IsZero() || a.now.Sub(a.activityAt[s.SessionID]) < time.Minute {
+		return nil
+	}
+	a.activityAt[s.SessionID] = a.now
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = a.api.Activity(ctx, s.SessionID) // a missed report costs at most a nap
+		return nil
+	}
 }
 
 // synced takes a sync page in: the conversation, its session on the list,

@@ -234,3 +234,36 @@ func TestTheWorkingLineSitsAboveTheComposer(t *testing.T) {
 		t.Fatalf("%d rows between the working line and the composer's text:\n%s", gap-1, strings.Join(lines[working:composer+1], "\n"))
 	}
 }
+
+// Writing a message keeps an awake session awake: a change to the draft is
+// reported, at most once a minute, and never wakes an asleep computer.
+func TestWritingAMessageReportsActivity(t *testing.T) {
+	d := newDriver(t)
+	reported := func() []string {
+		d.f.Mu.Lock()
+		defer d.f.Mu.Unlock()
+		return slices.Clone(d.f.Activity)
+	}
+	d.openSession("checkout") // awake
+	d.keys("Look at")
+	if got := reported(); !slices.Equal(got, []string{"ses_checkout"}) {
+		t.Fatalf("reported %v", got)
+	}
+	d.keys("left", "up") // moving the cursor is not writing
+	d.a.now = d.a.now.Add(61 * time.Second)
+	d.keys("left")
+	if got := reported(); len(got) != 1 {
+		t.Fatalf("a key that changed nothing reported: %v", got)
+	}
+	d.send(tea.PasteMsg{Content: " the logs"})
+	if got := reported(); len(got) != 2 {
+		t.Fatalf("a paste after a minute was not reported: %v", got)
+	}
+
+	d.keys("esc")
+	d.openSession("search api") // asleep
+	d.keys("Why")
+	if got := reported(); len(got) != 2 {
+		t.Fatalf("typing to an asleep session reported: %v", got)
+	}
+}
