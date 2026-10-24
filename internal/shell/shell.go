@@ -17,6 +17,8 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -146,7 +148,7 @@ func Run(ctx context.Context, client *api.Client, sessionID string, in *os.File,
 			if send(jinn.FrameInput, buf[:n]) != nil {
 				return
 			}
-			if time.Since(reported) > time.Minute { // typing keeps the session awake
+			if fromPerson(buf[:n]) && time.Since(reported) > time.Minute { // typing keeps the session awake
 				reported = time.Now()
 				go func() { _ = client.Activity(ctx, sessionID) }()
 			}
@@ -232,4 +234,58 @@ func (c *Command) Run() error {
 	}
 	_, err := Run(ctx, c.Client, c.Session.SessionID, in, c.out)
 	return err
+}
+
+// fromPerson reports whether terminal input holds something a person sent:
+// a key, a paste, a click. A terminal also writes replies of its own when a
+// program asks (where the cursor is, what it is, its size, its colours),
+// says when the window gains or loses focus, and reports the pointer moving
+// over it. Those are not someone at work, and must not keep a session
+// awake: a program that asks every few seconds would keep it awake forever.
+func fromPerson(in []byte) bool {
+	for i := 0; i < len(in); i++ {
+		if in[i] != 0x1b || i+1 >= len(in) {
+			return true // a key
+		}
+		switch in[i+1] {
+		case ']', 'P', '_', '^': // a string reply (OSC, DCS, APC, PM), to BEL or ST
+			j := i + 2
+			for j < len(in) && in[j] != 0x07 && !(in[j] == 0x1b && j+1 < len(in) && in[j+1] == '\\') {
+				j++
+			}
+			if j < len(in) && in[j] == 0x1b {
+				j++
+			}
+			i = j
+		case '[':
+			j := i + 2
+			for j < len(in) && (in[j] < 0x40 || in[j] > 0x7e) {
+				j++
+			}
+			if j >= len(in) {
+				return true
+			}
+			params, final := in[i+2:j], in[j]
+			switch {
+			case strings.ContainsRune("RcntyIO", rune(final)):
+				// a reply (cursor position, attributes, status, window, mode) or focus
+			case (final == 'M' || final == 'm') && len(params) > 0 && params[0] == '<':
+				button, _, _ := strings.Cut(string(params[1:]), ";")
+				if b, err := strconv.Atoi(button); err != nil || b&32 == 0 {
+					return true // a click or the wheel; 32 marks the pointer moving
+				}
+			case final == 'M' && len(params) == 0 && j+3 < len(in): // the older mouse encoding
+				if (in[j+1]-32)&32 == 0 {
+					return true
+				}
+				j += 3
+			default:
+				return true // a key: arrows, function keys, …
+			}
+			i = j
+		default:
+			return true // Alt and a key, or SS3 keys
+		}
+	}
+	return false
 }

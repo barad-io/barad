@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -52,8 +53,24 @@ func TestAShellInASessionsComputer(t *testing.T) {
 		}
 	}
 	waitFor("you@workspace:~$ ")
+	activity := func() []string {
+		f.Mu.Lock()
+		defer f.Mu.Unlock()
+		return slices.Clone(f.Activity)
+	}
+	// The terminal answering a program is not someone at work; typing is.
+	_, _ = typing.WriteString("\x1b[12;40R")
+	time.Sleep(100 * time.Millisecond)
+	if got := activity(); len(got) != 0 {
+		t.Fatalf("a terminal's reply kept the session awake: %v", got)
+	}
 	_, _ = typing.WriteString("ls -la\r")
-	waitFor("you said ls -la")
+	waitFor("you said")
+	for deadline := time.Now().Add(5 * time.Second); len(activity()) == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("typing did not keep the session awake")
+		}
+	}
 	_, _ = typing.WriteString("exit\r")
 	select {
 	case err := <-done:
@@ -71,5 +88,37 @@ func TestAShellInASessionsComputer(t *testing.T) {
 	}
 	if err := Wake(context.Background(), client, wire.Session{SessionID: "ses_search", ArchivedAt: time.Now()}, &out); err == nil {
 		t.Fatal("an archived session woke")
+	}
+}
+
+func TestOnlyAPersonsInputIsActivity(t *testing.T) {
+	for in, want := range map[string]bool{
+		"l":                              true,
+		"ls -la\r":                       true,
+		"\x1b[A":                         true,  // up
+		"\x1b[15~":                       true,  // F5
+		"\x1bOP":                         true,  // F1
+		"\x1bb":                          true,  // Alt+b
+		"\x1b":                           true,  // Esc
+		"\x1b[<0;10;5M":                  true,  // a click
+		"\x1b[<64;10;5M":                 true,  // the wheel
+		"\x1b[M !!":                      true,  // a click, the older encoding
+		"\x1b[12;40R":                    false, // where the cursor is
+		"\x1b[?62;22c":                   false, // what the terminal is
+		"\x1b[0n":                        false, // its status
+		"\x1b[8;24;80t":                  false, // its size
+		"\x1b[?2004;2$y":                 false, // a mode
+		"\x1b[I":                         false, // focus gained
+		"\x1b[O":                         false, // focus lost
+		"\x1b]11;rgb:1111/1111/1111\x07": false, // its background colour
+		"\x1bP>|kitty(0.36)\x1b\\":       false, // its name
+		"\x1b[<35;10;5M":                 false, // the pointer moving
+		"\x1b[M@!!":                      false, // the pointer moving, the older encoding
+		"\x1b[I\x1b[12;40R":              false,
+		"\x1b[12;40Rx":                   true, // a reply, then a key
+	} {
+		if got := fromPerson([]byte(in)); got != want {
+			t.Errorf("fromPerson(%q) = %v, want %v", in, got, want)
+		}
 	}
 }
