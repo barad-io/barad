@@ -267,3 +267,26 @@ func TestWritingAMessageReportsActivity(t *testing.T) {
 		t.Fatalf("typing to an asleep session reported: %v", got)
 	}
 }
+
+// A new session takes the name typed in its sheet; left blank, the API names it.
+func TestNamingANewSession(t *testing.T) {
+	d := newDriver(t)
+	d.keys("n")
+	d.sees("NAME", "a random name, like brisk otter 482913")
+	d.keys("Fix the race", "tab")
+	d.sees("type  ·  enter  start")
+	d.keys("Checkout race")
+	d.send(tea.PasteMsg{Content: " in\nCI"}) // a pasted line break is a space
+	d.keys("enter")
+	s := d.f.List[len(d.f.List)-1]
+	if s.Created["name"] != "Checkout race in CI" || s.S.Name != "Checkout race in CI" {
+		t.Fatalf("named %v (%q)", s.Created["name"], s.S.Name)
+	}
+	d.sees("Checkout race in CI")
+
+	d.keys("esc", "n", "Profile the API", "enter")
+	s = d.f.List[len(d.f.List)-1]
+	if _, named := s.Created["name"]; named || !strings.HasPrefix(s.S.Name, "brisk otter") {
+		t.Fatalf("a blank name was sent: %v, %q", s.Created["name"], s.S.Name)
+	}
+}

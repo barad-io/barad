@@ -42,7 +42,7 @@ Signing in never asks for your password. `barad login` shows a code such as `BCD
 - **A shell** in the session's computer: Ctrl+T. barad steps aside for it (waking the computer first) and comes back when you exit.
 - **One menu** (`?`, or Ctrl+K) for everything else, in groups: what needs you now (stop the agent, approve or dismiss a proposed session, wake it, open a shell, go to the session it came from); the conversation (your messages, copy the last reply, images, steps, attach an image, a read-only share link); the session's settings under its name (rename, model, reasoning effort, fast mode, move to a project, repositories its Git credentials reach, details and agent instructions, archive, delete); and Barad's own (usage, settings).
 - **Settings**, as the web app's: this computer (theme, what Enter does, notifications, steps); provider connections (connect one with a key or a subscription sign-in in your browser, rename, sign in again or replace the key, the sessions using it, sign out, remove); source control (GitHub sign-in, connecting accounts and organizations or installing Barad on another, each source's repositories, rename, disconnect, and who commits are by); billing (buy credits in your browser, balance history); and the account (change your password, sign out).
-- **New session** (`n`) starts from your project's agent, effort and repositories; choose others, each repository at a branch, and the variables it receives.
+- **New session** (`n`) starts from your project's agent, effort and repositories; name it (left blank, it gets a name like "brisk otter 482913"), choose another agent, each repository at a branch, and the variables it receives.
 - **Variables** of a session (in its menu) or a project: add one, a secret (typed in dots and never shown again), change a value, remove one.
 - **Images**: screenshots the agent took and images you attached. Attach one by dropping the file on the terminal or with Ctrl+V. Text pasted past 64 KB goes as a text attachment.
 - **Usage**: workspace time and credits, by day and by session, with the balance's activity; and inference: tokens and their cost by day, provider and model. **←** and **→** choose 7, 30 or 90 days.
@@ -60,7 +60,7 @@ Everything the app does is also a command, for scripts and quick changes: `barad
 barad sessions --unread                                  # NAME  STATE  PROJECT  MODEL  ACTIVE  ID
 barad sessions read --all                                # mark every reply read (the app shares what you have read)
 barad sessions log stripe --last                         # the agent's last reply, as it wrote it
-barad sessions new "Upgrade stripe-go to v86" --project payments --repo acme/web@release --wait
+barad sessions new "Upgrade stripe-go to v86" --name stripe --project payments --repo acme/web@release --wait
 git diff | barad send stripe "Review this" --wait        # piped input goes along; --wait prints the reply
 barad send stripe "What does this show?" --file shot.png
 barad sessions proposal docs --approve                   # start the session an agent proposes

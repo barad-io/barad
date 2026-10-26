@@ -128,6 +128,7 @@ func (c *Client) UpdateSettings(ctx context.Context, sessionID string, in Settin
 
 // NewSession is what a session starts with.
 type NewSession struct {
+	Name               string                     `json:"name,omitempty"` // blank: the API names it, as "brisk otter 482913"
 	ProviderResourceID string                     `json:"provider_resource_id"`
 	Model              string                     `json:"model,omitempty"`
 	ReasoningEffort    wire.ReasoningEffort       `json:"reasoning_effort,omitempty"`

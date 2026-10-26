@@ -695,6 +695,8 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				a.menu.q.Insert(msg.Content)
 			}
+		case a.start != nil && a.start.field == fieldName:
+			a.start.name.Insert(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(msg.Content)) // a name is one line
 		case a.start != nil:
 			a.start.task.Insert(msg.Content)
 		case a.filter != nil:

@@ -292,10 +292,10 @@ func TestMenuRenamesChangesModelAndArchives(t *testing.T) {
 func TestNewSessionStartsWithTheProjectsDefaults(t *testing.T) {
 	d := newDriver(t)
 	d.keys("n")
-	d.sees("New session", "AGENT", "claude-opus-5", "Claude Max", "EFFORT", "high", "REPOSITORIES", "acme/web", "ENVIRONMENT", "none", "PROJECT", "Acme")
+	d.sees("New session", "NAME", "AGENT", "claude-opus-5", "Claude Max", "EFFORT", "high", "REPOSITORIES", "acme/web", "ENVIRONMENT", "none", "PROJECT", "Acme")
 
 	// Repositories: add acme/infra, and clone acme/web at a branch.
-	d.keys("tab", "tab", "tab", "enter")
+	d.keys("tab", "tab", "tab", "tab", "enter")
 	d.sees("Cloned once, when the workspace is made", "✓ acme/web", "main (default)", "acme/infra")
 	d.keys("infra", "enter")
 	d.sees("✓ acme/infra")

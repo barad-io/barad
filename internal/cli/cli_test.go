@@ -164,6 +164,15 @@ func TestStartingWorkingWithAndEndingSessions(t *testing.T) {
 	}
 	b.fails("has no agent", "sessions", "new", "--project", "ops")
 
+	// A name, or a random one.
+	contains(t, b.ok("sessions", "new", "--project", "acme", "--name", "  Billing spike  "), "Started Billing spike")
+	if s := b.f.List[len(b.f.List)-1]; s.Created["name"] != "Billing spike" {
+		t.Fatalf("named %v", s.Created["name"])
+	}
+	if out := b.ok("sessions", "new", "--project", "acme"); !strings.Contains(out, "Started brisk otter") {
+		t.Fatalf("a blank name: %s", out)
+	}
+
 	contains(t, b.ok("sessions"), "NAME", "Fix the flaky checkout test", "idle", "Acme", "Move the billing cron to the queue", "working")
 	contains(t, b.ok("send", "checkout", "Add", "a", "regression", "test"), "Sent to Fix the flaky checkout test")
 	b.ok("sessions", "edit", "payments", "--fast", "on", "--name", "SDK upgrade", "--project", "ops")

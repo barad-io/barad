@@ -133,9 +133,10 @@ var sessionsShow = command{
 }
 
 var sessionsNew = command{
-	usage: "sessions new [TASK] [--wait] [--project P] [--provider P [--model M] [--effort E]] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
+	usage: "sessions new [TASK] [--name N] [--wait] [--project P] [--provider P [--model M] [--effort E]] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
 	about: "start a session (from its project's agent and repositories unless you name others), and send it TASK",
 	flags: func(fs *flag.FlagSet, c *call) {
+		strFlag(fs, c, "name", "its name (default: a random one, like brisk otter 482913)")
 		strFlag(fs, c, "project", "the project it joins (default: Default)")
 		agentFlags(fs, c)
 		listFlag(fs, c, "repo", "a repository it clones, at a branch if you name one (repeat for more)")
@@ -149,7 +150,7 @@ var sessionsNew = command{
 		if err != nil {
 			return err
 		}
-		in := api.NewSession{ProjectID: project.ProjectID}
+		in := api.NewSession{Name: strings.TrimSpace(c.str("name")), ProjectID: project.ProjectID}
 		agent := project.Agent
 		switch {
 		case c.str("provider") != "":

@@ -435,7 +435,11 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 	case path == "/sessions" && r.Method == http.MethodPost:
 		id := fmt.Sprintf("ses_new%d", len(f.List))
 		provider := strings.TrimPrefix(fmt.Sprint(body["provider_resource_id"]), "prov_")
-		fs := &Session{S: wire.Session{SessionID: id, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: fmt.Sprint(body["model"]),
+		name, _ := body["name"].(string)
+		if name == "" {
+			name = "brisk otter " + strings.TrimPrefix(id, "ses_new") // as the API names it
+		}
+		fs := &Session{S: wire.Session{SessionID: id, Name: name, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: fmt.Sprint(body["model"]),
 			ReasoningEffort: wire.ReasoningEffort(fmt.Sprint(body["reasoning_effort"])), MachineStatus: wire.MachineStatusHydrating, ContextWindowTokens: 200_000,
 			ProjectID: fmt.Sprint(body["project_id"]), CreatedAt: time.Now(), UpdatedAt: time.Now()}, Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}}
 		repos, _ := body["repositories"].([]any)

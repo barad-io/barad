@@ -376,7 +376,8 @@ func (a *app) menuView() string {
 // project's defaults, as the web form does.
 type starter struct {
 	task     Editor
-	field    int // the focused row: 0 the task, then agent, effort, repositories, environment, project
+	name     Editor // blank: the API names it
+	field    int    // the focused row: the task, then name, agent, effort, repositories, environment, project
 	provider string
 	model    string
 	effort   wire.ReasoningEffort
@@ -388,6 +389,7 @@ type starter struct {
 
 const (
 	fieldTask = iota
+	fieldName
 	fieldAgent
 	fieldEffort
 	fieldRepo
@@ -482,7 +484,7 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
-	rows := []int{fieldTask, fieldAgent, fieldEffort, fieldRepo, fieldEnv, fieldProject}
+	rows := []int{fieldTask, fieldName, fieldAgent, fieldEffort, fieldRepo, fieldEnv, fieldProject}
 	if len(a.efforts(st.provider, st.model, nil)) == 0 {
 		rows = slices.DeleteFunc(rows, func(r int) bool { return r == fieldEffort })
 	}
@@ -503,7 +505,7 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	case "enter":
 		switch st.field {
-		case fieldTask:
+		case fieldTask, fieldName:
 			return a.begin()
 		case fieldAgent:
 			mn := a.agentMenu(st.provider, st.model, func(a *app, provider, model string) tea.Cmd {
@@ -539,8 +541,13 @@ func (a *app) startKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
-	if st.field == fieldTask {
+	switch st.field {
+	case fieldTask:
 		st.task.Key(k, a.taskWidth())
+	case fieldName: // one line: a name has no line breaks
+		if ks := k.String(); ks != "shift+enter" && ks != "alt+enter" && ks != "ctrl+j" {
+			st.name.Key(k, 0)
+		}
 	}
 	return nil
 }
@@ -558,7 +565,7 @@ func (a *app) begin() tea.Cmd {
 		return nil
 	}
 	st.busy = true
-	in := api.NewSession{ProviderResourceID: st.provider, Model: st.model, ReasoningEffort: st.effort, ProjectID: st.project, Repositories: st.repos, Environment: st.env}
+	in := api.NewSession{Name: strings.TrimSpace(st.name.Value()), ProviderResourceID: st.provider, Model: st.model, ReasoningEffort: st.effort, ProjectID: st.project, Repositories: st.repos, Environment: st.env}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -620,11 +627,13 @@ func (a *app) startView() string {
 		}
 		env = Line{S(ansi.Truncate(strings.Join(names, ", "), inner-30, "…"), SText)}
 	}
+	name := st.name.Lines(inner-30, 1, SText, "a random name, like brisk otter 482913", st.field == fieldName && a.menu == nil)[0]
 	rows := []struct {
 		field int
 		k     string
 		v     Line
 	}{
+		{fieldName, "NAME", name},
 		{fieldAgent, "AGENT", agent},
 		{fieldEffort, "EFFORT", Line{S(effortLabel(st.effort), SText)}},
 		{fieldRepo, "REPOSITORIES", repo},
@@ -637,7 +646,11 @@ func (a *app) startView() string {
 		}
 		l := append(Line{gap(1), S(PadRight(r.k, 14), SFaint.Bold(true))}, r.v...)
 		if st.field == r.field {
-			l = spread(l, Line{S("enter  change", SMuted), gap(1)}, inner)
+			hint := "enter  change"
+			if r.field == fieldName {
+				hint = "type  ·  enter  start"
+			}
+			l = spread(l, Line{S(hint, SMuted), gap(1)}, inner)
 			l = on(l, Muted)
 			l[0] = S("▍", Fg(Accent).Background(Muted))
 		}
