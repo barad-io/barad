@@ -529,14 +529,37 @@ func (a *app) sessionBar(screen ...string) []string {
 		wire.MachineStatusHydrated: "awake", wire.MachineStatusHydrating: "waking", wire.MachineStatusDehydrating: "falling asleep",
 		wire.MachineStatusDehydrated: "asleep", wire.MachineStatusBroken: "broken",
 	}[s.MachineStatus]
+	// As the web app's machine strip: the computer's state, when an idle one sleeps, and
+	// what it costs an hour once the balance has been read.
+	var cost string
+	counting := false // an idle awake machine's countdown says when it was last active
+	if a.balance != nil {
+		cost = money(a.balance.WorkspaceRateUSDNanosPerHour) + "/hour"
+	}
 	switch machine {
 	case "awake":
 		detail = append(detail, gap(5), S("● ", Fg(groundOk)), S("awake", Fg(groundSec)))
+		if left := s.DehydrateAfter.Sub(a.now); s.CurrentTurnID == "" && s.ActiveCommandCount == 0 && !s.PendingTurn && !s.DehydrateAfter.IsZero() {
+			note := "sleeps soon"
+			if left > 0 {
+				note = fmt.Sprintf("sleeps in %dm", int(math.Ceil(left.Minutes())))
+			}
+			detail = append(detail, S("  ·  "+note, quiet))
+			counting = true
+		}
+		if cost != "" {
+			detail = append(detail, S("  ·  "+cost, quiet))
+		}
+	case "asleep":
+		detail = append(detail, gap(5), S("○ asleep  ·  files kept", quiet))
+		if cost != "" {
+			detail = append(detail, S("  ·  "+money(0)+"/hour", quiet))
+		}
 	case "":
 	default:
 		detail = append(detail, gap(5), S("○ "+machine, quiet))
 	}
-	if last := a.lastActive(); !last.IsZero() {
+	if last := a.lastActive(); !last.IsZero() && !counting {
 		when := ago(last, a.now) + " ago"
 		if when == "now ago" {
 			when = "just now"

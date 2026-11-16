@@ -71,14 +71,18 @@ type TokenUsage struct {
 }
 
 type Session struct {
-	SessionID                 string            `json:"session_id"`
-	Name                      string            `json:"name,omitempty"`
-	ProviderResourceID        string            `json:"provider_resource_id"`
-	Provider                  Provider          `json:"provider"`
-	Model                     string            `json:"model"`
-	ReasoningEffort           ReasoningEffort   `json:"reasoning_effort,omitempty"`
-	FastMode                  bool              `json:"fast_mode"`
-	MachineStatus             MachineStatus     `json:"machine_status"`
+	SessionID          string          `json:"session_id"`
+	Name               string          `json:"name,omitempty"`
+	ProviderResourceID string          `json:"provider_resource_id"`
+	Provider           Provider        `json:"provider"`
+	Model              string          `json:"model"`
+	ReasoningEffort    ReasoningEffort `json:"reasoning_effort,omitempty"`
+	FastMode           bool            `json:"fast_mode"`
+	MachineStatus      MachineStatus   `json:"machine_status"`
+	// When an idle awake computer sleeps: ten minutes after its last activity. A turn or a
+	// running command keeps it awake.
+	DehydrateAfter            time.Time         `json:"dehydrate_after,omitzero"`
+	ActiveCommandCount        int               `json:"active_command_count,omitempty"`
 	PendingTurn               bool              `json:"pending_turn,omitempty"`
 	CurrentTurnID             string            `json:"current_turn_id,omitempty"`
 	LatestTerminalTurnID      string            `json:"latest_terminal_turn_id,omitempty"`

@@ -121,6 +121,7 @@ func (f *API) seed() {
 	sdk.S.LatestProviderUsage = wire.TokenUsage{ContextTokens: 171_000}
 
 	guide := base("ses_guide", "Write the onboarding guide", "claude", "claude-sonnet-5", "medium", wire.MachineStatusHydrated, ago(26*time.Hour))
+	guide.S.DehydrateAfter = Start.Add(6*time.Minute + 30*time.Second) // someone was just at its shell
 	guide.User("Draft docs/onboarding.md from what new people ask in #help.", ago(25*time.Hour), nil)
 	t = guide.Turn("turn_g1", ago(25*time.Hour))
 	guide.Reply(t, "I drafted **docs/onboarding.md**. The deploy section is long enough to be its own guide, so I am proposing a separate session for it.", ago(25*time.Hour))

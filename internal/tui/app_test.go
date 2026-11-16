@@ -168,7 +168,7 @@ func TestHomeListsSessionsByWhatTheyNeed(t *testing.T) {
 func TestConversationShowsWorkFoldedThenUnfolded(t *testing.T) {
 	d := newDriver(t)
 	d.openSession("checkout")
-	d.sees("ACME", "Fix the flaky checkout test", "✻ claude-opus-5", "high", "repo  acme/web", "context", "31%", "awake",
+	d.sees("ACME", "Fix the flaky checkout test", "✻ claude-opus-5", "high", "repo  acme/web", "context", "31%", "awake", "$0.20/hour",
 		"you", "The checkout test fails about one run in five", "claude", "worked for", "5 steps",
 		"The test was flaky because `Cart.Add` updated `total`", "WHAT CHANGED", "func (c *Cart) Add(it Item) {")
 	d.misses("go test ./checkout/ -race -count=20")
@@ -517,6 +517,19 @@ func TestEditorRowsWrapLongLinesAndKeepEveryRune(t *testing.T) {
 	if e.Pos != 15 {
 		t.Fatalf("down to the empty line went to %d", e.Pos)
 	}
+}
+
+// As the web app's machine strip, the header says when an idle awake computer sleeps (in place of
+// when it was last active, which the countdown implies), what an awake one costs, and that an asleep
+// one keeps its files for nothing.
+func TestTheHeaderSaysWhatTheComputerIsDoingAndCosts(t *testing.T) {
+	d := newDriver(t)
+	d.openSession("onboarding guide")
+	d.sees("● awake  ·  sleeps in 7m  ·  $0.20/hour")
+	d.misses("last active")
+	d.keys("esc")
+	d.openSession("search api")
+	d.sees("○ asleep  ·  files kept  ·  $0.00/hour", "last active")
 }
 
 func TestTurnsSayWhenTheyEndedAndHowLongTheyTook(t *testing.T) {

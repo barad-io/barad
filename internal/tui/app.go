@@ -275,7 +275,7 @@ type (
 )
 
 func (a *app) Init() tea.Cmd {
-	return tea.Batch(tick(), a.list(), a.loadAccount(), a.checkLatest(), tea.Raw(ansi.ClearProgramStatusID("barad")))
+	return tea.Batch(tick(), a.list(), a.loadAccount(), a.loadBilling(), a.checkLatest(), tea.Raw(ansi.ClearProgramStatusID("barad")))
 }
 
 // checkLatest looks up the newest release, at most once a day, for a
