@@ -3,13 +3,12 @@ package fakeapi
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 	"sort"
@@ -37,7 +36,7 @@ type account struct {
 	Activity  []string          // the sessions activity was reported for, in order
 	Flows     map[string]*flow  // provider sign-ins, by flow ID
 	Objects   map[string][]byte // what a command left, or an upload brought, by key
-	hosts     map[string]*ecdh.PrivateKey
+	tickets   map[string]bool   // unused terminal tickets
 }
 
 type flow struct {
@@ -65,7 +64,7 @@ func (f *API) seedAccount() {
 		{OperationID: "op_1", Kind: "account_initialized", AmountUSDNanos: 0, EffectiveAt: Start.Add(-30 * 24 * time.Hour)},
 	}
 	f.Password = "correct horse"
-	f.Flows, f.Objects, f.hosts = map[string]*flow{}, map[string][]byte{}, map[string]*ecdh.PrivateKey{}
+	f.Flows, f.Objects, f.tickets = map[string]*flow{}, map[string][]byte{}, map[string]bool{}
 }
 
 func (f *API) provider(id string) *wire.ProviderView {
@@ -232,10 +231,10 @@ func (f *API) serveAccount(w http.ResponseWriter, r *http.Request, parts []strin
 			fail(409, "terminal_unavailable", "terminal access requires an already hydrated session")
 			return true
 		}
-		host, _ := ecdh.P256().GenerateKey(rand.Reader)
-		route := fmt.Sprintf("route_%d", len(f.hosts))
-		f.hosts[route+"\n"+str("public_key")] = host
-		reply(201, map[string]any{"relay_url": "ws" + strings.TrimPrefix(f.Srv.URL, "http") + "/relay", "route": route, "public_key": jinn.EncodeTerminalKey(host.PublicKey())})
+		ticket := fmt.Sprintf("tkt_%d", len(f.tickets))
+		f.tickets[ticket] = true
+		q := url.Values{"ticket": {ticket}, "rows": {fmt.Sprint(body["rows"])}, "cols": {fmt.Sprint(body["cols"])}}
+		reply(201, map[string]any{"url": "ws" + strings.TrimPrefix(f.Srv.URL, "http") + "/relay?" + q.Encode()})
 	case len(parts) == 3 && parts[0] == "sessions" && parts[2] == "activity":
 		f.Activity = append(f.Activity, parts[1])
 		reply(200, map[string]string{"status": "ok"})
@@ -373,34 +372,27 @@ func (f *API) objects(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// relay is the terminal relay and the run's host in one: a shell that
+// relay is Jinn's relay and the run's shell in one: it redeems a ticket once, and the shell
 // says where it is, echoes each line, and exits on "exit".
 func (f *API) relay(w http.ResponseWriter, r *http.Request) {
-	route := r.URL.Query().Get("route")
+	ticket := r.URL.Query().Get("ticket")
+	f.Mu.Lock()
+	ok := f.tickets[ticket]
+	delete(f.tickets, ticket)
+	f.Mu.Unlock()
+	if !ok {
+		http.Error(w, "invalid or used ticket", http.StatusUnauthorized)
+		return
+	}
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.CloseNow()
-	f.Mu.Lock()
-	var host *ecdh.PrivateKey
-	var caller string
-	for k, v := range f.hosts {
-		if r, key, _ := strings.Cut(k, "\n"); r == route {
-			host, caller = v, key
-		}
-	}
-	f.Mu.Unlock()
-	peer, err := jinn.DecodeTerminalKey(caller)
-	if host == nil || err != nil {
-		return
-	}
-	ch, err := jinn.NewTerminalChannel(host, peer, false)
-	if err != nil {
-		return
-	}
 	ctx := r.Context()
-	send := func(kind byte, data []byte) { _ = conn.Write(ctx, websocket.MessageBinary, ch.Seal(kind, data)) }
+	send := func(kind byte, data []byte) {
+		_ = conn.Write(ctx, websocket.MessageBinary, jinn.EncodeTerminalFrame(kind, data))
+	}
 	send(jinn.FrameOutput, []byte("you@workspace:~$ "))
 	var line []byte
 	for {
@@ -408,7 +400,7 @@ func (f *API) relay(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		kind, data, err := ch.Open(frame)
+		kind, data, err := jinn.DecodeTerminalFrame(frame)
 		if err != nil {
 			return
 		}

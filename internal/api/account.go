@@ -338,20 +338,17 @@ func (c *Client) Download(ctx context.Context, rawURL string, w io.Writer) error
 	return err
 }
 
-// TerminalTicket is where a session's terminal waits: the relay to connect
-// to, the route that pairs you with the session's computer, and its half of
-// the key exchange.
+// TerminalTicket is where a session's terminal waits: the address of Jinn's relay, with a
+// single-use ticket for the session's computer and the window's size.
 type TerminalTicket struct {
-	RelayURL  string `json:"relay_url"`
-	Route     string `json:"route"`
-	PublicKey string `json:"public_key"`
+	URL string `json:"url"`
 }
 
-// OpenTerminal starts a login shell in an awake session's computer, for a
-// caller with publicKey (ECDH P-256, base64url) and a window of rows×cols.
-func (c *Client) OpenTerminal(ctx context.Context, sessionID, publicKey string, rows, cols int) (*TerminalTicket, error) {
+// OpenTerminal asks for a login shell in an awake session's computer, for a window of
+// rows×cols. Connect to its URL within a minute: the ticket expires, and opens one shell.
+func (c *Client) OpenTerminal(ctx context.Context, sessionID string, rows, cols int) (*TerminalTicket, error) {
 	var out TerminalTicket
-	err := c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/terminal", map[string]any{"public_key": publicKey, "rows": rows, "cols": cols}, &out)
+	err := c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/terminal", map[string]any{"rows": rows, "cols": cols}, &out)
 	return &out, err
 }
 

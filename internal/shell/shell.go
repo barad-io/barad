@@ -1,20 +1,17 @@
 // Package shell is a login shell in a session's computer, in this terminal:
-// what the web app's Terminal tab is, without the browser. barad makes an
-// ECDH P-256 key pair and asks the API for a terminal; the API starts the
-// shell and returns Jinn's relay, a route and the computer's half of the key.
-// Both ends derive the channel's keys (usejinn.com/go), so Barad and the
-// relay carry only ciphertext.
+// what the web app's Terminal tab is, without the browser. barad asks the API
+// for a terminal; the API returns the address of Jinn's relay with a
+// single-use ticket, and the relay reaches the computer's shell over SSH. A
+// frame is one binary WebSocket message, its kind and then its data
+// (usejinn.com/go). TLS protects the connection; the relay sees the bytes.
 package shell
 
 import (
 	"context"
-	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -30,6 +27,9 @@ import (
 	"github.com/barad-io/barad/internal/api"
 	"github.com/barad-io/barad/wire"
 )
+
+// maxFrameData bounds one frame's data: Jinn's relay reads messages of up to 64 KiB.
+const maxFrameData = 32 << 10
 
 // Wake wakes an asleep session and waits until its computer is ready, saying
 // so on out. A session already awake returns at once.
@@ -80,24 +80,12 @@ func Run(ctx context.Context, client *api.Client, sessionID string, in *os.File,
 	if err != nil {
 		cols, rows = 80, 24
 	}
-	private, err := ecdh.P256().GenerateKey(rand.Reader)
-	if err != nil {
-		return 0, err
-	}
-	ticket, err := client.OpenTerminal(ctx, sessionID, jinn.EncodeTerminalKey(private.PublicKey()), rows, cols)
-	if err != nil {
-		return 0, err
-	}
-	peer, err := jinn.DecodeTerminalKey(ticket.PublicKey)
-	if err != nil {
-		return 0, err
-	}
-	ch, err := jinn.NewTerminalChannel(private, peer, true)
+	ticket, err := client.OpenTerminal(ctx, sessionID, rows, cols)
 	if err != nil {
 		return 0, err
 	}
 	dial, cancelDial := context.WithTimeout(ctx, 10*time.Second)
-	conn, _, err := websocket.Dial(dial, ticket.RelayURL+"?route="+url.QueryEscape(ticket.Route)+"&side=caller", nil)
+	conn, _, err := websocket.Dial(dial, ticket.URL, nil)
 	cancelDial()
 	if err != nil {
 		return 0, fmt.Errorf("could not reach the terminal relay: %w", err)
@@ -115,14 +103,14 @@ func Run(ctx context.Context, client *api.Client, sessionID string, in *os.File,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// One writer at a time: a frame's sequence is its place in the stream.
+	// One writer at a time, so a long paste's pieces stay in order.
 	var mu sync.Mutex
 	send := func(kind byte, data []byte) error {
 		mu.Lock()
 		defer mu.Unlock()
 		for first := true; first || len(data) > 0; first = false { // a long paste goes in pieces
-			n := min(len(data), jinn.MaxTerminalData)
-			if err := conn.Write(ctx, websocket.MessageBinary, ch.Seal(kind, data[:n])); err != nil {
+			n := min(len(data), maxFrameData)
+			if err := conn.Write(ctx, websocket.MessageBinary, jinn.EncodeTerminalFrame(kind, data[:n])); err != nil {
 				return err
 			}
 			data = data[n:]
@@ -182,7 +170,7 @@ func Run(ctx context.Context, client *api.Client, sessionID string, in *os.File,
 		if err != nil {
 			return 0, errors.New("the terminal disconnected")
 		}
-		kind, data, err := ch.Open(frame)
+		kind, data, err := jinn.DecodeTerminalFrame(frame)
 		if err != nil {
 			return 0, err
 		}

@@ -14,7 +14,7 @@ require (
 	github.com/yuin/goldmark v1.8.6
 	golang.org/x/image v0.47.0
 	golang.org/x/term v0.47.0
-	usejinn.com/go v0.5.2
+	usejinn.com/go v0.6.0
 )
 
 require (
