@@ -93,8 +93,17 @@ var Start = time.Now()
 func (f *API) seed() {
 	ago := func(d time.Duration) time.Time { return Start.Add(-d) }
 	base := func(id, name, provider, mdl string, effort wire.ReasoningEffort, machine wire.MachineStatus, created time.Time) *Session {
-		return &Session{S: wire.Session{SessionID: id, Name: name, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: mdl,
-			ReasoningEffort: effort, SupportsReasoningEffort: effort != "", SupportedReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"},
+		agentID := provider
+		switch provider {
+		case "openai":
+			agentID = "codex"
+		case "xai":
+			agentID = "grok"
+		}
+		authed := true
+		return &Session{S: wire.Session{SessionID: id, Name: name, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider),
+			Agent: agentID, RuntimeVersion: wire.RuntimeVersionV2, Size: "l", AgentAuthenticated: &authed, AgentAuthMethod: "cli_login",
+			Model: mdl, ReasoningEffort: effort, SupportsReasoningEffort: effort != "", SupportedReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"},
 			MachineStatus: machine, ContextWindowTokens: 200_000, AutoCompactTokenLimit: 160_000, ProjectID: "proj_acme", CreatedAt: created, UpdatedAt: created},
 			Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}, Repos: []string{"acme/web"},
 			Files: map[string][]byte{"web/README.md": []byte("# Web\n\nThe storefront.\n"), "web/checkout/cart.go": []byte("package checkout\n"), "notes.txt": []byte("remember the milk\n")}}
@@ -153,7 +162,7 @@ func (f *API) seed() {
 
 	f.List = []*Session{checkout, sdk, guide, search, cron, other}
 	f.Projects = []wire.Project{
-		{ProjectID: "proj_acme", Name: "Acme", Agent: &wire.ProjectAgent{ProviderResourceID: "prov_claude", Model: "claude-opus-5", ReasoningEffort: "high"},
+		{ProjectID: "proj_acme", Name: "Acme", Agent: &wire.ProjectAgent{Agent: "claude", ProviderResourceID: "prov_claude", Model: "claude-opus-5", ReasoningEffort: "high", Size: "l"},
 			Repositories: []wire.ProjectRepository{{SourceID: "src_1", Repository: "acme/web"}}},
 		{ProjectID: "proj_ops", Name: "Ops"},
 	}
@@ -423,6 +432,45 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case path == "/agents" && r.Method == http.MethodGet:
+		reply(200, wire.AgentsResponse{
+			Agents: []wire.AgentSpec{
+				{
+					ID: "claude", Label: "Claude Code", Binary: "claude", APIKeyEnv: "ANTHROPIC_API_KEY", LoginCommand: "claude auth login", DefaultModel: "claude-opus-5",
+					Models: []wire.AgentModelSpec{
+						{ID: "default", Label: "CLI Default", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high", "max"}, DefaultEffort: "high"},
+						{ID: "claude-opus-5", Label: "Claude Opus 5", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high", "max"}, DefaultEffort: "high"},
+						{ID: "claude-sonnet-5", Label: "Claude Sonnet 5", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultEffort: "medium"},
+					},
+				},
+				{
+					ID: "codex", Label: "Codex", Binary: "codex", APIKeyEnv: "OPENAI_API_KEY", LoginCommand: "codex login --device-auth", DefaultModel: "gpt-5.5",
+					Models: []wire.AgentModelSpec{
+						{ID: "default", Label: "CLI Default", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high", "xhigh"}, DefaultEffort: "medium"},
+						{ID: "gpt-5.5", Label: "GPT-5.5", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high", "xhigh"}, DefaultEffort: "medium"},
+					},
+				},
+				{
+					ID: "grok", Label: "Grok", Binary: "grok", APIKeyEnv: "XAI_API_KEY", LoginCommand: "grok login --device-code", DefaultModel: "grok-4",
+					Models: []wire.AgentModelSpec{
+						{ID: "default", Label: "CLI Default"},
+						{ID: "grok-4", Label: "Grok 4"},
+					},
+				},
+				{
+					ID: "agy", Label: "Antigravity", Binary: "agy", APIKeyEnv: "GEMINI_API_KEY", LoginCommand: "agy acp --login", DefaultModel: "default",
+					Models: []wire.AgentModelSpec{
+						{ID: "default", Label: "CLI Default", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultEffort: "high"},
+					},
+				},
+			},
+			Sizes: []wire.MachineSize{
+				{ID: "s", Label: "Small (1 vCPU, 1 GiB)"},
+				{ID: "m", Label: "Medium (2 vCPU, 2 GiB)"},
+				{ID: "l", Label: "Large (4 vCPU, 4 GiB)", Default: true},
+				{ID: "xl", Label: "Extra Large (8 vCPU, 8 GiB)"},
+			},
+		})
 	case path == "/account/initialize":
 		reply(200, map[string]any{})
 	case path == "/account/update-ticket":
@@ -435,14 +483,41 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		reply(200, map[string]any{"sessions": out})
 	case path == "/sessions" && r.Method == http.MethodPost:
 		id := fmt.Sprintf("ses_new%d", len(f.List))
-		provider := strings.TrimPrefix(fmt.Sprint(body["provider_resource_id"]), "prov_")
+		agentID, _ := body["agent"].(string)
+		provider := agentID
+		if provider == "" {
+			provider = strings.TrimPrefix(fmt.Sprint(body["provider_resource_id"]), "prov_")
+			agentID = provider
+		}
+		switch agentID {
+		case "codex":
+			provider = "codex"
+		case "grok":
+			provider = "grok"
+		case "agy":
+			provider = "antigravity"
+		}
 		name, _ := body["name"].(string)
 		if name == "" {
-			name = "brisk otter " + strings.TrimPrefix(id, "ses_new") // as the API names it
+			name = "brisk otter " + strings.TrimPrefix(id, "ses_new")
 		}
-		fs := &Session{S: wire.Session{SessionID: id, Name: name, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: fmt.Sprint(body["model"]),
-			ReasoningEffort: wire.ReasoningEffort(fmt.Sprint(body["reasoning_effort"])), MachineStatus: wire.MachineStatusHydrating, ContextWindowTokens: 200_000,
-			ProjectID: fmt.Sprint(body["project_id"]), CreatedAt: time.Now(), UpdatedAt: time.Now()}, Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}}
+		size, _ := body["size"].(string)
+		if size == "" {
+			size = "l"
+		}
+		mdl, _ := body["model"].(string)
+		eff, _ := body["reasoning_effort"].(string)
+		projID, _ := body["project_id"].(string)
+		if projID == "" {
+			projID = wire.DefaultProjectID
+		}
+		authed := true
+		fs := &Session{S: wire.Session{SessionID: id, Name: name, Agent: agentID, RuntimeVersion: wire.RuntimeVersionV2, Size: size,
+			AgentAuthenticated: &authed, ProviderResourceID: "prov_" + provider, Provider: wire.Provider(provider), Model: mdl,
+			ReasoningEffort: wire.ReasoningEffort(eff), FastMode: body["fast_mode"] == true,
+			SupportsReasoningEffort: eff != "", SupportedReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"},
+			MachineStatus: wire.MachineStatusHydrating, ContextWindowTokens: 200_000,
+			ProjectID: projID, CreatedAt: time.Now(), UpdatedAt: time.Now()}, Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}}
 		repos, _ := body["repositories"].([]any)
 		for _, r := range repos {
 			fs.Repos = append(fs.Repos, fmt.Sprint(r.(map[string]any)["repository"]))
@@ -513,15 +588,6 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		reply(200, out)
 	case len(parts) == 4 && parts[1] == "git-sources" && parts[3] == "branches":
 		reply(200, wire.GitBranches{DefaultBranch: "main", Branches: []string{"main", "release", "spike/queue"}})
-	case len(parts) == 4 && parts[0] == "account" && parts[1] == "providers" && parts[3] == "models":
-		models := []wire.ModelCapabilities{{Model: "claude-opus-5", SupportsReasoningEffort: true, ReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultReasoningEffort: "high"},
-			{Model: "claude-sonnet-5", SupportsReasoningEffort: true, ReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high"}, DefaultReasoningEffort: "medium"}}
-		def := "claude-opus-5"
-		if parts[2] != "prov_claude" {
-			models = []wire.ModelCapabilities{{Model: "gpt-5.5", SupportsReasoningEffort: true, ReasoningEfforts: []wire.ReasoningEffort{"low", "medium", "high", "xhigh"}, DefaultReasoningEffort: "medium"}}
-			def = "gpt-5.5"
-		}
-		reply(200, api.Models{Models: models, DefaultModel: def})
 	case len(parts) == 4 && parts[1] == "git-sources":
 		reply(200, map[string]any{"repositories": []map[string]any{{"full_name": "acme/web", "default_branch": "main"}, {"full_name": "acme/api", "default_branch": "main"}, {"full_name": "acme/infra", "default_branch": "trunk"}}})
 	case path == "/account/usage":
@@ -545,12 +611,43 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case len(parts) == 2 && r.Method == http.MethodPatch:
-			fs.S.Name = fmt.Sprint(body["name"])
-			fs.S.Model = fmt.Sprint(body["model"])
-			fs.S.ReasoningEffort = wire.ReasoningEffort(fmt.Sprint(body["reasoning_effort"]))
+			if mdl, _ := body["model"].(string); mdl != "" && mdl != fs.S.Model && fs.S.CurrentTurnID != "" {
+				fail(409, "invalid_state", "cannot change model while a turn is active")
+				return
+			}
+			if name, ok := body["name"].(string); ok {
+				fs.S.Name = name
+			}
+			if mdl, ok := body["model"].(string); ok && mdl != "" {
+				fs.S.Model = mdl
+			}
+			if eff, ok := body["reasoning_effort"].(string); ok {
+				fs.S.ReasoningEffort = wire.ReasoningEffort(eff)
+			}
 			fs.S.FastMode = body["fast_mode"] == true
 			fs.S.UpdatedAt = time.Now()
 			reply(200, fs.S)
+		case len(parts) == 3 && parts[2] == "continue" && r.Method == http.MethodPost:
+			newID := fmt.Sprintf("ses_cont%d", len(f.List))
+			name, _ := body["name"].(string)
+			if name == "" {
+				name = fs.S.Name + " (continued)"
+			}
+			agentID, _ := body["agent"].(string)
+			if agentID == "" {
+				agentID = fs.S.HarnessID()
+			}
+			mdl, _ := body["model"].(string)
+			if mdl == "" {
+				mdl = fs.S.Model
+			}
+			authed := true
+			ns := &Session{S: wire.Session{SessionID: newID, Name: name, Agent: agentID, RuntimeVersion: wire.RuntimeVersionV2, Size: "l",
+				AgentAuthenticated: &authed, Provider: wire.Provider(agentID), Model: mdl, LegacySourceID: fs.S.SessionID,
+				MachineStatus: wire.MachineStatusDehydrated, ContextWindowTokens: 200_000, ProjectID: fs.S.ProjectID,
+				CreatedAt: time.Now(), UpdatedAt: time.Now()}, Turns: map[string]wire.Turn{}, Proposals: map[int64]wire.SessionProposalView{}, Repos: slices.Clone(fs.Repos)}
+			f.List = append(f.List, ns)
+			reply(201, wire.ContinueSessionResponse{Session: ns.S, HandoffPrompt: "Continue from our previous session."})
 		case len(parts) == 2 && r.Method == http.MethodDelete:
 			fs.S.MachineStatus = wire.MachineStatusDeleting
 			reply(202, fs.S)
@@ -605,8 +702,8 @@ func (f *API) serve(w http.ResponseWriter, r *http.Request) {
 		case parts[2] == "hydrate":
 			fs.S.MachineStatus = wire.MachineStatusHydrating
 			reply(202, map[string]any{})
-		case parts[2] == "shares":
-			reply(201, api.Share{URL: f.Srv.URL + "/s/abc", ExpiresAt: time.Now().Add(24 * time.Hour)})
+		case parts[2] == "shares" || (len(parts) == 4 && parts[2] == "publications" && parts[3] == "transcript"):
+			reply(200, api.Share{ID: "abc", URL: f.Srv.URL + "/s/abc", PublishedAt: time.Now()})
 		case parts[2] == "proposals" && len(parts) == 5:
 			var seq int64
 			fmt.Sscan(parts[3], &seq)

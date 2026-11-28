@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/tui"
 )
 
 // pollEvery is how often a command that waits asks again: for a reply, a
@@ -54,19 +55,17 @@ var verbs = []struct {
 }{
 	{"sessions", "list", &sessionsList}, {"sessions", "show", &sessionsShow}, {"sessions", "log", &sessionsLog},
 	{"sessions", "read", &sessionsRead}, {"sessions", "unread", &sessionsUnread}, {"sessions", "proposal", &sessionsProposal},
-	{"sessions", "new", &sessionsNew},
+	{"sessions", "new", &sessionsNew}, {"sessions", "continue", &sessionsContinue},
 	{"sessions", "edit", &sessionsEdit}, {"sessions", "repos", &sessionsRepos}, {"sessions", "wake", &sessionsWake},
 	{"sessions", "stop", &sessionsStop}, {"sessions", "share", &sessionsShare}, {"sessions", "archive", &sessionsArchive},
-	{"sessions", "delete", &sessionsDelete},
+	{"sessions", "delete", &sessionsDelete}, {"sessions", "login", &loginAgentCommand},
 	{"send", "", &send},
 	{"shell", "", &shellCommand},
+	{"login-agent", "", &loginAgentCommand},
 	{"files", "list", &filesList}, {"files", "cat", &filesCat}, {"files", "get", &filesGet}, {"files", "put", &filesPut},
 	{"projects", "list", &projectsList}, {"projects", "show", &projectsShow}, {"projects", "new", &projectsNew},
 	{"projects", "edit", &projectsEdit}, {"projects", "delete", &projectsDelete},
 	{"env", "list", &envList}, {"env", "set", &envSet}, {"env", "unset", &envUnset},
-	{"providers", "list", &providersList}, {"providers", "show", &providersShow}, {"providers", "add", &providersAdd},
-	{"providers", "login", &providersLogin}, {"providers", "rename", &providersRename}, {"providers", "logout", &providersLogout},
-	{"providers", "remove", &providersRemove},
 	{"git", "status", &gitStatus}, {"git", "login", &gitLogin}, {"git", "logout", &gitLogout}, {"git", "connect", &gitConnect},
 	{"git", "repos", &gitRepos}, {"git", "rename", &gitRename}, {"git", "remove", &gitRemove}, {"git", "identity", &gitIdentity},
 	{"usage", "summary", &usageSummary}, {"usage", "sessions", &usageSessions}, {"usage", "providers", &usageProviders},
@@ -119,20 +118,33 @@ func Run(ctx context.Context, client *api.Client, args []string, in io.Reader, o
 	return cmd.run(c)
 }
 
-// parse parses flags wherever they are among the arguments, as people type
-// them: `barad projects new Web --repo acme/web`.
+// parse parses flags wherever they are among the arguments, stopping flag
+// parsing at "--" so remote commands like `barad shell SESSION -- uname -a`
+// pass flags through untouched.
 func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
-	for {
+	for len(args) > 0 {
+		if args[0] == "--" {
+			positional = append(positional, args[1:]...)
+			return positional, nil
+		}
 		if err := fs.Parse(args); err != nil {
 			return nil, err
 		}
 		if fs.NArg() == 0 {
 			return positional, nil
 		}
-		positional = append(positional, fs.Arg(0))
-		args = fs.Args()[1:]
+		// Check whether fs stopped because of "--"
+		rest := fs.Args()
+		consumed := len(args) - len(rest)
+		if consumed > 0 && args[consumed-1] == "--" {
+			positional = append(positional, rest...)
+			return positional, nil
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
+	return positional, nil
 }
 
 // Help prints the commands of one noun, or of them all, each under its noun.
@@ -252,4 +264,14 @@ func (c *call) terminal() (int, bool) {
 		return 0, false
 	}
 	return int(f.Fd()), true
+}
+
+// browse opens a page in the browser, and prints the URL if none opened.
+func (c *call) browse(page string) {
+	if tui.OpenURL(page) == nil {
+		fmt.Fprintf(c.out, "If no browser opened, go to %s\n", page)
+	} else {
+		fmt.Fprintf(c.out, "Open %s\n", page)
+	}
+	fmt.Fprintln(c.out, "Waiting for you…")
 }

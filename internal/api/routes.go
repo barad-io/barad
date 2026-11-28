@@ -129,9 +129,12 @@ func (c *Client) UpdateSettings(ctx context.Context, sessionID string, in Settin
 // NewSession is what a session starts with.
 type NewSession struct {
 	Name               string                     `json:"name,omitempty"` // blank: the API names it, as "brisk otter 482913"
-	ProviderResourceID string                     `json:"provider_resource_id"`
+	Agent              string                     `json:"agent,omitempty"`
+	ProviderResourceID string                     `json:"provider_resource_id,omitempty"`
 	Model              string                     `json:"model,omitempty"`
 	ReasoningEffort    wire.ReasoningEffort       `json:"reasoning_effort,omitempty"`
+	FastMode           bool                       `json:"fast_mode,omitempty"`
+	Size               string                     `json:"size,omitempty"`
 	ProjectID          string                     `json:"project_id,omitempty"`
 	Repositories       []RepositoryRequest        `json:"repositories,omitempty"`
 	Environment        []wire.EnvironmentVariable `json:"environment,omitempty"`
@@ -144,23 +147,26 @@ func (c *Client) CreateSession(ctx context.Context, in NewSession) (*wire.Sessio
 	return &out, err
 }
 
-func (c *Client) Providers(ctx context.Context) ([]wire.ProviderView, error) {
-	var out struct {
-		Providers []wire.ProviderView `json:"providers"`
-	}
-	err := c.Do(ctx, http.MethodGet, "/account/providers", nil, &out)
-	return out.Providers, err
+// ContinueSessionRequest selects the v2 harness and options when continuing a legacy session.
+type ContinueSessionRequest struct {
+	Agent           string               `json:"agent,omitempty"`
+	Model           string               `json:"model,omitempty"`
+	ReasoningEffort wire.ReasoningEffort `json:"reasoning_effort,omitempty"`
+	Size            string               `json:"size,omitempty"`
+	Name            string               `json:"name,omitempty"`
 }
 
-// Models is a provider connection's model catalog.
-type Models struct {
-	Models       []wire.ModelCapabilities `json:"models"`
-	DefaultModel string                   `json:"default_model"`
+// ContinueSession creates a new v2 session carrying over a legacy session's transcript and disk.
+func (c *Client) ContinueSession(ctx context.Context, sessionID string, in ContinueSessionRequest) (*wire.ContinueSessionResponse, error) {
+	var out wire.ContinueSessionResponse
+	err := c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/continue", in, &out)
+	return &out, err
 }
 
-func (c *Client) Models(ctx context.Context, resourceID string) (*Models, error) {
-	var out Models
-	err := c.Do(ctx, http.MethodGet, "/account/providers/"+escape(resourceID)+"/models", nil, &out)
+// Agents returns the available v2 native harnesses, their models, and machine sizes.
+func (c *Client) Agents(ctx context.Context) (*wire.AgentsResponse, error) {
+	var out wire.AgentsResponse
+	err := c.Do(ctx, http.MethodGet, "/agents", nil, &out)
 	return &out, err
 }
 
@@ -334,8 +340,16 @@ func (c *Client) ApproveProposal(ctx context.Context, s wire.Session, view wire.
 		environment = append(environment, v.Name)
 	}
 	body := map[string]any{
-		"provider_resource_id": s.ProviderResourceID, "model": s.Model, "repositories": repositories,
+		"model": s.Model, "repositories": repositories,
 		"title": view.Proposal.Title, "prompt": view.Proposal.Prompt, "proposal_environment": environment,
+	}
+	if s.IsV2() {
+		body["agent"] = s.HarnessID()
+		if s.Size != "" {
+			body["size"] = s.Size
+		}
+	} else if s.ProviderResourceID != "" {
+		body["provider_resource_id"] = s.ProviderResourceID
 	}
 	if s.SupportsReasoningEffort && s.ReasoningEffort != "" {
 		body["reasoning_effort"] = s.ReasoningEffort
@@ -421,15 +435,16 @@ func (c *Client) Wake(ctx context.Context, sessionID string) error {
 	return c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/hydrate", nil, nil)
 }
 
-// Share is a read-only link to a session's transcript.
+// Share is a published read-only link to a session's transcript.
 type Share struct {
-	URL       string    `json:"url"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID          string    `json:"id,omitempty"`
+	URL         string    `json:"url"`
+	PublishedAt time.Time `json:"published_at,omitzero"`
 }
 
-func (c *Client) Share(ctx context.Context, sessionID, requestID string) (*Share, error) {
+func (c *Client) Share(ctx context.Context, sessionID, _ string) (*Share, error) {
 	var out Share
-	err := c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/shares", map[string]any{"request_id": requestID}, &out)
+	err := c.Do(ctx, http.MethodPost, "/sessions/"+escape(sessionID)+"/publications/transcript", map[string]any{}, &out)
 	return &out, err
 }
 

@@ -1,6 +1,6 @@
 # barad
 
-Barad in the terminal: your sessions, their conversations, and what the web app does with them.
+The coding-agent TUI and CLI for Barad: persistent cloud workspaces, four native harnesses (`claude`, `codex`, `grok`, `agy`), full web-app parity, and first-class terminal multiplexer citizenship (Rex, Ghostty, tmux).
 
 ```sh
 curl -fsSL https://github.com/barad-io/barad/releases/latest/download/install.sh | sh
@@ -18,102 +18,112 @@ gh attestation verify "$(command -v barad)" --repo barad-io/barad \
 
 ### Updating
 
-`barad update` replaces barad with the newest release. The release workflow signs each release's `SHA256SUMS` with an Ed25519 key that only it can use (`SHA256SUMS.sig`; the key lives in the repository's `release` environment, open to `v*` tags alone). barad carries the public half, [`internal/update/release-signing.pem`](internal/update/release-signing.pem), and installs a download only when the signed checksums vouch for it. Once a day the home screen looks up the newest release and mentions it, quietly, when it is newer than yours; it never updates on its own.
+`barad update` replaces barad with the newest release. The release workflow signs each release's `SHA256SUMS` with an Ed25519 key (`SHA256SUMS.sig`). barad carries the public half in [`internal/update/release-signing.pem`](internal/update/release-signing.pem) and installs a download only when the signed checksums verify.
 
 ## Using it
 
 ```sh
-barad            # signs you in the first time, then opens the app
-barad login      # sign in: approve this computer in your browser
-barad logout     # sign out on this computer
-barad update     # replace barad with the newest release
+barad                # open fuzzy session picker (signs in on first run)
+barad -r             # resume the last session directly
+barad <session>      # attach straight into a session's TUI
+barad login          # sign in: approve this computer in your browser
+barad logout         # sign out on this computer
+barad update         # replace barad with its newest release
 barad version
 ```
 
-Signing in never asks for your password. `barad login` shows a code such as `BCDF-GHJK` and opens Barad in your browser, where you are already signed in. Check that the page shows the same code and your computer's name, then approve it. barad gets a session of its own, which `barad logout` revokes. On a computer without a browser, open the link it prints anywhere you are signed in to Barad.
+Signing in never asks for your password. `barad login` prints a short code such as `BCDF-GHJK` and opens Barad in your browser where you approve the computer. `barad logout` revokes the CLI session.
 
-- **Home**: your project's sessions, grouped by what they need from you: a reply you have not read or a failure, then what is running, then the rest. **R** marks every unread reply here read; **r** marks the selected one read, or unread again. **/** searches every project, by name or ID. **p** opens the projects: show another (each says how many sessions need you there), make a new one, and set up the shown one (name, colour, agent, effort, repositories, variables, delete). **m** moves the selected session to another project. **a** archives it (it asks first). **Tab** shows the archived ones; open one to read its conversation.
-- **A session**: your messages on the right, the agent's replies on the left, each turn ending with when it finished and how long it took. Its header says when an idle computer goes to sleep, as the web app's strip does. Its work folds into one row when a run ends; **Tab** shows the steps, then their full output. Replies stream in as the agent writes them.
-- **The message box**: writing in it keeps an awake session's computer awake, as on the web (it sleeps ten minutes after you stop). Enter sends and Shift+Enter or Alt+Enter starts a new line (or, with the preference, Enter starts a line and Alt+Enter sends); the arrow keys move through what you have written, Home and End to the line's ends.
-- **Select and copy**: drag across any text to copy it; the copy leaves out the app's frames and indent. A click on a link opens it in your browser.
-- **The footer** says how many sessions need you and how many are working, and briefly when one finishes; so does a desktop notification (OSC 9: Ghostty, iTerm2, WezTerm, kitty), unless you turn it off.
-- **Switch sessions**: Ctrl+S, anywhere, lists every session in every project, what needs you first; type to narrow it to a name, Enter to open it.
-- **Your messages**: Ctrl+P and Ctrl+N jump to your previous and next message, as the web app's arrows do; Ctrl+O lists them all, as the web app's conversation map does.
-- **A shell** in the session's computer: Ctrl+T. barad steps aside for it (waking the computer first) and comes back when you exit.
-- **One menu** (`?`, or Ctrl+K) for everything else, in groups: what needs you now (stop the agent, approve or dismiss a proposed session, wake it, open a shell, go to the session it came from); the conversation (your messages, copy the last reply, images, steps, attach an image, a read-only share link); the session's settings under its name (rename, model, reasoning effort, fast mode, move to a project, repositories its Git credentials reach, details and agent instructions, archive, delete); and Barad's own (usage, settings).
-- **Settings**, as the web app's: this computer (theme, what Enter does, notifications, steps); provider connections (connect one with a key or a subscription sign-in in your browser, rename, sign in again or replace the key, the sessions using it, sign out, remove); source control (GitHub sign-in, connecting accounts and organizations or installing Barad on another, each source's repositories, rename, disconnect, and who commits are by); billing (buy credits in your browser, balance history); and the account (change your password, sign out).
-- **New session** (`n`) starts from your project's agent, effort and repositories; name it (left blank, it gets a name like "brisk otter 482913"), choose another agent, each repository at a branch, and the variables it receives.
-- **Variables** of a session (in its menu) or a project: add one, a secret (typed in dots and never shown again), change a value, remove one.
-- **Images**: screenshots the agent took and images you attached. Attach one by dropping the file on the terminal or with Ctrl+V. Text pasted past 64 KB goes as a text attachment.
-- **Usage**: workspace time and credits, by day and by session, with the balance's activity; and inference: tokens and their cost by day, provider and model. **←** and **→** choose 7, 30 or 90 days.
+### TUI layout & interaction
 
-The footer always lists the keys that work on the current screen.
+- **Primary-buffer inline viewport**: no alternate screen, no permanent sidebars, no mouse hijacking. Settled exchanges print cleanly into your terminal's native scrollback so scrolling, text selection, copying, and narrow Rex/Ghostty/tmux splits work natively.
+- **Pinned bottom composer**: multiline input (`Enter` sends, `Shift+Enter` / `Alt+Enter` inserts a newline; configurable via `/account` or `barad config`), inline `/` slash-command completion, `@path` workspace file completion, drag-dropped file paths and `Ctrl+V` clipboard image attachments, uniform post-turn prompt queueing (`Queued · runs after current turn`), and `Esc` to gracefully stop an active turn.
+- **Single-line footer**: `session name · harness/model/effort (+fast on Codex) · ctx % · awake|sleeping|waking|sign-in required`.
+- **Per-pane OSC 7501 status**: emits Rex's Program Status Protocol (`working`, `blocked` for auth/proposals, `done`, `error`, `idle`, `clear`) strictly for the attached session so multiple panes run cleanly side by side.
+- **Tool output toggle**: `Ctrl+T` cycles compact / shown / full tool diffs and reasoning; `/tools` inspects any historical step's full diff/output and loads older transcript pages (`o`).
 
-Pictures use the kitty graphics protocol where the terminal draws its Unicode placeholders (kitty, Ghostty) and truecolor half blocks elsewhere, Rex included. `BARAD_GRAPHICS=kitty` or `blocks` overrides the choice. Two themes, night and paper, set the terminal's colours while barad runs, so it looks the same whatever your terminal theme is.
+### Slash commands & overlays
 
-## Without the app
+| Command | Action |
+|---|---|
+| `/sessions` (`Ctrl+P`) | Fuzzy session picker across projects with unread dots, live status, and `+ New session` |
+| `/new` | Create a new session (project defaults, `claude`/`codex`/`grok`/`agy`, model + custom ID, effort, Codex fast mode, size, GitHub repos) |
+| `/model` | Switch model (catalog or custom ID), reasoning effort, and Codex `fast_mode` (fenced while a turn is active) |
+| `/login` | Sign in to the session's native harness CLI (`claude`, `codex`, `grok`, `agy`) directly in your terminal and report auth |
+| `/shell` | Drop into an interactive login shell inside the session's workspace VM (`exit` returns to the TUI) |
+| `/settings` | Rename, move project, Git repos, env & secret vars, wake VM, publish share link, archive/delete |
+| `/files` | Browse `/workspace`, preview files, insert `@path` (`i`) into the composer |
+| `/tools` | Inspect full diffs/outputs of tool calls and load older transcript history (`o`) |
+| `/projects` | Manage projects, environment variables, and defaults |
+| `/usage` | Workspace compute & model inference usage (7 / 30 / 90 days) |
+| `/billing` | Credit balance, billing history, Terms of Service, buy credits |
+| `/account` | Account info, GitHub status, git identity, theme (`auto` / `night` / `paper`), composer Enter mode |
+| `/continue` | Continue a legacy read-only session into a new v2 session |
+| `/open` | Open the latest screenshot or attached image URL in your browser |
+| `/stop` | Gracefully stop the active turn |
+| `/quit` | Exit barad |
 
-Everything the app does is also a command, for scripts and quick changes: `barad help` lists them all. `--json` prints what a command returns, `--yes` skips a confirmation, and a value a command asks for (a key, a secret) can come on stdin instead.
+## Scriptable CLI
+
+Everything is also available as scriptable commands (`barad help` lists them all). Pass `--json` for machine-readable output and `--yes` to skip confirmations.
 
 ```sh
-# Sessions: what needs you, their conversations, and talking to them
-barad sessions --unread                                  # NAME  STATE  PROJECT  MODEL  ACTIVE  ID
-barad sessions read --all                                # mark every reply read (the app shares what you have read)
-barad sessions log stripe --last                         # the agent's last reply, as it wrote it
-barad sessions new "Upgrade stripe-go to v86" --name stripe --project payments --repo acme/web@release --wait
-git diff | barad send stripe "Review this" --wait        # piped input goes along; --wait prints the reply
+# Sessions
+barad sessions --json                                    # list sessions (NAME  STATE  AGENT  MODEL  PROJECT  ACTIVE  ID)
+barad sessions --unread
+barad sessions show stripe
+barad sessions log stripe --last
+barad sessions new "Upgrade stripe-go to v86" --agent codex --effort high --fast --size l --repo acme/web@release --wait
+barad sessions edit stripe --model gpt-5.5 --effort medium --fast on
+barad sessions continue legacy-id --agent claude
+barad sessions share stripe                              # publish read-only transcript URL
+git diff | barad send stripe "Review this" --wait
 barad send stripe "What does this show?" --file shot.png
-barad sessions proposal docs --approve                   # start the session an agent proposes
-barad sessions --archived
+barad login-agent stripe                                 # interactive native harness login in VM
 
-# A session's computer
-barad shell stripe                                       # a login shell in it, here (it wakes the computer)
-barad files stripe web/src                               # list a directory of /workspace
+# Workspace shell & files
+barad shell stripe                                       # interactive login shell (wakes VM if sleeping)
+barad shell stripe -- uname -a                           # run a command non-interactively and forward its exit code
+barad files stripe web/src
 barad files cat stripe web/README.md
 barad files get stripe web/dist/report.html --to ~/Downloads
 barad files put stripe ./fixtures.json --to web/test
 
-# Projects and their variables
-barad projects new Payments --provider claude --model claude-opus-5 --effort high --repo acme/api --colour teal
-barad env set STRIPE_KEY --secret --project payments     # the value is read unseen, or from stdin
-
-# The account
-barad providers add chatgpt                              # a subscription signs in in your browser
-echo "$XAI_KEY" | barad providers add xai_api --name xAI
-barad git connect acme                                   # a GitHub organization Barad is installed on
+# Projects, environment & account
+barad projects new Payments --agent claude --model default --effort high --size l --repo acme/api --colour teal
+barad env set STRIPE_KEY --secret --project payments
+barad git connect acme
 barad git identity --separate on --barad-author on
-barad billing buy 25                                     # pay in your browser; the credits arrive here
+barad billing buy 25
 barad usage models --days 7
-barad config enter newline                               # this computer's preferences for the app
-barad account password
+barad config theme auto                                  # auto | night | paper
+barad account
 ```
 
-Sessions, projects, provider connections and Git sources are named by ID, or by name: exactly in any case, or by a part only one of them has.
+Sessions, projects, and Git sources can be named by ID, exact name (case-insensitive), or any unique substring.
 
-## Files and settings
+## Files and environment variables
 
-barad keeps its files in your config directory (`~/.config/barad` on Linux, `~/Library/Application Support/barad` on macOS), readable only by you: `credentials.json` holds its session and `prefs.json` this computer's preferences and what you have read, which the app and the commands share (`barad config` changes the preferences). `barad logout` revokes the session and deletes the file.
+barad stores its credentials (`credentials.json`) and shared preferences (`prefs.json`) in `~/.config/barad` (Linux / `$XDG_CONFIG_HOME/barad`) or `~/Library/Application Support/barad` (macOS).
 
-| Variable | |
+| Variable | Values |
 |---|---|
-| `BARAD_THEME` | `night` or `paper` |
-| `BARAD_GRAPHICS` | `kitty` or `blocks` |
-| `BARAD_API_URL` | another Barad stack |
+| `BARAD_THEME` | `night` or `paper` (overrides `auto` detection) |
+| `BARAD_API_URL` | Point at another Barad API endpoint |
 
-What stays in the web app is what belongs to a browser: installing it as an app, and keeping a phone's screen awake.
-
-## Building
+## Building & testing
 
 ```sh
 go build ./cmd/barad
+go vet ./...
 go test ./...
 ```
 
-`go test` drives the whole app and every command against an in-memory API (`internal/fakeapi`), terminal included. The same fake serves a manual session:
+`go test` runs the CLI, TUI, and shell against an in-memory Barad API (`internal/fakeapi`). To run the TUI manually against the fake API:
 
 ```sh
 mkdir -p /tmp/fake && BARAD_FAKE_API_DIR=/tmp/fake go test ./internal/fakeapi -run TestServeFakeAPI -timeout 0 &
 XDG_CONFIG_HOME=/tmp/fake BARAD_API_URL=$(cat /tmp/fake/url) go run ./cmd/barad
 ```
 
-`wire` holds the API's JSON as barad uses it; the Barad service tests that its own types keep every field there.
+`wire` holds the API's JSON shapes; the Barad backend's `internal/clicontract` test verifies every field remains compatible.

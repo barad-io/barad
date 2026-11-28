@@ -1,17 +1,17 @@
-// barad is Barad in the terminal: your sessions, their conversations, and
-// everything the web app does with them.
+// barad is the Barad coding-agent CLI and TUI: persistent cloud sessions,
+// native harnesses (claude, codex, grok, agy), and scriptable subcommands.
 //
-//	barad            the app (signs you in first if needed)
-//	barad login      sign in: approve this computer in the web app
-//	barad logout     sign out on this computer
-//	barad version    the release this is
-//	barad update     replace barad with its newest release
-//	barad help       every command: all the app does, without the app
+//	barad                 open fuzzy session picker (or resume with -r)
+//	barad <session>       attach straight into a session's TUI
+//	barad login           sign in: approve this computer in the web app
+//	barad logout          sign out on this computer
+//	barad version         the release this is
+//	barad update          replace barad with its newest release
+//	barad help            all scriptable commands
 //
-// Credentials live in the user config directory (~/.config/barad on Linux),
-// readable only by you. BARAD_API_URL points it at another stack;
-// BARAD_THEME=night|paper and BARAD_GRAPHICS=kitty|blocks override what it
-// detects.
+// Credentials live in ~/.config/barad (or $XDG_CONFIG_HOME/barad).
+// BARAD_API_URL points at another stack; BARAD_THEME=auto|night|paper overrides
+// theme detection.
 package main
 
 import (
@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/barad-io/barad/internal/api"
@@ -30,7 +31,7 @@ import (
 	"github.com/barad-io/barad/internal/update"
 )
 
-// version is the release, set when it is built (-ldflags "-X main.version=v1.2.3").
+// version is the release, set when built (-ldflags "-X main.version=v1.2.3").
 var version = "dev"
 
 func main() {
@@ -54,12 +55,9 @@ func run(args []string) error {
 	}
 	switch command {
 	case "":
-		if !client.SignedIn() {
-			if err := login(client); err != nil {
-				return err
-			}
-		}
-		return tui.Run(client, version)
+		return runTUI(client, tui.Options{})
+	case "-r", "--resume":
+		return runTUI(client, tui.Options{Resume: true})
 	case "login":
 		return login(client)
 	case "logout":
@@ -76,7 +74,14 @@ func run(args []string) error {
 	case "update":
 		return selfUpdate()
 	case "help", "-h", "--help":
-		fmt.Print("usage: barad [COMMAND]\n\n  barad            the app (it signs you in first)\n  barad login      sign in: approve this computer in your browser\n  barad logout     sign out on this computer\n  barad update     replace barad with its newest release\n  barad version    the release this is\n")
+		fmt.Print("usage: barad [SESSION | -r | COMMAND]\n\n" +
+			"  barad               open the fuzzy session picker\n" +
+			"  barad -r, --resume  resume the last session\n" +
+			"  barad SESSION       attach straight into a session's TUI\n" +
+			"  barad login         sign in: approve this computer in your browser\n" +
+			"  barad logout        sign out on this computer\n" +
+			"  barad update        replace barad with its newest release\n" +
+			"  barad version       the release this is\n")
 		return cli.Help(os.Stdout, "")
 	}
 	if cli.Known(command) {
@@ -87,11 +92,24 @@ func run(args []string) error {
 		defer stop()
 		return cli.Run(ctx, client, args, os.Stdin, os.Stdout)
 	}
+	// If it does not look like a flag, treat `barad <session>` as attaching directly to that session.
+	if !strings.HasPrefix(command, "-") {
+		query := strings.Join(args, " ")
+		return runTUI(client, tui.Options{SessionQuery: query})
+	}
 	return fmt.Errorf("unknown command %q; barad help lists them", command)
 }
 
-// selfUpdate replaces this barad with the newest release, once its signed
-// checksums vouch for the download.
+func runTUI(client *api.Client, opts tui.Options) error {
+	if !client.SignedIn() {
+		if err := login(client); err != nil {
+			return err
+		}
+	}
+	opts.Version = version
+	return tui.Run(client, opts)
+}
+
 func selfUpdate() error {
 	if !update.Released(version) {
 		return errors.New("this is a development build; install a release with: curl -fsSL https://github.com/barad-io/barad/releases/latest/download/install.sh | sh")
@@ -123,9 +141,6 @@ func selfUpdate() error {
 	return nil
 }
 
-// login signs in with a device code: it opens the web app, where you are
-// already signed in, at a page asking you to approve this computer, and waits
-// for your answer. Your password never passes through the command line.
 func login(client *api.Client) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -155,5 +170,3 @@ func login(client *api.Client) error {
 	}
 	return nil
 }
-
-// openBrowser opens url in the default browser, without waiting for it.

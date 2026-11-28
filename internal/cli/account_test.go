@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/barad-io/barad/internal/prefs"
-	"github.com/barad-io/barad/wire"
 )
 
 func TestReadUnreadAndArchived(t *testing.T) {
@@ -66,46 +65,6 @@ func TestLogAndWaitingForAReply(t *testing.T) {
 	b.fails("neither an image", "send", "checkout", "x", "--file", os.Args[0])
 }
 
-func TestProviderConnections(t *testing.T) {
-	b := newBarad(t)
-	contains(t, b.ok("providers"), "Claude Max", "Claude subscription", "ready", "OpenAI", "OpenAI API")
-	contains(t, b.ok("providers", "show", "claude max"), "used by", "sessions", "Fix the flaky checkout test")
-
-	if _, err := b.run("xai-key\n", "providers", "add", "xai_api", "--name", "Grok API"); err != nil {
-		t.Fatal(err)
-	}
-	contains(t, b.ok("providers"), "Grok API", "xAI API")
-	b.ok("providers", "rename", "grok api", "xAI")
-	b.ok("providers", "logout", "xai", "--yes")
-	contains(t, b.ok("providers", "show", "xai"), "signed out")
-	if _, err := b.run("new-key\n", "providers", "login", "xai"); err != nil {
-		t.Fatal(err)
-	}
-	contains(t, b.ok("providers", "show", "xai"), "ready")
-
-	// A subscription signs in with a code in the browser.
-	out := b.ok("providers", "add", "chatgpt")
-	contains(t, out, "WXYZ-1234", "Connected ChatGPT subscription")
-	if len(b.opened) == 0 || !strings.HasSuffix(b.opened[len(b.opened)-1], "/device") {
-		t.Fatalf("opened %v", b.opened)
-	}
-	// Claude's page gives a code to paste back.
-	out, err := b.run("claude-code-42\n", "providers", "add", "claude", "--name", "Claude Pro")
-	if err != nil {
-		t.Fatal(err)
-	}
-	contains(t, out, "Paste the code", "Connected Claude Pro")
-	if !slices.ContainsFunc(b.f.Providers, func(p wire.ProviderView) bool { return p.Name == "Claude Pro" && p.Ready }) {
-		t.Fatalf("providers %+v", b.f.Providers)
-	}
-	b.fails("no provider type", "providers", "add", "gemini")
-	b.fails("Run again with --yes", "providers", "remove", "claude pro")
-	b.ok("providers", "remove", "claude pro", "--yes")
-	if strings.Contains(b.ok("providers"), "Claude Pro") {
-		t.Fatal("a removed connection is listed")
-	}
-}
-
 func TestSourceControl(t *testing.T) {
 	b := newBarad(t)
 	contains(t, b.ok("git"), "signed in as you", "acme", "src_1", "not connected: barad git connect you", "authored by You <you@example.com>, committed by You")
@@ -147,7 +106,7 @@ func TestBillingAndUsage(t *testing.T) {
 
 func TestPreferences(t *testing.T) {
 	b := newBarad(t)
-	contains(t, b.ok("config"), "theme", "night", "enter", "send", "notify", "on", "steps", "folded")
+	contains(t, b.ok("config"), "theme", "auto", "enter", "send", "notify", "on", "steps", "folded")
 	b.ok("config", "enter", "newline")
 	b.ok("config", "notify", "off")
 	b.ok("config", "steps", "full")

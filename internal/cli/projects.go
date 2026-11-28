@@ -12,13 +12,9 @@ import (
 
 var projectsList = command{
 	usage: "projects [list]",
-	about: "your projects, with the agent and repositories their sessions start with",
+	about: "your projects, with the default agent and repositories their sessions start with",
 	run: func(c *call) error {
 		projects, err := c.api.Projects(c.ctx)
-		if err != nil {
-			return err
-		}
-		names, err := c.providerNames()
 		if err != nil {
 			return err
 		}
@@ -29,7 +25,7 @@ var projectsList = command{
 				continue
 			}
 			open = append(open, p)
-			rows = append(rows, []string{p.Name, describeAgent(p.Agent, names), describeRepos(p.Repositories), p.ProjectID})
+			rows = append(rows, []string{p.Name, describeAgent(p.Agent), describeRepos(p.Repositories), p.ProjectID})
 		}
 		return c.table(open, []string{"NAME", "AGENT", "REPOSITORIES", "ID"}, rows)
 	},
@@ -54,28 +50,25 @@ var projectsShow = command{
 		if c.asJSON {
 			return c.json(map[string]any{"project": p, "environment": env.Variables})
 		}
-		names, err := c.providerNames()
-		if err != nil {
-			return err
-		}
 		fmt.Fprintf(c.out, "%s  (%s)\n\n", p.Name, p.ProjectID)
-		fmt.Fprintf(c.out, "  agent         %s\n", describeAgent(p.Agent, names))
+		fmt.Fprintf(c.out, "  agent         %s\n", describeAgent(p.Agent))
 		fmt.Fprintf(c.out, "  repositories  %s\n", describeRepos(p.Repositories))
 		fmt.Fprintf(c.out, "  environment   %s\n", describeEnv(env.Variables))
 		return nil
 	},
 }
 
-// agentFlags are how a project's or a session's agent is named.
+// agentFlags are how a project's or a session's v2 agent is named.
 func agentFlags(fs *flag.FlagSet, c *call) {
-	strFlag(fs, c, "provider", "the provider connection: its name, ID or type (claude, openai…)")
-	strFlag(fs, c, "model", "the model (default: the connection's)")
-	strFlag(fs, c, "effort", "the reasoning effort (default: the model's)")
+	strFlag(fs, c, "agent", "the harness: claude, codex, grok, or agy")
+	strFlag(fs, c, "model", "the model (default: harness default, or custom model ID)")
+	strFlag(fs, c, "effort", "the reasoning effort (low, medium, high, max…)")
+	strFlag(fs, c, "size", "the machine size: s, m, l, or xl")
 }
 
 var projectsNew = command{
-	usage: "projects new NAME [--provider P [--model M] [--effort E]] [--repo OWNER/NAME]… [--colour C]",
-	about: "make a project; its sessions start with this agent and clone these repositories",
+	usage: "projects new NAME [--agent claude|codex|grok|agy [--model M] [--effort E] [--size S]] [--repo OWNER/NAME]… [--colour C]",
+	about: "make a project; its sessions start with this default harness and clone these repositories",
 	flags: func(fs *flag.FlagSet, c *call) {
 		agentFlags(fs, c)
 		listFlag(fs, c, "repo", "a repository its sessions clone (repeat for more)")
@@ -87,12 +80,12 @@ var projectsNew = command{
 			return err
 		}
 		in := api.ProjectSettings{Name: name, Colour: c.str("colour"), Repositories: []wire.ProjectRepository{}}
-		if c.str("provider") != "" {
-			if in.Agent, err = c.agent(c.str("provider"), c.str("model"), c.str("effort")); err != nil {
+		if c.str("agent") != "" {
+			if in.Agent, err = c.resolveAgent(c.str("agent"), c.str("model"), c.str("effort"), c.str("size")); err != nil {
 				return err
 			}
-		} else if c.str("model") != "" || c.str("effort") != "" {
-			return errors.New("--model and --effort need --provider")
+		} else if c.str("model") != "" || c.str("effort") != "" || c.str("size") != "" {
+			return errors.New("--model, --effort and --size need --agent")
 		}
 		if in.Repositories, err = c.projectRepos(nil, c.list("repo"), nil); err != nil {
 			return err
@@ -106,8 +99,8 @@ var projectsNew = command{
 }
 
 var projectsEdit = command{
-	usage: "projects edit PROJECT [--name N] [--colour C] [--provider P [--model M] [--effort E] | --no-agent] [--add-repo R]… [--remove-repo R]…",
-	about: "change a project's name, agent or repositories",
+	usage: "projects edit PROJECT [--name N] [--colour C] [--agent A [--model M] [--effort E] [--size S] | --no-agent] [--add-repo R]… [--remove-repo R]…",
+	about: "change a project's name, default agent, or repositories",
 	flags: func(fs *flag.FlagSet, c *call) {
 		strFlag(fs, c, "name", "its new name")
 		agentFlags(fs, c)
@@ -135,19 +128,18 @@ var projectsEdit = command{
 		switch {
 		case c.flag("no-agent"):
 			in.Agent = nil
-		case c.str("provider") != "":
-			if in.Agent, err = c.agent(c.str("provider"), c.str("model"), c.str("effort")); err != nil {
+		case c.str("agent") != "":
+			if in.Agent, err = c.resolveAgent(c.str("agent"), c.str("model"), c.str("effort"), c.str("size")); err != nil {
 				return err
 			}
-		case c.str("model") != "" || c.str("effort") != "":
+		case c.str("model") != "" || c.str("effort") != "" || c.str("size") != "":
 			if in.Agent == nil {
-				return errors.New("the project has no agent yet: name its --provider")
+				return errors.New("the project has no agent yet: name its --agent")
 			}
-			model := c.str("model")
-			if model == "" {
-				model = in.Agent.Model
-			}
-			if in.Agent, err = c.agent(in.Agent.ProviderResourceID, model, c.str("effort")); err != nil {
+			agentID := firstNonEmpty(in.Agent.Agent, "claude")
+			model := firstNonEmpty(c.str("model"), in.Agent.Model)
+			size := firstNonEmpty(c.str("size"), in.Agent.Size)
+			if in.Agent, err = c.resolveAgent(agentID, model, c.str("effort"), size); err != nil {
 				return err
 			}
 		}
@@ -190,8 +182,6 @@ var projectsDelete = command{
 	},
 }
 
-// projectRepos is have with add added and remove removed, each named
-// owner/name and checked against what your Git sources reach.
 func (c *call) projectRepos(have []wire.ProjectRepository, add, remove []string) ([]wire.ProjectRepository, error) {
 	out := append([]wire.ProjectRepository{}, have...)
 	if len(add) > 0 {
@@ -228,41 +218,40 @@ func (c *call) projectRepos(have []wire.ProjectRepository, add, remove []string)
 	return out, nil
 }
 
-// providerNames names each provider connection, by ID.
-func (c *call) providerNames() (map[string]string, error) {
-	all, err := c.api.Providers(c.ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]string{}
-	for _, p := range all {
-		out[p.ResourceID] = p.Name
-	}
-	return out, nil
-}
-
-func describeAgent(a *wire.ProjectAgent, names map[string]string) string {
+func describeAgent(a *wire.ProjectAgent) string {
 	if a == nil {
 		return "chosen per session"
 	}
-	s := names[a.ProviderResourceID]
-	if s == "" {
-		s = a.ProviderResourceID
+	head := a.Agent
+	if head == "" {
+		head = a.ProviderResourceID
 	}
-	s += " · " + a.Model
+	var parts []string
+	if head != "" {
+		parts = append(parts, head)
+	}
+	if a.Model != "" {
+		parts = append(parts, a.Model)
+	}
 	if a.ReasoningEffort != "" {
-		s += " · " + string(a.ReasoningEffort)
+		parts = append(parts, string(a.ReasoningEffort))
 	}
-	return s
+	if a.Size != "" {
+		parts = append(parts, "size "+a.Size)
+	}
+	if len(parts) == 0 {
+		return "chosen per session"
+	}
+	return strings.Join(parts, " / ")
 }
 
 func describeRepos(rs []wire.ProjectRepository) string {
 	if len(rs) == 0 {
 		return "none"
 	}
-	var names []string
-	for _, r := range rs {
-		names = append(names, r.Repository)
+	names := make([]string, len(rs))
+	for i, r := range rs {
+		names[i] = r.Repository
 	}
 	return strings.Join(names, ", ")
 }
@@ -271,13 +260,13 @@ func describeEnv(vs []wire.EnvironmentVariable) string {
 	if len(vs) == 0 {
 		return "none"
 	}
-	var names []string
-	for _, v := range vs {
-		n := v.Name
+	names := make([]string, len(vs))
+	for i, v := range vs {
 		if v.Secret {
-			n += " (secret)"
+			names[i] = v.Name + " (secret)"
+		} else {
+			names[i] = v.Name
 		}
-		names = append(names, n)
 	}
 	return strings.Join(names, ", ")
 }

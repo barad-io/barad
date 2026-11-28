@@ -22,16 +22,29 @@ import (
 // web app's Terminal and Files tabs give them.
 
 var shellCommand = command{
-	usage: "shell SESSION",
-	about: "a login shell in a session's computer, in this terminal (waking it if it sleeps); exit to leave",
+	usage: "shell SESSION [-- CMD...]",
+	about: "open a login shell in a session's workspace, or run CMD non-interactively (waking if asleep)",
 	run: func(c *call) error {
 		s, err := c.sessionArg(true)
 		if err != nil {
 			return err
 		}
+		if len(c.args) > 1 {
+			if err := shell.Wake(c.ctx, c.api, s, io.Discard); err != nil {
+				return err
+			}
+			status, err := shell.RunCommand(c.ctx, c.api, s.SessionID, c.args[1:], c.out)
+			if err != nil {
+				return err
+			}
+			if status != 0 {
+				return exitStatus(status)
+			}
+			return nil
+		}
 		in, ok := c.in.(*os.File)
 		if _, term := c.terminal(); !ok || !term {
-			return errors.New("a shell needs a terminal")
+			return errors.New("an interactive shell needs a terminal (or pass -- CMD... to run a command)")
 		}
 		if err := shell.Wake(c.ctx, c.api, s, c.out); err != nil {
 			return err
@@ -44,6 +57,40 @@ var shellCommand = command{
 			return exitStatus(status)
 		}
 		return nil
+	},
+}
+
+var loginAgentCommand = command{
+	usage: "login-agent SESSION",
+	about: "sign in to a session's native coding agent harness inside its workspace terminal",
+	run: func(c *call) error {
+		s, err := c.sessionArg(true)
+		if err != nil {
+			return err
+		}
+		in, ok := c.in.(*os.File)
+		if _, isTerm := c.terminal(); !ok || !isTerm {
+			return errors.New("harness login needs an interactive terminal")
+		}
+		agentID := s.HarnessID()
+		loginCmd := shell.DefaultLoginCommand(agentID)
+		if cat, err := c.api.Agents(c.ctx); err == nil {
+			for _, a := range cat.Agents {
+				if strings.EqualFold(a.ID, agentID) && a.LoginCommand != "" {
+					loginCmd = a.LoginCommand
+					break
+				}
+			}
+		}
+		cmd := &shell.LoginCommand{
+			Client:       c.api,
+			Session:      s,
+			AgentID:      agentID,
+			LoginCommand: loginCmd,
+		}
+		cmd.SetStdin(in)
+		cmd.SetStdout(c.out)
+		return cmd.Run()
 	},
 }
 

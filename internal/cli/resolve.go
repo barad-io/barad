@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/barad-io/barad/internal/api"
@@ -47,7 +48,6 @@ func pick[T any](kind, query string, all []T, id func(T) string, name func(T) st
 	return zero, fmt.Errorf("%q could be any of: %s; use the ID", query, strings.Join(names, ", "))
 }
 
-// noMatch is pick finding nothing by the name.
 type noMatch struct{ kind, query string }
 
 func (e noMatch) Error() string { return fmt.Sprintf("no %s matches %q", e.kind, e.query) }
@@ -78,8 +78,7 @@ func hasDefault(ps []wire.Project) bool {
 	return false
 }
 
-// session is a session by ID or name: a live one, or failing that, an
-// archived one.
+// session resolves a session by ID or name (live first, then archived).
 func (c *call) session(query string) (wire.Session, error) {
 	all, err := c.api.Sessions(c.ctx)
 	if err != nil {
@@ -89,7 +88,7 @@ func (c *call) session(query string) (wire.Session, error) {
 	for _, s := range all {
 		switch {
 		case s.MachineStatus == wire.MachineStatusDeleting:
-		case s.ArchivedAt.IsZero():
+		case s.ArchivedAt.IsZero() && s.MachineStatus != wire.MachineStatusArchived:
 			live = append(live, s)
 		default:
 			archived = append(archived, s)
@@ -102,34 +101,16 @@ func (c *call) session(query string) (wire.Session, error) {
 	return s, err
 }
 
-// live is a session that is not archived: one that can still work.
+// live resolves an active (non-archived) session.
 func (c *call) live(query string) (wire.Session, error) {
 	s, err := c.session(query)
-	if err == nil && !s.ArchivedAt.IsZero() {
+	if err == nil && (!s.ArchivedAt.IsZero() || s.MachineStatus == wire.MachineStatusArchived) {
 		return s, fmt.Errorf("%s is archived: its workspace is gone, and it takes no messages", sessionName(s))
 	}
 	return s, err
 }
 
-// provider is a connection, by ID, name or provider type ("claude").
-func (c *call) provider(query string) (wire.ProviderView, error) {
-	all, err := c.api.Providers(c.ctx)
-	if err != nil {
-		return wire.ProviderView{}, err
-	}
-	var byType []wire.ProviderView
-	for _, p := range all {
-		if strings.EqualFold(p.ProviderType, query) {
-			byType = append(byType, p)
-		}
-	}
-	if len(byType) == 1 {
-		return byType[0], nil
-	}
-	return pick("provider connection", query, all, func(p wire.ProviderView) string { return p.ResourceID }, func(p wire.ProviderView) string { return p.Name })
-}
-
-// repository is one your Git sources reach, by owner/name.
+// repository matches a GitHub repository reachable through the account's Git sources.
 func (c *call) repository(name string, all []api.Repository) (api.Repository, error) {
 	for _, r := range all {
 		if strings.EqualFold(r.FullName, name) {
@@ -146,49 +127,107 @@ func sessionName(s wire.Session) string {
 	return "Untitled session"
 }
 
-// agent is the agent a provider connection, model and effort describe: what
-// a project starts its sessions with. The model defaults to the
-// connection's, and the effort to the model's.
-func (c *call) agent(providerQuery, model, effort string) (*wire.ProjectAgent, error) {
-	p, err := c.provider(providerQuery)
+// agentSpec finds a v2 harness driver in GET /agents by id or label.
+func (c *call) agentSpec(query string) (wire.AgentSpec, *wire.AgentsResponse, error) {
+	cat, err := c.api.Agents(c.ctx)
+	if err != nil {
+		return wire.AgentSpec{}, nil, err
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		q = "claude"
+	}
+	// Accept common aliases.
+	switch q {
+	case "openai", "chatgpt":
+		q = "codex"
+	case "xai":
+		q = "grok"
+	case "antigravity":
+		q = "agy"
+	}
+	for _, a := range cat.Agents {
+		if strings.EqualFold(a.ID, q) || strings.EqualFold(a.Label, q) {
+			return a, cat, nil
+		}
+	}
+	var ids []string
+	for _, a := range cat.Agents {
+		ids = append(ids, a.ID)
+	}
+	return wire.AgentSpec{}, cat, fmt.Errorf("unknown agent %q; choose one of %s", query, strings.Join(ids, ", "))
+}
+
+// resolveAgent validates a v2 harness, model (including custom model IDs),
+// reasoning effort, and machine size against GET /agents.
+func (c *call) resolveAgent(agentQuery, model, effort, size string) (*wire.ProjectAgent, error) {
+	spec, cat, err := c.agentSpec(agentQuery)
 	if err != nil {
 		return nil, err
 	}
-	models, err := c.api.Models(c.ctx, p.ResourceID)
-	if err != nil {
-		return nil, err
-	}
-	if model == "" {
-		model = models.DefaultModel
-	}
-	for _, m := range models.Models {
-		if m.Model != model {
-			continue
+	if strings.TrimSpace(model) == "" {
+		model = spec.DefaultModel
+		if model == "" {
+			model = "default"
 		}
-		e := wire.ReasoningEffort(effort)
-		switch {
-		case !m.SupportsReasoningEffort && effort != "":
-			return nil, fmt.Errorf("%s takes no reasoning effort", model)
-		case !m.SupportsReasoningEffort:
-			e = ""
-		case effort == "":
-			e = m.DefaultReasoningEffort
-		default:
-			ok := false
-			for _, x := range m.ReasoningEfforts {
-				ok = ok || x == e
-			}
-			if !ok {
-				return nil, fmt.Errorf("%s takes reasoning effort %s, not %q", model, joinEfforts(m.ReasoningEfforts), effort)
+	}
+	// Find matching model spec, or inherit default model's effort capabilities for custom model IDs.
+	var ms wire.AgentModelSpec
+	matched := false
+	for _, m := range spec.Models {
+		if m.ID == model {
+			ms, matched = m, true
+			break
+		}
+	}
+	if !matched {
+		ms = wire.AgentModelSpec{
+			ID:                      model,
+			Label:                   model,
+			SupportsReasoningEffort: true,
+			Efforts:                 []wire.ReasoningEffort{"low", "medium", "high"},
+			DefaultEffort:           "high",
+		}
+		for _, m := range spec.Models {
+			if m.ID == spec.DefaultModel || m.ID == "default" {
+				ms.SupportsReasoningEffort = m.SupportsReasoningEffort
+				ms.Efforts = m.Efforts
+				ms.DefaultEffort = m.DefaultEffort
+				break
 			}
 		}
-		return &wire.ProjectAgent{ProviderResourceID: p.ResourceID, Model: model, ReasoningEffort: e}, nil
 	}
-	var names []string
-	for _, m := range models.Models {
-		names = append(names, m.Model)
+	e := wire.ReasoningEffort(strings.ToLower(strings.TrimSpace(effort)))
+	switch {
+	case !ms.SupportsReasoningEffort && e != "":
+		return nil, fmt.Errorf("%s does not support reasoning effort", model)
+	case !ms.SupportsReasoningEffort:
+		e = ""
+	case e == "":
+		e = ms.DefaultEffort
+	case len(ms.Efforts) > 0 && !slices.Contains(ms.Efforts, e):
+		return nil, fmt.Errorf("%s takes reasoning effort %s, not %q", model, joinEfforts(ms.Efforts), effort)
 	}
-	return nil, fmt.Errorf("%s has no model %q; it has %s", p.Name, model, strings.Join(names, ", "))
+	sz := strings.ToLower(strings.TrimSpace(size))
+	if sz != "" && len(cat.Sizes) > 0 {
+		ok := false
+		var valid []string
+		for _, s := range cat.Sizes {
+			valid = append(valid, s.ID)
+			if s.ID == sz {
+				ok = true
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("size must be one of %s, not %q", strings.Join(valid, ", "), size)
+		}
+	}
+	return &wire.ProjectAgent{
+		Agent:           spec.ID,
+		Model:           model,
+		ReasoningEffort: e,
+		Size:            sz,
+	}, nil
 }
 
 func joinEfforts(es []wire.ReasoningEffort) string {

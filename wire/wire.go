@@ -10,7 +10,7 @@ import (
 )
 
 type (
-	Provider        string // claude, openai, codex, xai, grok
+	Provider        string // claude, openai, codex, xai, grok, antigravity
 	ReasoningEffort string
 	MachineStatus   string
 	TurnStatus      string
@@ -19,12 +19,16 @@ type (
 )
 
 const (
+	RuntimeVersionV2 = 2
+
 	MachineStatusDehydrated  MachineStatus = "dehydrated"
 	MachineStatusHydrating   MachineStatus = "hydrating"
 	MachineStatusHydrated    MachineStatus = "hydrated"
 	MachineStatusDehydrating MachineStatus = "dehydrating"
 	MachineStatusBroken      MachineStatus = "broken"
 	MachineStatusDeleting    MachineStatus = "deleting"
+	MachineStatusArchiving   MachineStatus = "archiving"
+	MachineStatusArchived    MachineStatus = "archived"
 
 	TurnStatusActive     TurnStatus = "active"
 	TurnStatusCompacting TurnStatus = "compacting"
@@ -75,6 +79,12 @@ type Session struct {
 	Name               string          `json:"name,omitempty"`
 	ProviderResourceID string          `json:"provider_resource_id"`
 	Provider           Provider        `json:"provider"`
+	Agent              string          `json:"agent,omitempty"`
+	RuntimeVersion     int             `json:"runtime_version,omitempty"`
+	Size               string          `json:"size,omitempty"`
+	AgentAuthenticated *bool           `json:"agent_authenticated,omitempty"`
+	AgentAuthMethod    string          `json:"agent_auth_method,omitempty"`
+	LegacySourceID     string          `json:"legacy_source_id,omitempty"`
 	Model              string          `json:"model"`
 	ReasoningEffort    ReasoningEffort `json:"reasoning_effort,omitempty"`
 	FastMode           bool            `json:"fast_mode"`
@@ -99,6 +109,33 @@ type Session struct {
 	Origin                    *SessionOrigin    `json:"origin,omitempty"`
 	CreatedAt                 time.Time         `json:"created_at"`
 	UpdatedAt                 time.Time         `json:"updated_at"`
+}
+
+// IsV2 reports whether this session runs on the Barad v2 native harness runtime.
+func (s Session) IsV2() bool { return s.RuntimeVersion >= RuntimeVersionV2 }
+
+// AuthRequired reports whether this v2 session is blocked on harness sign-in.
+func (s Session) AuthRequired() bool {
+	return s.IsV2() && s.AgentAuthenticated != nil && !*s.AgentAuthenticated
+}
+
+// HarnessID returns the canonical v2 agent identifier (claude, codex, grok, agy).
+func (s Session) HarnessID() string {
+	if s.Agent != "" {
+		return s.Agent
+	}
+	switch s.Provider {
+	case "claude":
+		return "claude"
+	case "openai", "codex":
+		return "codex"
+	case "xai", "grok":
+		return "grok"
+	case "antigravity":
+		return "agy"
+	default:
+		return string(s.Provider)
+	}
 }
 
 // SessionOrigin is the proposal a session was started from.
@@ -129,6 +166,7 @@ type TranscriptItem struct {
 	Kind       ItemKind        `json:"kind"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
+	Streaming  bool            `json:"streaming,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
 }
 
@@ -253,9 +291,50 @@ type WorkspaceInstructions struct {
 }
 
 type ProjectAgent struct {
-	ProviderResourceID string          `json:"provider_resource_id"`
+	Agent              string          `json:"agent,omitempty"`
+	ProviderResourceID string          `json:"provider_resource_id,omitempty"`
 	Model              string          `json:"model"`
 	ReasoningEffort    ReasoningEffort `json:"reasoning_effort,omitempty"`
+	Size               string          `json:"size,omitempty"`
+}
+
+// AgentModelSpec describes one selectable model exposed by a harness driver.
+type AgentModelSpec struct {
+	ID                      string            `json:"id"`
+	Label                   string            `json:"label"`
+	SupportsReasoningEffort bool              `json:"supports_reasoning_effort,omitempty"`
+	Efforts                 []ReasoningEffort `json:"efforts,omitempty"`
+	DefaultEffort           ReasoningEffort   `json:"default_effort,omitempty"`
+}
+
+// AgentSpec describes a native Barad v2 harness returned by GET /agents.
+type AgentSpec struct {
+	ID           string           `json:"id"`
+	Label        string           `json:"label"`
+	Binary       string           `json:"binary"`
+	APIKeyEnv    string           `json:"api_key_env"`
+	LoginCommand string           `json:"login_command,omitempty"`
+	DefaultModel string           `json:"default_model"`
+	Models       []AgentModelSpec `json:"models"`
+}
+
+// MachineSize describes a selectable compute size returned by GET /agents.
+type MachineSize struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Default bool   `json:"default,omitempty"`
+}
+
+// AgentsResponse is the payload returned by GET /agents.
+type AgentsResponse struct {
+	Agents []AgentSpec   `json:"agents"`
+	Sizes  []MachineSize `json:"sizes"`
+}
+
+// ContinueSessionResponse is the payload returned by POST /sessions/{id}/continue.
+type ContinueSessionResponse struct {
+	Session       Session `json:"session"`
+	HandoffPrompt string  `json:"handoff_prompt"`
 }
 
 type ProjectRepository struct {

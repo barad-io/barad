@@ -20,7 +20,7 @@ type setting struct {
 }
 
 var settings = []setting{
-	{"theme", "the app's colours", []string{"night", "paper"},
+	{"theme", "the app's colours", []string{"auto", "night", "paper"},
 		func(p prefs.Prefs) string { return p.Theme }, func(p *prefs.Prefs, v string) { p.Theme = v }},
 	{"enter", "what Enter does in the composer (the other is Alt+Enter)", []string{"send", "newline"},
 		func(p prefs.Prefs) string { return onOff(p.Newline, "newline", "send") },

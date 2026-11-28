@@ -13,25 +13,7 @@ import (
 	"github.com/barad-io/barad/wire"
 )
 
-// The account's routes: provider connections, source control, billing and
-// the password, as the web app's Settings uses them.
-
-// ProviderTypes are the kinds of provider connection, in the web app's
-// order, with its names for them.
-var ProviderTypes = []struct{ Type, Name string }{
-	{"chatgpt", "ChatGPT subscription"}, {"openai_api", "OpenAI API"}, {"grok", "Grok subscription"},
-	{"claude", "Claude subscription"}, {"xai_api", "xAI API"},
-}
-
-// ProviderTypeName is the web app's name for a kind of connection.
-func ProviderTypeName(providerType string) string {
-	for _, p := range ProviderTypes {
-		if p.Type == providerType {
-			return p.Name
-		}
-	}
-	return providerType
-}
+// The account's routes: source control, billing, credentials, and terminal access.
 
 // Identity is who sessions' commits are by, as the web app previews it: the
 // author is you, or Barad; the committer is the author, unless the
@@ -51,70 +33,7 @@ func Identity(s wire.GitSettings) (author, committer string) {
 	return author, author
 }
 
-// UsesAPIKey reports whether a provider type connects with an API key, not
-// a subscription sign-in.
-func UsesAPIKey(providerType string) bool {
-	return providerType == "openai_api" || providerType == "xai_api"
-}
-
-// AddAPIKeyProvider connects a provider with an API key.
-func (c *Client) AddAPIKeyProvider(ctx context.Context, providerType, name, key string) (*wire.ProviderView, error) {
-	var out wire.ProviderView
-	err := c.Do(ctx, http.MethodPost, "/account/providers/api-key", map[string]string{"type": providerType, "name": name, "api_key": key}, &out)
-	return &out, err
-}
-
-// PutAPIKey adds or replaces a connection's API key.
-func (c *Client) PutAPIKey(ctx context.Context, resourceID, key string) error {
-	return c.Do(ctx, http.MethodPut, "/account/providers/"+escape(resourceID)+"/api-key", map[string]string{"api_key": key}, nil)
-}
-
-// AuthorizeProvider starts a subscription sign-in: for a new connection
-// named name, or with resourceID, for an existing one.
-func (c *Client) AuthorizeProvider(ctx context.Context, providerType, name, resourceID string) (*wire.ProviderAuthorization, error) {
-	in := map[string]string{"type": providerType, "name": name}
-	if resourceID != "" {
-		in["resource_id"] = resourceID
-	}
-	var out wire.ProviderAuthorization
-	err := c.Do(ctx, http.MethodPost, "/account/providers/authorize", in, &out)
-	return &out, err
-}
-
-func authorizationPath(flow *wire.ProviderAuthorization, providerType, verb string) string {
-	return fmt.Sprintf("/account/providers/authorization/%s/%s?type=%s&resource_id=%s",
-		escape(flow.FlowID), verb, url.QueryEscape(providerType), url.QueryEscape(flow.ResourceID))
-}
-
-// PollProvider asks how a sign-in stands. A poll too soon is not an error:
-// it reads as pending.
-func (c *Client) PollProvider(ctx context.Context, flow *wire.ProviderAuthorization, providerType string) (*wire.ProviderAuthorizationPoll, error) {
-	var out wire.ProviderAuthorizationPoll
-	err := c.Do(ctx, http.MethodPost, authorizationPath(flow, providerType, "poll"), nil, &out)
-	if IsCode(err, "poll_too_soon") {
-		return &wire.ProviderAuthorizationPoll{Pending: true}, nil
-	}
-	return &out, err
-}
-
-// SubmitProviderCode passes Claude's sign-in the code its page showed.
-func (c *Client) SubmitProviderCode(ctx context.Context, flow *wire.ProviderAuthorization, code string) error {
-	return c.Do(ctx, http.MethodPost, authorizationPath(flow, "claude", "code"), map[string]string{"code": code}, nil)
-}
-
-// CancelProvider abandons Claude's sign-in.
-func (c *Client) CancelProvider(ctx context.Context, flow *wire.ProviderAuthorization) error {
-	return c.Do(ctx, http.MethodPost, authorizationPath(flow, "claude", "cancel"), nil, nil)
-}
-
-// RemoveCredential signs a connection out: sessions using it stop until it
-// signs in again.
-func (c *Client) RemoveCredential(ctx context.Context, resourceID string) error {
-	return c.Do(ctx, http.MethodDelete, "/account/providers/"+escape(resourceID)+"/credential", nil, nil)
-}
-
-// Connections are provider connections ("providers") and Git sources
-// ("git-sources"): both rename, list their sessions, and are removed alike.
+// Connections are Git sources ("git-sources"): rename, list their sessions, and remove.
 
 func (c *Client) RenameConnection(ctx context.Context, route, resourceID, name string) error {
 	return c.Do(ctx, http.MethodPatch, "/account/"+route+"/"+escape(resourceID), map[string]string{"name": name}, nil)

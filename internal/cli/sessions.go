@@ -71,13 +71,13 @@ var sessionsList = command{
 			if archived {
 				when = ago(s.ArchivedAt)
 			}
-			rows = append(rows, []string{sessionName(s), word, names[projectOf(s)], s.Model, when, s.SessionID})
+			rows = append(rows, []string{sessionName(s), word, s.HarnessID(), s.Model, names[projectOf(s)], when, s.SessionID})
 		}
 		if len(rows) == 0 && c.flag("unread") && !c.asJSON {
 			_, err := fmt.Fprintln(c.out, "Nothing unread.")
 			return err
 		}
-		return c.table(list, []string{"NAME", "STATE", "PROJECT", "MODEL", "ACTIVE", "ID"}, rows)
+		return c.table(list, []string{"NAME", "STATE", "AGENT", "MODEL", "PROJECT", "ACTIVE", "ID"}, rows)
 	},
 }
 
@@ -116,13 +116,28 @@ var sessionsShow = command{
 		if effort == "" {
 			effort = "—"
 		}
+		modelLabel := s.Model
+		if s.FastMode {
+			modelLabel += " (fast)"
+		}
+		auth := "authenticated"
+		if s.AuthRequired() {
+			auth = "sign-in required (run barad login-agent " + s.SessionID + ")"
+		} else if s.AgentAuthMethod != "" {
+			auth = "authenticated (" + s.AgentAuthMethod + ")"
+		}
+		size := s.Size
+		if size == "" {
+			size = "l"
+		}
 		fmt.Fprintf(c.out, "%s  (%s)\n\n", sessionName(s), s.SessionID)
 		state := api.StandingOf(s, c.reviewed([]wire.Session{s})[s.SessionID], false).Word
 		if !s.ArchivedAt.IsZero() {
 			state += " " + ago(s.ArchivedAt)
 		}
 		for _, kv := range [][2]string{
-			{"state", state}, {"model", s.Model}, {"effort", effort}, {"project", project.Name},
+			{"state", state}, {"agent", s.HarnessID()}, {"model", modelLabel}, {"effort", effort},
+			{"size", size}, {"auth", auth}, {"project", project.Name},
 			{"repositories", repo}, {"environment", describeEnv(env.Variables)},
 			{"created", s.CreatedAt.Local().Format("2 Jan 2006 15:04")}, {"active", ago(activity(s))},
 		} {
@@ -133,12 +148,13 @@ var sessionsShow = command{
 }
 
 var sessionsNew = command{
-	usage: "sessions new [TASK] [--name N] [--wait] [--project P] [--provider P [--model M] [--effort E]] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
-	about: "start a session (from its project's agent and repositories unless you name others), and send it TASK",
+	usage: "sessions new [TASK] [--name N] [--wait] [--project P] [--agent claude|codex|grok|agy] [--model M] [--effort E] [--fast] [--size s|m|l|xl] [--repo OWNER/NAME[@BRANCH]]… [--no-repos] [--env NAME=VALUE]… [--secret-env NAME=VALUE]…",
+	about: "start a session (using its project defaults unless overridden), and optionally send it TASK",
 	flags: func(fs *flag.FlagSet, c *call) {
-		strFlag(fs, c, "name", "its name (default: a random one, like brisk otter 482913)")
+		strFlag(fs, c, "name", "its name (default: generated)")
 		strFlag(fs, c, "project", "the project it joins (default: Default)")
 		agentFlags(fs, c)
+		boolFlag(fs, c, "fast", "enable fast mode (Codex)")
 		listFlag(fs, c, "repo", "a repository it clones, at a branch if you name one (repeat for more)")
 		boolFlag(fs, c, "no-repos", "a blank workspace, whatever the project clones")
 		listFlag(fs, c, "env", "a variable it receives (repeat for more)")
@@ -150,21 +166,30 @@ var sessionsNew = command{
 		if err != nil {
 			return err
 		}
-		in := api.NewSession{Name: strings.TrimSpace(c.str("name")), ProjectID: project.ProjectID}
-		agent := project.Agent
-		switch {
-		case c.str("provider") != "":
-			if agent, err = c.agent(c.str("provider"), c.str("model"), c.str("effort")); err != nil {
-				return err
+		in := api.NewSession{Name: strings.TrimSpace(c.str("name")), ProjectID: project.ProjectID, FastMode: c.flag("fast")}
+		agentID := c.str("agent")
+		modelID := c.str("model")
+		effort := c.str("effort")
+		size := c.str("size")
+		if project.Agent != nil {
+			if agentID == "" {
+				agentID = project.Agent.Agent
 			}
-		case agent != nil && (c.str("model") != "" || c.str("effort") != ""):
-			if agent, err = c.agent(agent.ProviderResourceID, firstNonEmpty(c.str("model"), agent.Model), c.str("effort")); err != nil {
-				return err
+			if modelID == "" && (c.str("agent") == "" || strings.EqualFold(c.str("agent"), project.Agent.Agent)) {
+				modelID = project.Agent.Model
 			}
-		case agent == nil:
-			return fmt.Errorf("%s has no agent: name the --provider", project.Name)
+			if effort == "" && c.str("model") == "" && c.str("agent") == "" {
+				effort = string(project.Agent.ReasoningEffort)
+			}
+			if size == "" {
+				size = project.Agent.Size
+			}
 		}
-		in.ProviderResourceID, in.Model, in.ReasoningEffort = agent.ProviderResourceID, agent.Model, agent.ReasoningEffort
+		resolved, err := c.resolveAgent(agentID, modelID, effort, size)
+		if err != nil {
+			return err
+		}
+		in.Agent, in.Model, in.ReasoningEffort, in.Size = resolved.Agent, resolved.Model, resolved.ReasoningEffort, resolved.Size
 		switch {
 		case c.flag("no-repos"):
 		case len(c.list("repo")) > 0:
@@ -210,6 +235,33 @@ var sessionsNew = command{
 	},
 }
 
+var sessionsContinue = command{
+	usage: "sessions continue SESSION [--agent claude|codex|grok|agy] [--model M] [--effort E] [--size s|m|l|xl] [--name N]",
+	about: "continue a legacy read-only session in a new v2 session carrying over its transcript and disk",
+	flags: func(fs *flag.FlagSet, c *call) {
+		strFlag(fs, c, "name", "new session name")
+		agentFlags(fs, c)
+	},
+	run: func(c *call) error {
+		s, err := c.sessionArg(false)
+		if err != nil {
+			return err
+		}
+		req := api.ContinueSessionRequest{
+			Name:            strings.TrimSpace(c.str("name")),
+			Agent:           strings.TrimSpace(c.str("agent")),
+			Model:           strings.TrimSpace(c.str("model")),
+			ReasoningEffort: wire.ReasoningEffort(strings.TrimSpace(c.str("effort"))),
+			Size:            strings.TrimSpace(c.str("size")),
+		}
+		out, err := c.api.ContinueSession(c.ctx, s.SessionID, req)
+		if err != nil {
+			return err
+		}
+		return c.say(out, "Continued into %s (%s).", sessionName(out.Session), out.Session.SessionID)
+	},
+}
+
 var sessionsEdit = command{
 	usage: "sessions edit SESSION [--name N] [--model M] [--effort E] [--fast on|off] [--project P]",
 	about: "rename a session, change its model, effort or fast mode, or move it to another project",
@@ -217,7 +269,7 @@ var sessionsEdit = command{
 		strFlag(fs, c, "name", "its new name")
 		strFlag(fs, c, "model", "the model its next turn uses")
 		strFlag(fs, c, "effort", "the reasoning effort")
-		strFlag(fs, c, "fast", "fast mode: on or off (faster replies at more usage or API cost)")
+		strFlag(fs, c, "fast", "fast mode: on or off (Codex)")
 		strFlag(fs, c, "project", "the project it moves to")
 	},
 	run: func(c *call) error {
@@ -231,11 +283,11 @@ var sessionsEdit = command{
 			st.Name, changed = n, true
 		}
 		if c.str("model") != "" || c.str("effort") != "" {
-			agent, err := c.agent(s.ProviderResourceID, firstNonEmpty(c.str("model"), s.Model), c.str("effort"))
+			resolved, err := c.resolveAgent(s.HarnessID(), firstNonEmpty(c.str("model"), s.Model), c.str("effort"), "")
 			if err != nil {
 				return err
 			}
-			st.Model, st.ReasoningEffort, changed = agent.Model, agent.ReasoningEffort, true
+			st.Model, st.ReasoningEffort, changed = resolved.Model, resolved.ReasoningEffort, true
 		}
 		switch c.str("fast") {
 		case "":
@@ -374,9 +426,9 @@ var sessionsStop = sessionAction("sessions stop SESSION", "stop the agent after 
 		return "Stopping " + sessionName(s) + " after this step.", c.api.Cancel(c.ctx, s.SessionID)
 	})
 
-var sessionsShare = sessionAction("sessions share SESSION", "a read-only link to the conversation, for 24 hours", "", false,
+var sessionsShare = sessionAction("sessions share SESSION", "publish a read-only link to the conversation", "", false,
 	func(c *call, s wire.Session) (string, error) {
-		sh, err := c.api.Share(c.ctx, s.SessionID, "share"+strings.TrimPrefix(requestID(), "msg"))
+		sh, err := c.api.Share(c.ctx, s.SessionID, "")
 		if err != nil {
 			return "", err
 		}

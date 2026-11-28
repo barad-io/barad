@@ -27,9 +27,10 @@ const (
 func (w Work) String() string { return [...]string{"folded", "shown", "full"}[w] }
 
 type Prefs struct {
-	Theme   string `json:"theme"`   // night or paper
-	Project string `json:"project"` // the project the home screen shows
-	Work    Work   `json:"work"`
+	Theme       string `json:"theme"`                  // auto, night or paper
+	LastSession string `json:"last_session,omitempty"` // last attached session ID
+	Project     string `json:"project"`                // project filter remembered in session picker
+	Work        Work   `json:"work"`
 	// Reviewed is, for each session, the newest finished turn you have
 	// seen. Nil until the first list arrives, which counts as read: the
 	// web app assumes the same.
@@ -38,8 +39,7 @@ type Prefs struct {
 	Newline bool `json:"enter_newline"`
 	// Silent stops the desktop notification when a session finishes out of sight.
 	Silent bool `json:"silent"`
-	// The newest release, as last looked up (at most daily): the home
-	// screen mentions it while it is newer than the one running.
+	// The newest release, as last looked up (at most daily).
 	Latest          string    `json:"latest"`
 	LatestCheckedAt time.Time `json:"latest_checked_at"`
 }
@@ -63,8 +63,8 @@ func Load() Prefs {
 	if p.Work < WorkFolded || p.Work > WorkFull {
 		p.Work = WorkFolded
 	}
-	if p.Theme != "paper" {
-		p.Theme = "night"
+	if p.Theme != "paper" && p.Theme != "night" {
+		p.Theme = "auto"
 	}
 	return p
 }

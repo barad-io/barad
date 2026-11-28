@@ -1,133 +1,96 @@
-// Package tui is Barad's terminal app: your sessions on a cover, a session
-// as a conversation, one menu for everything rare, and full screens for
-// images and usage. It reads and changes state only through the Barad API,
-// and follows live updates the way the web app does: a hint arrives on the
-// update socket, then the app syncs from the API.
+// Package tui implements Barad's primary-buffer inline coding-agent TUI:
+// full-width conversation viewport backed by native terminal scrollback,
+// pinned bottom composer with slash commands and @file completion, single-line
+// status footer, on-demand overlays with 100% web-app parity, and per-pane
+// OSC 7501 status reporting for Rex and modern terminal multiplexers.
 package tui
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
 	"github.com/barad-io/barad/internal/prefs"
-	"github.com/barad-io/barad/internal/update"
+	"github.com/barad-io/barad/internal/shell"
 	"github.com/barad-io/barad/wire"
 )
 
-type screen int
-
-const (
-	screenHome screen = iota
-	screenChat
-	screenImages
-	screenUsage
-)
-
-// An attachment is a file waiting to go with the next message: an image,
-// or text too long for the message itself.
-type attachment struct {
-	name      string
-	data      []byte
-	mediaType string
-	pic       *Picture // images only
+// Options controls how the Barad TUI launches.
+type Options struct {
+	SessionQuery string // attach directly to a matching session ID or name
+	Resume       bool   // attach directly to the last active session
+	Version      string // build version string
 }
 
 type app struct {
-	api      *api.Client
-	version  string // the release running, or "dev"
-	w, h     int
-	gfx      Graphics
-	frame    int
-	now      time.Time
-	prefs    prefs.Prefs
-	exit     error  // why the app quit, when it was not asked to
-	farewell string // what to say when it has quit
+	api           *api.Client
+	opts          Options
+	w, h          int
+	frame         int
+	now           time.Time
+	prefs         prefs.Prefs
+	terminalLight *bool
+	exit          error
+	farewell      string
 
-	// The account.
-	sessions          []wire.Session // not archived, not being deleted
-	archived          []wire.Session // the conversations whose workspaces are gone
-	listed            bool
-	listing, relist   bool
-	projects          []wire.Project
-	providers         []wire.ProviderView
-	catalogs          map[string]*api.Models // by provider connection
-	repos             []api.Repository
-	sessionRepos      map[string][]wire.SessionGitRepository // what each session's Git credentials reach
-	instructions      map[string]*wire.WorkspaceInstructions // each session's agent instruction files
-	envs              map[string]*wire.EnvironmentView       // variables, by "sessions/ID" or "projects/ID"
-	branches          map[string]*wire.GitBranches           // by source and repository
-	github            *wire.GitHubAccount
-	sources           []wire.AccountResource
-	sourceRepos       map[string][]wire.GitHubRepository // by Git source
-	identity          *wire.GitSettings
-	history           []wire.BillingEntry
-	users             map[string][]wire.ResourceDependency // the sessions using each connection
-	signIn            *signIn                              // a provider sign-in in progress
-	awaiting          *awaitGitHub                         // GitHub, in the browser, finishing a step
-	paying            *wire.BillingAccount                 // the balance before a payment in the browser
-	activityAt        map[string]time.Time                 // when typing was last reported, by session
-	payUntil          time.Time
-	usage             *wire.UsageReport
-	workspace         *wire.WorkspaceUsage
-	balance           *wire.BillingAccount
-	online            bool
-	reported          map[string]string // OSC 7501 sequences sent, by session
-	pics              map[string]*Picture
-	picErr            map[string]string
-	picLoading        map[string]bool
-	mast              *Picture // the cover's landscape, drawn for mastKey
-	mastKey           string
-	mastBusy          bool
-	toast             string
-	toastBad          bool
-	toastAt           time.Time
-	notice            string               // a desktop notification to send at the next frame
-	md                map[mdKey][]Line     // agent prose, laid out
-	laid              map[laidKey][]string // still exchanges, painted (transcript)
-	cancelRequestedOn string               // the turn you asked to stop
+	// Account state.
+	sessions     []wire.Session
+	archived     []wire.Session
+	listed       bool
+	listing      bool
+	relist       bool
+	projects     []wire.Project
+	agents       []wire.AgentSpec
+	sizes        []wire.MachineSize
+	repos        []api.Repository
+	reposLoaded  bool
+	sessionRepos map[string][]wire.SessionGitRepository
+	envs         map[string]*wire.EnvironmentView
+	github       *wire.GitHubAccount
+	identity     *wire.GitSettings
+	usage        *wire.UsageReport
+	workspace    *wire.WorkspaceUsage
+	balance      *wire.BillingAccount
+	history      []wire.BillingEntry
+	usageDays    int
+	usageTab     int
+	wsFiles      map[string][]string
+	online       bool
+	status       statusTracker
 
-	// Where you are.
-	screen   screen
-	sel      string // the selected session on the home screen
-	conv     *conversation
-	comp     Editor
-	attach   []attachment
-	note     string // the last thing the composer has to say about attachments
-	scroll   int    // transcript rows above the bottom
-	filter   *Editor
-	shelf    bool     // the home screen lists the archived sessions
-	start    *starter // the new session sheet
-	menu     *menu
-	imgIdx   int
-	usageTab int   // 0 Barad, 1 inference
-	days     int   // the usage screen's range: 7, 30 or 90 days
-	span     *span // text selected with the mouse
+	// Active session + primary-buffer scrollback state.
+	conv              *conversation
+	flushed           int  // settled exchanges already printed via tea.Println
+	headerPrinted     bool // whether the attached session header divider was printed
+	lastActiveTurnID  string
+	cancelRequestedOn string
+	lastCtrlC         time.Time
+
+	// Composer & overlays.
+	comp    Editor
+	attach  []attachment
+	compSel int
+	ov      overlay
+
+	toast    string
+	toastBad bool
+	toastAt  time.Time
 }
 
-type mdKey struct {
-	text  string
-	width int
-}
-
-// Run starts the app for a signed-in client and returns when you quit;
-// version is the release it is.
-func Run(client *api.Client, version string) error {
-	a := newApp(client, DetectGraphics())
-	a.version = version
+// Run launches the primary-buffer inline Barad TUI for a signed-in client.
+func Run(client *api.Client, opts Options) error {
+	a := newApp(client, opts)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := tea.NewProgram(a, tea.WithFPS(120)) // a key shows within 8 ms of its frame
+	p := tea.NewProgram(a, tea.WithFPS(60))
 	go a.follow(ctx, p)
 	if _, err := p.Run(); err != nil {
 		return err
@@ -138,20 +101,26 @@ func Run(client *api.Client, version string) error {
 	return a.exit
 }
 
-func newApp(client *api.Client, g Graphics) *app {
-	a := &app{api: client, gfx: g, now: time.Now(), catalogs: map[string]*api.Models{}, sessionRepos: map[string][]wire.SessionGitRepository{}, instructions: map[string]*wire.WorkspaceInstructions{},
-		envs: map[string]*wire.EnvironmentView{}, branches: map[string]*wire.GitBranches{}, sourceRepos: map[string][]wire.GitHubRepository{}, users: map[string][]wire.ResourceDependency{}, activityAt: map[string]time.Time{},
-		reported: map[string]string{}, pics: map[string]*Picture{}, picErr: map[string]string{}, picLoading: map[string]bool{}, md: map[mdKey][]Line{}}
-	a.prefs = prefs.Load()
-	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
-		a.prefs.Theme = t
+func newApp(client *api.Client, opts Options) *app {
+	a := &app{
+		api:          client,
+		opts:         opts,
+		w:            100,
+		h:            30,
+		now:          time.Now(),
+		prefs:        prefs.Load(),
+		sessionRepos: map[string][]wire.SessionGitRepository{},
+		envs:         map[string]*wire.EnvironmentView{},
+		wsFiles:      map[string][]string{},
+		usageDays:    30,
 	}
-	applyTheme(a.prefs.Theme)
+	applyTheme(resolveTheme(a.prefs.Theme, nil))
+	if opts.SessionQuery == "" && !opts.Resume {
+		a.ov = &pickerOverlay{}
+	}
 	return a
 }
 
-// follow keeps the update socket open, reconnecting with backoff, and turns
-// its hints into messages.
 func (a *app) follow(ctx context.Context, p *tea.Program) {
 	hints := make(chan api.Dirty)
 	go func() {
@@ -217,17 +186,18 @@ type (
 	}
 	createdMsg struct {
 		session *wire.Session
-		prompt  string
 		err     error
 	}
-	accountMsg struct {
-		projects  []wire.Project
-		providers []wire.ProviderView
-		err       error
+	modelSavedMsg struct {
+		session *wire.Session
+		err     error
 	}
-	catalogMsg struct {
-		provider string
-		models   *api.Models
+	agentsMsg struct {
+		res *wire.AgentsResponse
+		err error
+	}
+	projectsMsg struct {
+		projects []wire.Project
 		err      error
 	}
 	reposMsg struct {
@@ -239,10 +209,23 @@ type (
 		repos []wire.SessionGitRepository
 		err   error
 	}
-	pictureMsg struct {
-		key string
-		pic *Picture
-		err error
+	envLoadedMsg struct {
+		key   string
+		view  *wire.EnvironmentView
+		err   error
+		saved bool
+	}
+	filesLoadedMsg struct {
+		sessionID   string
+		dir         string
+		entries     []wire.FileEntry
+		err         error
+		openOverlay bool
+	}
+	filePreviewMsg struct {
+		path    string
+		content string
+		err     error
 	}
 	usageMsg struct {
 		report    *wire.UsageReport
@@ -250,59 +233,1003 @@ type (
 		balance   *wire.BillingAccount
 		err       error
 	}
+	billingMsg struct {
+		balance *wire.BillingAccount
+		history []wire.BillingEntry
+		err     error
+	}
+	accountInfoMsg struct {
+		github   *wire.GitHubAccount
+		identity *wire.GitSettings
+		err      error
+	}
 	clipboardMsg struct {
 		data []byte
 		err  error
 	}
-	latestMsg struct {
-		tag string
-		err error
+	execDoneMsg struct {
+		kind string
+		err  error
 	}
-	mastMsg struct {
-		key string
-		p   *Picture
+	shareMsg struct {
+		url string
 	}
-	// doneMsg ends an action: what to say, and what to reload.
 	doneMsg struct {
-		say     string
-		err     error
-		relist  bool
-		resync  bool
-		open    string // a session to open
-		session *wire.Session
-		account bool // reload the projects and providers
+		say            string
+		err            error
+		relist         bool
+		resync         bool
+		open           string
+		session        *wire.Session
+		detach         bool
+		reloadProjects bool
+		reloadBilling  bool
+		reloadReposFor string
 	}
 )
 
-func (a *app) Init() tea.Cmd {
-	return tea.Batch(tick(), a.list(), a.loadAccount(), a.checkLatest(), tea.Raw(ansi.ClearProgramStatusID("barad")))
-}
-
-// checkLatest looks up the newest release, at most once a day, for a
-// release build.
-func (a *app) checkLatest() tea.Cmd {
-	if !update.Released(a.version) || a.now.Sub(a.prefs.LatestCheckedAt) < 24*time.Hour {
-		return nil
-	}
-	return call(update.Latest, func(tag string, err error) tea.Msg { return latestMsg{tag, err} })
-}
-
-// frameEvery is how often the app draws a frame: spinners, the bar's sweep
-// and kitty uploads move on ticks.
-var frameEvery = 80 * time.Millisecond
+var frameEvery = 100 * time.Millisecond
 
 func tick() tea.Cmd {
 	return tea.Tick(frameEvery, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-// call runs f against the API off the update loop, with a deadline.
 func call[T any](f func(ctx context.Context) (T, error), done func(T, error) tea.Msg) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		v, err := f(ctx)
 		return done(v, err)
 	}
+}
+
+func (a *app) Init() tea.Cmd {
+	return tea.Batch(
+		tick(),
+		a.list(),
+		a.loadAgents(),
+		a.loadProjects(),
+		tea.RequestBackgroundColor,
+	)
+}
+
+func (a *app) quit() tea.Cmd {
+	return tea.Sequence(a.status.clear(), tea.Quit)
+}
+
+// ---------------------------------------------------------------- Update
+
+func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		if msg.Width > 0 {
+			a.w = msg.Width
+		}
+		if msg.Height > 0 {
+			a.h = msg.Height
+		}
+		return a, nil
+
+	case tea.BackgroundColorMsg:
+		light := !msg.IsDark()
+		a.terminalLight = &light
+		applyTheme(resolveTheme(a.prefs.Theme, a.terminalLight))
+		return a, nil
+
+	case tickMsg:
+		a.frame++
+		a.now = time.Time(msg)
+		cmds := []tea.Cmd{tick()}
+		// Fallback sync poll while turn active or waking (in case WS reconnects).
+		if a.conv != nil && !a.conv.syncing && a.frame%25 == 0 {
+			s := a.conv.session
+			if s.CurrentTurnID != "" || s.MachineStatus == wire.MachineStatusHydrating || s.PendingTurn || len(a.conv.pending) > 0 {
+				cmds = append(cmds, a.syncConv(a.conv))
+			}
+		}
+		if c := a.status.emit(a.conv); c != nil {
+			cmds = append(cmds, c)
+		}
+		return a, tea.Batch(cmds...)
+
+	case onlineMsg:
+		wasOffline := !a.online
+		a.online = msg.online
+		if errors.Is(msg.err, api.ErrSignedOut) {
+			a.exit = errors.New("signed out; run barad login")
+			return a, a.quit()
+		}
+		if msg.online && wasOffline {
+			cmds := []tea.Cmd{a.list()}
+			if a.conv != nil {
+				cmds = append(cmds, a.syncConv(a.conv))
+			}
+			return a, tea.Batch(cmds...)
+		}
+		return a, nil
+
+	case dirtyMsg:
+		var cmds []tea.Cmd
+		if len(msg.Summaries) > 0 {
+			cmds = append(cmds, a.list())
+		}
+		if a.conv != nil && slices.Contains(msg.Sessions, a.conv.id) {
+			cmds = append(cmds, a.syncConv(a.conv))
+		}
+		return a, tea.Batch(cmds...)
+
+	case sessionsMsg:
+		a.listing = false
+		var cmds []tea.Cmd
+		if a.relist {
+			a.relist = false
+			cmds = append(cmds, a.list())
+		}
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, tea.Batch(cmds...)
+		}
+		a.listed = true
+		a.sessions, a.archived = nil, nil
+		for _, s := range msg.sessions {
+			switch {
+			case s.MachineStatus == wire.MachineStatusDeleting:
+			case !s.ArchivedAt.IsZero() || s.MachineStatus == wire.MachineStatusArchived:
+				a.archived = append(a.archived, s)
+			default:
+				a.sessions = append(a.sessions, s)
+			}
+		}
+		if a.prefs.Reviewed == nil {
+			a.prefs, _ = prefs.Update(func(p *prefs.Prefs) {
+				if p.Reviewed == nil {
+					p.Read(msg.sessions)
+				}
+			})
+		}
+		// Keep attached session metadata fresh.
+		if a.conv != nil {
+			for _, s := range msg.sessions {
+				if s.SessionID == a.conv.id {
+					if a.lastActiveTurnID != "" && s.CurrentTurnID == "" && s.LatestTerminalTurnID == a.lastActiveTurnID {
+						a.lastActiveTurnID = ""
+						if s.LatestTerminalTurnStatus == wire.TurnStatusCompleted {
+							a.status.markTurnCompleted(s.LatestTerminalTurnID)
+						}
+					}
+					a.conv.session = s
+					break
+				}
+			}
+		}
+		// Handle initial auto-attach (`barad <session>` or `barad --resume`).
+		if a.conv == nil && (a.opts.SessionQuery != "" || a.opts.Resume) {
+			if target, ok := a.resolveStartupSession(); ok {
+				a.opts.SessionQuery, a.opts.Resume = "", false
+				cmds = append(cmds, a.attachSession(target))
+			} else {
+				if a.opts.SessionQuery != "" {
+					a.flash(fmt.Sprintf("No session matching %q — pick one below", a.opts.SessionQuery), true)
+				}
+				a.opts.SessionQuery, a.opts.Resume = "", false
+				a.ov = &pickerOverlay{}
+			}
+		}
+		if c := a.status.emit(a.conv); c != nil {
+			cmds = append(cmds, c)
+		}
+		return a, tea.Batch(cmds...)
+
+	case syncMsg:
+		if a.conv == nil || a.conv.id != msg.id {
+			return a, nil
+		}
+		a.conv.syncing = false
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		prevTurn := a.lastActiveTurnID
+		more := a.conv.applySync(msg.data)
+		if a.conv.session.CurrentTurnID != "" {
+			a.lastActiveTurnID = a.conv.session.CurrentTurnID
+		} else if prevTurn != "" && a.conv.session.LatestTerminalTurnID == prevTurn {
+			a.lastActiveTurnID = ""
+			if a.conv.session.LatestTerminalTurnStatus == wire.TurnStatusCompleted {
+				a.status.markTurnCompleted(prevTurn)
+			}
+		}
+		// Mark session read while attached.
+		if a.conv.session.LatestTerminalTurnID != "" && a.prefs.Reviewed[a.conv.id] != a.conv.session.LatestTerminalTurnID {
+			s := a.conv.session
+			a.prefs, _ = prefs.Update(func(p *prefs.Prefs) { p.Read([]wire.Session{s}) })
+		}
+		var cmds []tea.Cmd
+		if flushCmd := a.flushCommitted(); flushCmd != nil {
+			cmds = append(cmds, flushCmd)
+		}
+		if more || a.conv.resync {
+			a.conv.resync = false
+			cmds = append(cmds, a.syncConv(a.conv))
+		}
+		// Prefetch workspace root file list once when hydrated for `@` completion.
+		if a.conv.session.MachineStatus == wire.MachineStatusHydrated {
+			if _, ok := a.wsFiles[a.conv.id]; !ok {
+				a.wsFiles[a.conv.id] = []string{} // mark in-flight
+				cmds = append(cmds, a.fetchFiles(a.conv.id, ".", false))
+			}
+		}
+		if c := a.status.emit(a.conv); c != nil {
+			cmds = append(cmds, c)
+		}
+		return a, tea.Batch(cmds...)
+
+	case olderMsg:
+		if a.conv == nil || a.conv.id != msg.id {
+			return a, nil
+		}
+		a.conv.loadingOlder = false
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		beforeLen := len(a.conv.exchanges())
+		a.conv.applyOlder(msg.data)
+		added := len(a.conv.exchanges()) - beforeLen
+		if added > 0 {
+			a.flushed += added
+			// Print the newly loaded older exchanges to scrollback cleanly.
+			var lines []string
+			lines = append(lines, Line{S("── Earlier history ──", SFaint)}.Paint(nil, 0))
+			for _, ex := range a.conv.exchanges()[:added] {
+				lines = append(lines, renderExchange(a.conv, ex, a.w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)...)
+				lines = append(lines, "")
+			}
+			a.flash(fmt.Sprintf("Loaded %d older exchanges", added), false)
+			return a, printlnChunked(lines, a.h)
+		}
+		a.flash("No older messages", false)
+		return a, nil
+
+	case sentMsg:
+		if msg.err != nil {
+			if a.conv != nil && a.conv.id == msg.id {
+				a.conv.sending = slices.DeleteFunc(a.conv.sending, func(p api.PendingMessage) bool { return p.RequestID == msg.requestID })
+				a.conv.changed()
+				if a.comp.Value() == "" {
+					a.comp.Insert(msg.text)
+				}
+				a.attach = append(msg.attach, a.attach...)
+			}
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		if a.conv != nil && a.conv.id == msg.id {
+			return a, tea.Batch(a.syncConv(a.conv), a.status.emit(a.conv))
+		}
+		return a, nil
+
+	case createdMsg:
+		if msg.err != nil {
+			if n, ok := a.ov.(*newSessionOverlay); ok {
+				n.busy = false
+				n.errMsg = msg.err.Error()
+			} else {
+				a.flash(msg.err.Error(), true)
+			}
+			return a, nil
+		}
+		a.ov = nil
+		a.sessions = append([]wire.Session{*msg.session}, a.sessions...)
+		a.flash("Created "+sessionTitle(*msg.session), false)
+		return a, tea.Batch(a.list(), a.attachSession(*msg.session))
+
+	case modelSavedMsg:
+		if msg.err != nil {
+			if m, ok := a.ov.(*modelOverlay); ok {
+				m.saving = false
+				m.errMsg = msg.err.Error()
+			} else {
+				a.flash(msg.err.Error(), true)
+			}
+			return a, nil
+		}
+		if a.conv != nil && msg.session != nil && a.conv.id == msg.session.SessionID {
+			a.conv.session = *msg.session
+		}
+		a.ov = nil
+		a.flash("Updated model settings", false)
+		return a, a.list()
+
+	case agentsMsg:
+		if msg.err == nil && msg.res != nil {
+			a.agents = msg.res.Agents
+			a.sizes = msg.res.Sizes
+			if n, ok := a.ov.(*newSessionOverlay); ok {
+				n.applyProjectDefaults(a)
+			}
+		}
+		return a, nil
+
+	case projectsMsg:
+		if msg.err == nil {
+			a.projects = msg.projects
+			if lo, ok := a.ov.(*listOverlay); ok && lo.title == "Projects" {
+				a.ov = a.buildProjectsOverlay()
+			}
+		}
+		return a, nil
+
+	case reposMsg:
+		if msg.err == nil {
+			a.repos = msg.repos
+			a.reposLoaded = true
+			if lo, ok := a.ov.(*listOverlay); ok && strings.HasPrefix(lo.title, "Git repositories") && a.conv != nil {
+				parent := lo.parent
+				next := a.buildReposOverlay(a.conv.session)
+				next.parent = parent
+				a.ov = next
+			}
+		}
+		return a, nil
+
+	case sessionReposMsg:
+		if msg.err == nil {
+			a.sessionRepos[msg.id] = msg.repos
+			if lo, ok := a.ov.(*listOverlay); ok && a.conv != nil && a.conv.id == msg.id {
+				if strings.HasPrefix(lo.title, "Session settings") {
+					a.ov = a.buildSettingsOverlay(a.conv.session)
+				} else if strings.HasPrefix(lo.title, "Git repositories") {
+					parent := lo.parent
+					next := a.buildReposOverlay(a.conv.session)
+					next.parent = parent
+					a.ov = next
+				}
+			}
+		}
+		return a, nil
+
+	case envLoadedMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		a.envs[msg.key] = msg.view
+		if msg.saved {
+			a.flash("Environment updated", false)
+		}
+		if lo, ok := a.ov.(*listOverlay); ok {
+			if strings.HasPrefix(lo.title, "Session settings") && a.conv != nil {
+				a.ov = a.buildSettingsOverlay(a.conv.session)
+			} else if strings.HasPrefix(lo.title, "Session env") || strings.HasPrefix(lo.title, "Project env") {
+				kind, id, _ := strings.Cut(msg.key, "/")
+				parent := lo.parent
+				next := a.buildEnvOverlay(api.EnvironmentOwner{Kind: kind, ID: id}, lo.title)
+				next.parent = parent
+				a.ov = next
+			}
+		}
+		return a, nil
+
+	case filesLoadedMsg:
+		if msg.err != nil {
+			if msg.openOverlay {
+				a.ov = nil
+				a.flash(msg.err.Error(), true)
+			}
+			return a, nil
+		}
+		if msg.dir == "." {
+			var names []string
+			for _, e := range msg.entries {
+				n := e.Name
+				if e.Type == "directory" {
+					n += "/"
+				}
+				names = append(names, n)
+			}
+			a.wsFiles[msg.sessionID] = names
+		}
+		if msg.openOverlay {
+			a.ov = a.buildFilesOverlay(msg.sessionID, msg.dir, msg.entries)
+		}
+		return a, nil
+
+	case filePreviewMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		if lo, ok := a.ov.(*listOverlay); ok {
+			lo.viewer = &textViewer{
+				title: "File · " + msg.path,
+				lines: codeLines(msg.content, msg.path[max(0, strings.LastIndex(msg.path, ".")):], max(30, a.w-4)),
+			}
+		}
+		return a, nil
+
+	case usageMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		a.usage, a.workspace, a.balance = msg.report, msg.workspace, msg.balance
+		return a, nil
+
+	case billingMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		a.balance, a.history = msg.balance, msg.history
+		if lo, ok := a.ov.(*listOverlay); ok && lo.title == "Billing & Credits" {
+			a.ov = a.buildBillingOverlay()
+		}
+		return a, nil
+
+	case accountInfoMsg:
+		if msg.err == nil {
+			a.github, a.identity = msg.github, msg.identity
+			if lo, ok := a.ov.(*listOverlay); ok && lo.title == "Account & Preferences" {
+				a.ov = a.buildAccountOverlay()
+			}
+		}
+		return a, nil
+
+	case clipboardMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		a.attach = append(a.attach, attachment{
+			name:      fmt.Sprintf("clipboard-%s.png", a.now.Format("150405")),
+			data:      msg.data,
+			mediaType: "image/png",
+		})
+		a.flash("Attached clipboard image", false)
+		return a, nil
+
+	case execDoneMsg:
+		if msg.err != nil {
+			a.flash(msg.kind+": "+msg.err.Error(), true)
+		} else if msg.kind == "login" {
+			a.flash("Harness sign-in finished — syncing session…", false)
+		} else {
+			a.flash("Returned from shell", false)
+		}
+		var cmds []tea.Cmd
+		cmds = append(cmds, a.list())
+		if a.conv != nil {
+			cmds = append(cmds, a.syncConv(a.conv))
+		}
+		return a, tea.Batch(cmds...)
+
+	case shareMsg:
+		a.ov = nil
+		a.flash("Share link printed above", false)
+		line := Line{S("Published share link: ", SMuted), S(msg.url, linked(SAgent.Underline(true), msg.url))}.Paint(nil, 0)
+		return a, tea.Println(line)
+
+	case doneMsg:
+		if msg.err != nil {
+			a.flash(msg.err.Error(), true)
+			return a, nil
+		}
+		if msg.say != "" {
+			a.flash(msg.say, false)
+		}
+		var cmds []tea.Cmd
+		if msg.session != nil && a.conv != nil && a.conv.id == msg.session.SessionID {
+			a.conv.session = *msg.session
+			if lo, ok := a.ov.(*listOverlay); ok && strings.HasPrefix(lo.title, "Session settings") {
+				sel := lo.sel
+				next := a.buildSettingsOverlay(a.conv.session)
+				next.sel = min(sel, max(0, len(next.items)-1))
+				a.ov = next
+			}
+		}
+		if msg.detach {
+			a.conv = nil
+			a.flushed = 0
+			a.headerPrinted = false
+			a.ov = &pickerOverlay{}
+			cmds = append(cmds, a.status.clear())
+		}
+		if msg.relist {
+			cmds = append(cmds, a.list())
+		}
+		if msg.resync && a.conv != nil {
+			cmds = append(cmds, a.syncConv(a.conv))
+		}
+		if msg.reloadProjects {
+			cmds = append(cmds, a.loadProjects())
+		}
+		if msg.reloadBilling {
+			cmds = append(cmds, a.loadBilling())
+		}
+		if msg.reloadReposFor != "" {
+			cmds = append(cmds, a.loadSessionRepos(msg.reloadReposFor))
+		}
+		if msg.open != "" {
+			for _, s := range a.sessions {
+				if s.SessionID == msg.open {
+					cmds = append(cmds, a.attachSession(s))
+					break
+				}
+			}
+		}
+		return a, tea.Batch(cmds...)
+
+	case tea.PasteMsg:
+		if a.ov != nil {
+			return a, nil
+		}
+		pasted := strings.TrimSpace(msg.Content)
+		if pasted != "" && !strings.Contains(pasted, "\n") {
+			if at, err := readAttachment(pasted); err == nil {
+				if len(a.attach) >= wire.PromptMediaMaximumItems {
+					a.flash("Maximum attachments reached", true)
+					return a, nil
+				}
+				a.attach = append(a.attach, at)
+				a.flash("Attached "+at.name, false)
+				return a, nil
+			}
+		}
+		a.comp.Insert(msg.Content)
+		return a, nil
+
+	case tea.KeyPressMsg:
+		a.status.ackUserInput()
+		cmd := a.handleKey(msg)
+		if stCmd := a.status.emit(a.conv); stCmd != nil {
+			return a, tea.Batch(cmd, stCmd)
+		}
+		return a, cmd
+	}
+	return a, nil
+}
+
+func (a *app) handleKey(k tea.KeyPressMsg) tea.Cmd {
+	ks := k.String()
+	// Global Ctrl+P opens fuzzy session picker (except when already inside picker).
+	if ks == "ctrl+p" {
+		if _, isPicker := a.ov.(*pickerOverlay); isPicker {
+			if a.conv != nil {
+				a.ov = nil
+			}
+			return nil
+		}
+		return a.openPicker("")
+	}
+	// Global Ctrl+C handling: close overlay, stop turn, clear input, or quit on double press.
+	if ks == "ctrl+c" {
+		if a.ov != nil {
+			if a.conv == nil {
+				return a.quit()
+			}
+			a.ov = nil
+			return nil
+		}
+		if a.conv != nil && a.conv.session.CurrentTurnID != "" && a.comp.Value() == "" && a.now.Sub(a.lastCtrlC) > 2*time.Second {
+			a.lastCtrlC = a.now
+			return a.cancelTurn()
+		}
+		if a.comp.Value() != "" {
+			a.comp.Reset()
+			a.lastCtrlC = a.now
+			a.flash("Cleared input (press Ctrl+C again to quit)", false)
+			return nil
+		}
+		return a.quit()
+	}
+
+	if a.ov != nil {
+		return a.ov.Key(a, k)
+	}
+
+	// Completion popup navigation (/commands or @files).
+	if comps := a.completions(); len(comps) > 0 {
+		switch ks {
+		case "up":
+			if a.compSel > 0 {
+				a.compSel--
+			} else {
+				a.compSel = len(comps) - 1
+			}
+			return nil
+		case "down":
+			a.compSel = (a.compSel + 1) % len(comps)
+			return nil
+		case "tab":
+			idx := min(max(0, a.compSel), len(comps)-1)
+			return comps[idx].apply(a)
+		case "enter":
+			if !a.prefs.Newline {
+				idx := min(max(0, a.compSel), len(comps)-1)
+				return comps[idx].apply(a)
+			}
+		case "esc":
+			a.comp.Reset()
+			a.compSel = 0
+			return nil
+		}
+	}
+
+	switch ks {
+	case "esc":
+		if a.conv != nil && a.conv.session.CurrentTurnID != "" {
+			return a.cancelTurn()
+		}
+		return nil
+	case "ctrl+t":
+		a.cycleWork()
+		return nil
+	case "ctrl+v":
+		return func() tea.Msg {
+			data, err := clipboardImage()
+			return clipboardMsg{data, err}
+		}
+	case "backspace":
+		if a.comp.Value() == "" && len(a.attach) > 0 {
+			a.attach = a.attach[:len(a.attach)-1]
+			return nil
+		}
+	case "enter", "alt+enter", "ctrl+enter":
+		sends := (ks == "enter") != a.prefs.Newline
+		if !sends {
+			a.comp.Insert("\n")
+			return nil
+		}
+		val := strings.TrimSpace(a.comp.Value())
+		if strings.HasPrefix(val, "/") {
+			if cmd, ok := a.runSlash(val); ok {
+				return cmd
+			}
+		}
+		if a.conv == nil {
+			return a.openPicker("")
+		}
+		if !a.conv.session.ArchivedAt.IsZero() || a.conv.session.MachineStatus == wire.MachineStatusArchived {
+			return nil
+		}
+		if !a.conv.session.IsV2() {
+			a.flash("Legacy read-only session — run /continue to continue in v2", true)
+			return nil
+		}
+		if val != "" || len(a.attach) > 0 {
+			return a.sendMessage()
+		}
+		return nil
+	}
+	a.comp.Key(k, max(12, a.w-2))
+	a.compSel = 0
+	return nil
+}
+
+// ---------------------------------------------------------------- View (Primary Buffer Inline)
+
+func (a *app) View() tea.View {
+	w := max(a.w, 32)
+	var sections []string
+
+	// 1. Live active/unflushed exchange (streaming text, active tools, spinner).
+	if a.conv != nil {
+		exs := a.conv.exchanges()
+		start := min(a.flushed, len(exs))
+		for i := start; i < len(exs); i++ {
+			rendered := renderExchange(a.conv, exs[i], w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)
+			sections = append(sections, rendered...)
+			if i < len(exs)-1 {
+				sections = append(sections, "")
+			}
+		}
+		// Auth Gate / legacy notices.
+		if a.conv.session.AuthRequired() {
+			sections = append(sections, Line{
+				S("⚠ ", SWarn.Bold(true)),
+				S("Sign-in required for "+harnessLabel(a.conv.session.HarnessID())+" — run ", SWarn),
+				S("/login", SAccent.Bold(true)),
+				S(" to authenticate and run queued prompts", SWarn),
+			}.Paint(nil, 0))
+		} else if !a.conv.session.IsV2() {
+			sections = append(sections, Line{
+				S("ℹ ", SAgent),
+				S("Legacy read-only session — run ", SMuted),
+				S("/continue", SAccent.Bold(true)),
+				S(" to continue in a new v2 session", SMuted),
+			}.Paint(nil, 0))
+		}
+	}
+
+	// 2. Uniform post-turn queued prompt banner.
+	for _, ql := range a.renderQueuedBanner(w) {
+		sections = append(sections, ql.Paint(nil, 0))
+	}
+
+	// 3. On-demand overlay (invisible until invoked).
+	if a.ov != nil {
+		maxH := max(10, min(a.h-6, 20))
+		for _, ol := range renderOverlayFrame(a.ov, a, w, maxH) {
+			sections = append(sections, ol.Paint(nil, 0))
+		}
+	}
+
+	// 4. Pinned bottom composer.
+	for _, cl := range a.renderComposer(w) {
+		sections = append(sections, cl.Paint(nil, 0))
+	}
+
+	// 5. Single thin status footer.
+	sections = append(sections, a.renderFooter(w).Paint(nil, 0))
+
+	v := tea.NewView(strings.Join(sections, "\n"))
+	v.AltScreen = false
+	v.MouseMode = tea.MouseModeNone
+	v.WindowTitle = a.windowTitle()
+	return v
+}
+
+func (a *app) windowTitle() string {
+	if a.conv == nil {
+		return "barad"
+	}
+	return sessionTitle(a.conv.session) + " · barad"
+}
+
+// ---------------------------------------------------------------- primary-buffer flushing
+
+// flushCommitted prints newly settled exchanges ONCE into the terminal's native
+// primary scrollback via tea.Println so native scroll, selection, and copy work
+// seamlessly without ever fighting the terminal emulator or multiplexer.
+func (a *app) flushCommitted() tea.Cmd {
+	if a.conv == nil || !a.conv.initialized {
+		return nil
+	}
+	var lines []string
+	if !a.headerPrinted {
+		a.headerPrinted = true
+		s := a.conv.session
+		mark, mc := harnessMark(s.HarnessID())
+		head := Line{
+			S("── ", Fg(BorderDefault)),
+			S(mark+" ", Fg(mc)),
+			S(sessionTitle(s), SText.Bold(true)),
+			S(" · "+harnessLabel(s.HarnessID())+"/"+s.Model, SMuted),
+			S(" ──", Fg(BorderDefault)),
+		}
+		lines = append(lines, "", head.Paint(nil, 0))
+		if a.conv.hasOlder {
+			lines = append(lines, Line{S("  (earlier history available — run /tools and press o to load)", SFaint)}.Paint(nil, 0))
+		}
+		lines = append(lines, "")
+	}
+
+	exs := a.conv.exchanges()
+	w := max(a.w, 32)
+	for a.flushed < len(exs) && !exs[a.flushed].moving {
+		rendered := renderExchange(a.conv, exs[a.flushed], w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)
+		lines = append(lines, rendered...)
+		lines = append(lines, "")
+		a.flushed++
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return printlnChunked(lines, a.h)
+}
+
+// printlnChunked emits lines to Bubble Tea v2's primary scrollback in small
+// chunks so cursedRenderer.insertAbove never exceeds the viewport height and
+// always keeps the bottom composer + footer anchored cleanly in view.
+func printlnChunked(lines []string, termH int) tea.Cmd {
+	if len(lines) == 0 {
+		return nil
+	}
+	chunk := max(1, min(6, (termH-6)/2))
+	if len(lines) <= chunk {
+		return tea.Println(strings.Join(lines, "\n"))
+	}
+	cmds := make([]tea.Cmd, 0, (len(lines)+chunk-1)/chunk)
+	for i := 0; i < len(lines); i += chunk {
+		end := min(len(lines), i+chunk)
+		cmds = append(cmds, tea.Println(strings.Join(lines[i:end], "\n")))
+	}
+	return tea.Sequence(cmds...)
+}
+
+// ---------------------------------------------------------------- actions & API calls
+
+func (a *app) attachSession(s wire.Session) tea.Cmd {
+	a.conv = newConversation(s)
+	a.flushed = 0
+	a.headerPrinted = false
+	a.lastActiveTurnID = s.CurrentTurnID
+	a.cancelRequestedOn = ""
+	a.status.ackUserInput()
+	a.prefs, _ = prefs.Update(func(p *prefs.Prefs) {
+		p.LastSession = s.SessionID
+		p.Read([]wire.Session{s})
+	})
+	return tea.Batch(a.syncConv(a.conv), a.status.emit(a.conv))
+}
+
+func (a *app) resolveStartupSession() (wire.Session, bool) {
+	all := append(append([]wire.Session{}, a.sessions...), a.archived...)
+	if a.opts.Resume {
+		if id := a.prefs.LastSession; id != "" {
+			for _, s := range all {
+				if s.SessionID == id {
+					return s, true
+				}
+			}
+		}
+		if len(a.sessions) > 0 {
+			return a.sessions[0], true
+		}
+		return wire.Session{}, false
+	}
+	q := strings.TrimSpace(a.opts.SessionQuery)
+	if q == "" {
+		return wire.Session{}, false
+	}
+	for _, s := range all {
+		if s.SessionID == q {
+			return s, true
+		}
+	}
+	ql := strings.ToLower(q)
+	var exact, partial []wire.Session
+	for _, s := range all {
+		nl := strings.ToLower(sessionTitle(s))
+		if nl == ql {
+			exact = append(exact, s)
+		} else if strings.Contains(nl, ql) {
+			partial = append(partial, s)
+		}
+	}
+	if len(exact) == 1 {
+		return exact[0], true
+	}
+	if len(exact) == 0 && len(partial) == 1 {
+		return partial[0], true
+	}
+	return wire.Session{}, false
+}
+
+func (a *app) sendMessage() tea.Cmd {
+	c := a.conv
+	text := strings.TrimSpace(a.comp.Value())
+	atts := a.attach
+	reqID := randomID("msg_", 8)
+	pending := api.PendingMessage{RequestID: reqID, Text: text, Kind: "sending", CreatedAt: a.now}
+	for _, at := range atts {
+		pending.Media = append(pending.Media, wire.PromptMediaRef{Filename: at.name, MediaType: at.mediaType})
+	}
+	c.sending = append(c.sending, pending)
+	c.changed()
+	a.comp.Reset()
+	a.attach = nil
+	id := c.id
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		var ids []string
+		for _, at := range atts {
+			mid, err := a.api.UploadMedia(ctx, id, reqID, randomID("media_", 10), at.name, at.mediaType, at.data)
+			if err != nil {
+				return sentMsg{id, reqID, text, atts, err}
+			}
+			ids = append(ids, mid)
+		}
+		_, err := a.api.SendMessage(ctx, id, reqID, text, ids)
+		return sentMsg{id, reqID, text, atts, err}
+	}
+}
+
+func (a *app) cancelTurn() tea.Cmd {
+	c := a.conv
+	if c == nil || c.session.CurrentTurnID == "" || a.cancelRequestedOn == c.session.CurrentTurnID {
+		return nil
+	}
+	a.cancelRequestedOn = c.session.CurrentTurnID
+	a.flash("Stopping active turn…", false)
+	id := c.id
+	return call(func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, a.api.Cancel(ctx, id)
+	}, func(_ struct{}, err error) tea.Msg {
+		return doneMsg{err: err, resync: true}
+	})
+}
+
+func (a *app) execShell() tea.Cmd {
+	if a.conv == nil {
+		a.flash("Attach to a session first (/sessions)", true)
+		return nil
+	}
+	s := a.conv.session
+	if !s.ArchivedAt.IsZero() || s.MachineStatus == wire.MachineStatusArchived {
+		a.flash("Archived session has no workspace VM", true)
+		return nil
+	}
+	cmd := &shell.Command{Client: a.api, Session: s}
+	return tea.Exec(cmd, func(err error) tea.Msg { return execDoneMsg{kind: "shell", err: err} })
+}
+
+func (a *app) execLogin() tea.Cmd {
+	if a.conv == nil {
+		a.flash("Attach to a session first (/sessions)", true)
+		return nil
+	}
+	s := a.conv.session
+	if !s.ArchivedAt.IsZero() || s.MachineStatus == wire.MachineStatusArchived {
+		a.flash("Archived session has no workspace VM", true)
+		return nil
+	}
+	agentID := s.HarnessID()
+	loginCmd := shell.DefaultLoginCommand(agentID)
+	for _, ag := range a.agents {
+		if strings.EqualFold(ag.ID, agentID) && ag.LoginCommand != "" {
+			loginCmd = ag.LoginCommand
+			break
+		}
+	}
+	cmd := &shell.LoginCommand{
+		Client:       a.api,
+		Session:      s,
+		AgentID:      agentID,
+		LoginCommand: loginCmd,
+	}
+	return tea.Exec(cmd, func(err error) tea.Msg { return execDoneMsg{kind: "login", err: err} })
+}
+
+func (a *app) continueCurrentSession() tea.Cmd {
+	if a.conv == nil {
+		a.flash("Attach to a session first (/sessions)", true)
+		return nil
+	}
+	s := a.conv.session
+	return call(func(ctx context.Context) (*wire.Session, error) {
+		res, err := a.api.ContinueSession(ctx, s.SessionID, api.ContinueSessionRequest{})
+		if err != nil {
+			return nil, err
+		}
+		return &res.Session, nil
+	}, func(ns *wire.Session, err error) tea.Msg {
+		return createdMsg{session: ns, err: err}
+	})
+}
+
+func (a *app) openLatestMedia() tea.Cmd {
+	if a.conv == nil {
+		a.flash("Attach to a session first", true)
+		return nil
+	}
+	pics := a.conv.pictures()
+	if len(pics) == 0 {
+		a.flash("No screenshots or attached images in this session", false)
+		return nil
+	}
+	last := pics[len(pics)-1]
+	id := a.conv.id
+	return call(func(ctx context.Context) (string, error) {
+		if last.mediaID != "" {
+			return a.api.MediaURL(ctx, id, last.mediaID)
+		}
+		return a.api.ScreenshotURL(ctx, id, last.shot)
+	}, func(u string, err error) tea.Msg {
+		if err != nil {
+			return doneMsg{err: err}
+		}
+		_ = OpenURL(u)
+		return doneMsg{say: "Opened " + last.name}
+	})
+}
+
+func (a *app) cycleWork() {
+	next := (a.prefs.Work + 1) % 3
+	a.prefs, _ = prefs.Update(func(p *prefs.Prefs) { p.Work = next })
+	a.flash("Tool output: "+next.String(), false)
 }
 
 func (a *app) list() tea.Cmd {
@@ -311,45 +1238,10 @@ func (a *app) list() tea.Cmd {
 		return nil
 	}
 	a.listing = true
-	return call(a.api.Sessions, func(s []wire.Session, err error) tea.Msg { return sessionsMsg{s, err} })
+	return call(a.api.Sessions, func(list []wire.Session, err error) tea.Msg { return sessionsMsg{list, err} })
 }
 
-func (a *app) loadAccount() tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		projects, err := a.api.Projects(ctx)
-		if err != nil {
-			return accountMsg{err: err}
-		}
-		providers, err := a.api.Providers(ctx)
-		return accountMsg{projects, providers, err}
-	}
-}
-
-// loadSessionRepos reads which repositories a session's Git credentials reach.
-func (a *app) loadSessionRepos(id string) tea.Cmd {
-	if _, ok := a.sessionRepos[id]; !ok {
-		a.sessionRepos[id] = nil // asked
-	}
-	return call(func(ctx context.Context) ([]wire.SessionGitRepository, error) {
-		return a.api.SessionRepositories(ctx, id)
-	},
-		func(r []wire.SessionGitRepository, err error) tea.Msg { return sessionReposMsg{id, r, err} })
-}
-
-func (a *app) loadCatalog(provider string) tea.Cmd {
-	if provider == "" || a.catalogs[provider] != nil {
-		return nil
-	}
-	return call(func(ctx context.Context) (*api.Models, error) { return a.api.Models(ctx, provider) },
-		func(m *api.Models, err error) tea.Msg { return catalogMsg{provider, m, err} })
-}
-
-// sync reads the open session from its cursors. A sync already on its way
-// is followed by another, so no hint is lost.
-func (a *app) sync() tea.Cmd {
-	c := a.conv
+func (a *app) syncConv(c *conversation) tea.Cmd {
 	if c == nil {
 		return nil
 	}
@@ -358,9 +1250,10 @@ func (a *app) sync() tea.Cmd {
 		return nil
 	}
 	c.syncing = true
-	id, initial, after, event := c.id, !c.initialized, c.afterTranscript, c.afterEvent
-	return call(func(ctx context.Context) (*api.Sync, error) { return a.api.Sync(ctx, id, initial, after, event) },
-		func(d *api.Sync, err error) tea.Msg { return syncMsg{id, d, err} })
+	id, initial, afterT, afterE := c.id, !c.initialized, c.afterTranscript, c.afterEvent
+	return call(func(ctx context.Context) (*api.Sync, error) {
+		return a.api.Sync(ctx, id, initial, afterT, afterE)
+	}, func(d *api.Sync, err error) tea.Msg { return syncMsg{id, d, err} })
 }
 
 func (a *app) loadOlder() tea.Cmd {
@@ -370,787 +1263,95 @@ func (a *app) loadOlder() tea.Cmd {
 	}
 	c.loadingOlder = true
 	id, before := c.id, c.before
-	return call(func(ctx context.Context) (*api.Older, error) { return a.api.TranscriptBefore(ctx, id, before) },
-		func(d *api.Older, err error) tea.Msg { return olderMsg{id, d, err} })
+	return call(func(ctx context.Context) (*api.Older, error) {
+		return a.api.TranscriptBefore(ctx, id, before)
+	}, func(d *api.Older, err error) tea.Msg { return olderMsg{id, d, err} })
 }
 
-// fetchPictures starts loading every picture in the conversation that is
-// not loaded yet.
-func (a *app) fetchPictures() tea.Cmd {
-	if a.conv == nil {
-		return nil
-	}
-	var cmds []tea.Cmd
-	id := a.conv.id
-	for _, ref := range a.conv.pictures() {
-		if a.pics[ref.key] != nil || a.picLoading[ref.key] || a.picErr[ref.key] != "" {
-			continue
-		}
-		a.picLoading[ref.key] = true
-		ref := ref
-		cmds = append(cmds, call(func(ctx context.Context) (*Picture, error) {
-			var link string
-			var err error
-			if ref.mediaID != "" {
-				link, err = a.api.MediaURL(ctx, id, ref.mediaID)
-			} else {
-				link, err = a.api.ScreenshotURL(ctx, id, ref.shot)
-			}
-			if err != nil {
-				return nil, err
-			}
-			data, err := a.api.Fetch(ctx, link)
-			if err != nil {
-				return nil, err
-			}
-			return NewPicture(ref.name, data)
-		}, func(p *Picture, err error) tea.Msg { return pictureMsg{ref.key, p, err} }))
-	}
-	return tea.Batch(cmds...)
+func (a *app) loadAgents() tea.Cmd {
+	return call(a.api.Agents, func(res *wire.AgentsResponse, err error) tea.Msg { return agentsMsg{res, err} })
+}
+
+func (a *app) loadProjects() tea.Cmd {
+	return call(a.api.Projects, func(ps []wire.Project, err error) tea.Msg { return projectsMsg{ps, err} })
+}
+
+func (a *app) loadRepos() tea.Cmd {
+	return call(a.api.Repositories, func(rs []api.Repository, err error) tea.Msg { return reposMsg{rs, err} })
+}
+
+func (a *app) loadSessionRepos(id string) tea.Cmd {
+	return call(func(ctx context.Context) ([]wire.SessionGitRepository, error) {
+		return a.api.SessionRepositories(ctx, id)
+	}, func(rs []wire.SessionGitRepository, err error) tea.Msg { return sessionReposMsg{id, rs, err} })
+}
+
+func (a *app) loadEnv(owner api.EnvironmentOwner) tea.Cmd {
+	return call(func(ctx context.Context) (*wire.EnvironmentView, error) {
+		return a.api.Environment(ctx, owner)
+	}, func(v *wire.EnvironmentView, err error) tea.Msg {
+		return envLoadedMsg{key: owner.Kind + "/" + owner.ID, view: v, err: err}
+	})
 }
 
 func (a *app) loadUsage() tea.Cmd {
-	if a.days == 0 {
-		a.days = 30
+	days := a.usageDays
+	tz := time.Local.String()
+	if tz == "Local" {
+		tz = "UTC"
 	}
-	days := a.days
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		zone := time.Local.String()
-		if zone == "Local" {
-			zone = "UTC"
+		rep, err := a.api.Usage(ctx, days, tz)
+		if err != nil {
+			return usageMsg{err: err}
 		}
-		var m usageMsg
-		m.report, m.err = a.api.Usage(ctx, days, zone)
-		if m.err != nil {
-			return m
+		ws, err := a.api.WorkspaceUsage(ctx, days, tz)
+		if err != nil {
+			return usageMsg{err: err}
 		}
-		if m.workspace, m.err = a.api.WorkspaceUsage(ctx, days, zone); m.err != nil {
-			return m
-		}
-		m.balance, m.err = a.api.Billing(ctx)
-		return m
+		bal, _ := a.api.Billing(ctx)
+		return usageMsg{report: rep, workspace: ws, balance: bal}
 	}
+}
+
+func (a *app) loadBilling() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		bal, err := a.api.Billing(ctx)
+		if err != nil {
+			return billingMsg{err: err}
+		}
+		hist, _ := a.api.BillingHistory(ctx, "")
+		var entries []wire.BillingEntry
+		if hist != nil {
+			entries = hist.Entries
+		}
+		return billingMsg{balance: bal, history: entries}
+	}
+}
+
+func (a *app) loadAccountInfo() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		gh, err := a.api.GitHub(ctx)
+		if err != nil {
+			return accountInfoMsg{err: err}
+		}
+		id, _ := a.api.GitSettings(ctx)
+		return accountInfoMsg{github: gh, identity: id}
+	}
+}
+
+func (a *app) flash(msg string, bad bool) {
+	a.toast, a.toastBad, a.toastAt = msg, bad, a.now
 }
 
 func randomID(prefix string, n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
-	return prefix + fmt.Sprintf("%x", b)
-}
-
-// ---------------------------------------------------------------- update
-
-func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		a.w, a.h = msg.Width, msg.Height
-	case tickMsg:
-		a.now = time.Time(msg)
-		a.frame++
-		cmds := []tea.Cmd{tick(), a.report(), a.drawMast()}
-		if t := Transmissions(); t != "" && a.frame > 2 { // images sent before the alt screen are lost
-			cmds = append(cmds, tea.Raw(t))
-		}
-		if a.notice != "" {
-			cmds = append(cmds, tea.Raw(ansi.Notify(a.notice)))
-			a.notice = ""
-		}
-		return a, tea.Batch(cmds...)
-	case onlineMsg:
-		if errors.Is(msg.err, api.ErrSignedOut) {
-			return a, a.signedOut()
-		}
-		a.online = msg.online
-		if msg.online {
-			// Hints sent while the socket was away are lost: catch up.
-			return a, tea.Batch(a.list(), a.sync())
-		}
-	case dirtyMsg:
-		// The open session's list entry comes with its sync; any other
-		// changed summary reloads the list, as the web app does.
-		var cmds []tea.Cmd
-		if a.conv != nil && slices.Contains(msg.Sessions, a.conv.id) {
-			cmds = append(cmds, a.sync())
-		}
-		if slices.ContainsFunc(msg.Summaries, func(id string) bool { return a.conv == nil || id != a.conv.id }) {
-			cmds = append(cmds, a.list())
-		}
-		return a, tea.Batch(cmds...)
-	case sessionsMsg:
-		a.listing = false
-		var cmd tea.Cmd
-		if a.relist {
-			a.relist = false
-			cmd = a.list()
-		}
-		if msg.err != nil {
-			return a, tea.Batch(cmd, a.fail("Could not load sessions", msg.err))
-		}
-		a.setSessions(msg.sessions)
-		return a, cmd
-	case accountMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not load your account", msg.err)
-		}
-		a.projects, a.providers = msg.projects, msg.providers
-		a.reloadMenu()
-	case loadedMsg:
-		if msg.err != nil {
-			return a, a.fail(msg.what, msg.err)
-		}
-		cmd := msg.apply(a)
-		a.reloadMenu()
-		return a, cmd
-	case shellMsg:
-		if msg.err != nil {
-			return a, a.fail("The shell ended", msg.err)
-		}
-		return a, tea.Batch(a.sync(), a.list())
-	case signInMsg:
-		return a, a.signInStep(msg)
-	case githubMsg:
-		return a, a.githubStep(msg)
-	case paidMsg:
-		return a, a.paymentStep(msg)
-	case catalogMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not load models", msg.err)
-		}
-		a.catalogs[msg.provider] = msg.models
-		if a.start != nil {
-			a.start.settle(a)
-		}
-		a.reloadMenu()
-	case reposMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not list repositories", msg.err)
-		}
-		a.repos = msg.repos
-		a.reloadMenu()
-	case reposChangedMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not change the repositories", msg.err)
-		}
-		a.say(msg.say)
-		return a, a.loadSessionRepos(msg.id)
-	case instructionsMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not read the agent's instructions", msg.err)
-		}
-		a.instructions[msg.id] = msg.w
-		a.reloadMenu()
-	case sessionReposMsg:
-		if msg.err != nil {
-			delete(a.sessionRepos, msg.id) // ask again at the next sync
-			return a, nil
-		}
-		a.sessionRepos[msg.id] = msg.repos
-		a.reloadMenu()
-	case syncMsg:
-		return a, a.synced(msg)
-	case olderMsg:
-		if a.conv == nil || a.conv.id != msg.id {
-			return a, nil
-		}
-		a.conv.loadingOlder = false
-		if msg.err != nil {
-			return a, a.fail("Could not load earlier messages", msg.err)
-		}
-		a.conv.applyOlder(msg.data)
-		return a, a.fetchPictures()
-	case sentMsg:
-		if msg.err != nil {
-			// The message goes back in the box, unless you have started another.
-			if a.conv != nil && a.conv.id == msg.id {
-				a.conv.sending = slices.DeleteFunc(a.conv.sending, func(p api.PendingMessage) bool { return p.RequestID == msg.requestID })
-				a.conv.changed()
-				if a.comp.Value() == "" && len(a.attach) == 0 {
-					a.comp.Insert(msg.text)
-					a.attach = msg.attach
-				}
-			}
-			return a, a.fail("Your message was not sent", msg.err)
-		}
-		return a, tea.Batch(a.sync(), a.list())
-	case createdMsg:
-		if msg.session == nil {
-			if a.start != nil {
-				a.start.busy = false
-			}
-			return a, a.fail("Could not start the session", msg.err)
-		}
-		a.start = nil
-		a.replaceSession(*msg.session)
-		cmds := []tea.Cmd{a.open(msg.session.SessionID), a.list()}
-		if msg.err != nil { // the session started, its first message did not
-			a.comp.Insert(msg.prompt)
-			cmds = append(cmds, a.fail("Your message was not sent", msg.err))
-		}
-		return a, tea.Batch(cmds...)
-	case pictureMsg:
-		delete(a.picLoading, msg.key)
-		if msg.err != nil {
-			a.picErr[msg.key] = msg.err.Error()
-			return a, nil
-		}
-		a.pics[msg.key] = msg.pic
-	case sharedMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not share", msg.err)
-		}
-		a.say("Link copied — it works until " + msg.share.ExpiresAt.Local().Format("2 Jan 15:04"))
-		return a, tea.SetClipboard(msg.share.URL)
-	case signOutMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not sign out", msg.err)
-		}
-		a.farewell = "Signed out."
-		return a, tea.Quit
-	case usageMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not load usage", msg.err)
-		}
-		a.usage, a.workspace, a.balance = msg.report, msg.workspace, msg.balance
-	case clipboardMsg:
-		if msg.err != nil {
-			a.note = msg.err.Error()
-			return a, nil
-		}
-		before := a.draft()
-		a.attachImage("pasted.png", msg.data)
-		return a, a.drafting(before)
-	case latestMsg:
-		if msg.err == nil { // offline: ask again next time
-			a.setPrefs(func(p *prefs.Prefs) { p.Latest, p.LatestCheckedAt = msg.tag, a.now })
-		}
-	case mastMsg:
-		a.mastBusy = false
-		a.mast, a.mastKey = msg.p, msg.key
-	case doneMsg:
-		var cmds []tea.Cmd
-		if msg.err != nil {
-			return a, a.fail(msg.say, msg.err)
-		}
-		if msg.say != "" {
-			a.say(msg.say)
-		}
-		if msg.session != nil && a.conv != nil && a.conv.id == msg.session.SessionID {
-			a.conv.session = *msg.session
-			a.conv.changed()
-			a.replaceSession(*msg.session)
-		}
-		if msg.relist {
-			cmds = append(cmds, a.list())
-		}
-		if msg.resync {
-			cmds = append(cmds, a.sync())
-		}
-		if msg.open != "" {
-			a.openSession(msg.open)
-			cmds = append(cmds, a.sync())
-		}
-		if msg.account {
-			cmds = append(cmds, a.loadAccount())
-		}
-		return a, tea.Batch(cmds...)
-	case projectMadeMsg:
-		a.projects = append(a.projects, *msg.p)
-		a.showProject(msg.p.ProjectID)
-		a.say("Made " + msg.p.Name + ": set its agent and repositories in the menu")
-		return a, a.loadAccount()
-	case envMsg:
-		if msg.err != nil {
-			delete(a.envs, msg.key) // read it afresh
-			return a, a.fail("Could not change the environment", msg.err)
-		}
-		a.envs[msg.key] = msg.v
-		if msg.say != "" {
-			a.say(msg.say)
-		}
-		a.reloadMenu()
-	case branchesMsg:
-		if msg.err != nil {
-			return a, a.fail("Could not list the branches", msg.err)
-		}
-		a.branches[msg.key] = msg.b
-		a.reloadMenu()
-	case tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
-		return a, a.mouse(msg.(tea.MouseMsg))
-	case tea.MouseWheelMsg:
-		a.span = nil
-		if a.screen == screenChat && a.menu == nil {
-			if msg.Button == tea.MouseWheelUp {
-				return a, a.scrollBy(3)
-			}
-			return a, a.scrollBy(-3)
-		}
-	case tea.PasteMsg:
-		before := a.draft()
-		switch {
-		case a.menu != nil:
-			if a.menu.edit != nil {
-				a.menu.edit.Insert(msg.Content)
-			} else {
-				a.menu.q.Insert(msg.Content)
-			}
-		case a.start != nil && a.start.field == fieldName:
-			a.start.name.Insert(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(msg.Content)) // a name is one line
-		case a.start != nil:
-			a.start.task.Insert(msg.Content)
-		case a.filter != nil:
-			a.filter.Insert(msg.Content)
-		case a.screen == screenChat:
-			a.paste(msg.Content)
-		}
-		return a, a.drafting(before)
-	case tea.KeyPressMsg:
-		a.span = nil
-		before := a.draft()
-		cmd := a.key(msg)
-		return a, tea.Batch(cmd, a.drafting(before))
-	}
-	return a, nil
-}
-
-// draft is what the open session's composer holds: its text and attachments.
-func (a *app) draft() string {
-	if a.conv == nil {
-		return ""
-	}
-	d := a.conv.id + "\x00" + a.comp.Value()
-	for _, at := range a.attach {
-		d += "\x00" + at.name
-	}
-	return d
-}
-
-// drafting reports activity when a key or a paste changed the open
-// session's draft: writing a message keeps its computer awake, as typing in
-// its terminal does and as on the web. At most once a minute; an asleep
-// computer stays asleep until the message is sent.
-func (a *app) drafting(before string) tea.Cmd {
-	c := a.conv
-	if c == nil || a.screen != screenChat || a.draft() == before || a.comp.Value() == "" && len(a.attach) == 0 {
-		return nil
-	}
-	s := c.session
-	if s.MachineStatus != wire.MachineStatusHydrated || !s.ArchivedAt.IsZero() || a.now.Sub(a.activityAt[s.SessionID]) < time.Minute {
-		return nil
-	}
-	a.activityAt[s.SessionID] = a.now
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = a.api.Activity(ctx, s.SessionID) // a missed report costs at most a nap
-		return nil
-	}
-}
-
-// synced takes a sync page in: the conversation, its session on the list,
-// what you have now seen, and its pictures.
-func (a *app) synced(msg syncMsg) tea.Cmd {
-	c := a.conv
-	if c == nil || c.id != msg.id {
-		return nil
-	}
-	c.syncing = false
-	if msg.err != nil {
-		if api.IsCode(msg.err, "not_found") || isStatus(msg.err, 404) {
-			a.conv, a.screen, a.menu = nil, screenHome, nil
-			return tea.Batch(a.fail("That session is gone", msg.err), a.list())
-		}
-		return a.fail("Could not sync the session", msg.err)
-	}
-	beforeT, beforeE := c.afterTranscript, c.afterEvent
-	more := c.applySync(msg.data)
-	advanced := c.afterTranscript != beforeT || c.afterEvent != beforeE
-	if more && advanced || c.resync {
-		c.resync = false
-		c.syncing = true
-		id, after, event := c.id, c.afterTranscript, c.afterEvent
-		next := call(func(ctx context.Context) (*api.Sync, error) { return a.api.Sync(ctx, id, false, after, event) },
-			func(d *api.Sync, err error) tea.Msg { return syncMsg{id, d, err} })
-		a.replaceSession(c.session)
-		a.markReviewed()
-		return tea.Batch(next, a.fetchPictures())
-	}
-	a.replaceSession(c.session)
-	a.markReviewed()
-	var cmds []tea.Cmd
-	if _, ok := a.sessionRepos[c.id]; !ok {
-		cmds = append(cmds, a.loadSessionRepos(c.id))
-	}
-	if a.cancelRequestedOn != "" && a.cancelRequestedOn != c.session.CurrentTurnID {
-		a.cancelRequestedOn = ""
-	}
-	return tea.Batch(append(cmds, a.fetchPictures())...)
-}
-
-func isStatus(err error, status int) bool {
-	var e *api.Error
-	return errors.As(err, &e) && e.Status == status
-}
-
-// setSessions takes a fresh list. The open session keeps whichever copy is
-// newer: the list and a sync can pass each other.
-func (a *app) setSessions(list []wire.Session) {
-	var keep, ended, archived []wire.Session
-	for _, s := range list {
-		if s.MachineStatus == wire.MachineStatusDeleting {
-			continue
-		}
-		if !s.ArchivedAt.IsZero() {
-			archived = append(archived, s)
-			continue
-		}
-		if a.conv != nil && s.SessionID == a.conv.id && a.conv.session.UpdatedAt.After(s.UpdatedAt) {
-			s = a.conv.session
-		}
-		if prev, ok := a.session(s.SessionID); ok && a.endedUnseen(prev, s) {
-			ended = append(ended, s)
-		}
-		keep = append(keep, s)
-	}
-	a.sessions, a.archived = keep, archived
-	a.prefs.Reviewed = prefs.Load().Reviewed // the commands may have marked some read
-	a.announce(ended)
-	if !a.listed {
-		a.listed = true
-		if a.prefs.Reviewed == nil { // a first run has read everything so far, as the web app assumes
-			a.markRead(keep)
-		}
-		if o := a.order(); len(o) > 0 && a.sel == "" {
-			a.sel = o[0].SessionID
-		}
-	}
-}
-
-func (a *app) replaceSession(s wire.Session) {
-	for i := range a.sessions {
-		if a.sessions[i].SessionID == s.SessionID {
-			if a.endedUnseen(a.sessions[i], s) {
-				a.announce([]wire.Session{s})
-			}
-			a.sessions[i] = s
-			return
-		}
-	}
-	if s.ArchivedAt.IsZero() {
-		a.sessions = append(a.sessions, s)
-	}
-}
-
-// endedUnseen reports whether a session's turn ended between two copies
-// of it, out of your sight: not the conversation on screen.
-func (a *app) endedUnseen(prev, next wire.Session) bool {
-	watching := a.screen == screenChat && a.conv != nil && a.conv.id == next.SessionID
-	return a.listed && !watching && next.LatestTerminalTurnID != "" && next.LatestTerminalTurnID != prev.LatestTerminalTurnID
-}
-
-// announce says briefly, in the footer, that sessions finished a turn, and
-// unless you silenced it, with a desktop notification (OSC 9).
-func (a *app) announce(ended []wire.Session) {
-	var text string
-	switch len(ended) {
-	case 0:
-		return
-	case 1:
-		s := ended[0]
-		word := map[wire.TurnStatus]string{wire.TurnStatusFailed: " failed", wire.TurnStatusCancelled: " stopped"}[s.LatestTerminalTurnStatus]
-		if word == "" {
-			word = " is done"
-		}
-		text = sessionName(s) + word
-	default:
-		text = fmt.Sprintf("%d sessions finished", len(ended))
-	}
-	a.say(text)
-	a.toastBad = len(ended) == 1 && ended[0].LatestTerminalTurnStatus == wire.TurnStatusFailed
-	if !a.prefs.Silent {
-		a.notice = "Barad: " + text
-	}
-}
-
-func (a *app) session(id string) (wire.Session, bool) {
-	for _, s := range append(a.sessions, a.archived...) {
-		if s.SessionID == id {
-			return s, true
-		}
-	}
-	return wire.Session{}, false
-}
-
-// markReviewed records that you have seen the open session's newest turn.
-func (a *app) markReviewed() {
-	if a.screen == screenHome || a.conv == nil {
-		return
-	}
-	s := a.conv.session
-	if s.LatestTerminalTurnID != "" && a.prefs.Reviewed[s.SessionID] != s.LatestTerminalTurnID {
-		a.markRead([]wire.Session{s})
-	}
-}
-
-func (a *app) openSession(id string) {
-	s, ok := a.session(id)
-	if !ok {
-		s = wire.Session{SessionID: id}
-	}
-	if a.conv == nil || a.conv.id != id {
-		a.conv = newConversation(s)
-		a.comp.Reset()
-		a.attach, a.note = nil, ""
-	}
-	a.screen, a.scroll, a.sel = screenChat, 0, id
-	a.markReviewed()
-}
-
-func (a *app) say(s string) { a.toast, a.toastBad, a.toastAt = s, false, a.now }
-
-// fail reports an error in the footer, or quits when you are signed out.
-func (a *app) fail(what string, err error) tea.Cmd {
-	if errors.Is(err, api.ErrSignedOut) {
-		return a.signedOut()
-	}
-	a.toast, a.toastBad, a.toastAt = what+": "+err.Error(), true, a.now
-	return nil
-}
-
-func (a *app) signedOut() tea.Cmd {
-	a.exit = errors.New("you are signed out; run `barad login`")
-	return tea.Quit
-}
-
-// ---------------------------------------------------------------- derived state
-
-var groupLabel = map[api.Group]string{api.NeedsYou: "NEEDS YOU", api.Running: "RUNNING", api.Resting: "RESTING"}
-
-// standing is a session's state on the list. A message you are sending
-// holds it as working.
-func (a *app) standing(s wire.Session) api.Standing {
-	held := a.conv != nil && a.conv.id == s.SessionID && len(a.conv.sending)+len(a.conv.pending) > 0
-	return api.StandingOf(s, a.prefs.Reviewed[s.SessionID], held)
-}
-
-// activityAt is when a session last did something you would notice.
-func activityAt(s wire.Session) time.Time {
-	t := s.CreatedAt
-	if s.LatestTerminalTurnAt.After(t) {
-		t = s.LatestTerminalTurnAt
-	}
-	if s.LatestUserPromptAt.After(t) {
-		t = s.LatestUserPromptAt
-	}
-	return t
-}
-
-func projectOf(s wire.Session) string {
-	if s.ProjectID == "" {
-		return wire.DefaultProjectID
-	}
-	return s.ProjectID
-}
-
-// projectID is the project the home screen shows: the one you chose, or
-// until you choose, the one you were last busy in.
-func (a *app) projectID() string {
-	want := a.prefs.Project
-	if want == "" {
-		var newest wire.Session
-		for _, s := range a.sessions {
-			if activityAt(s).After(activityAt(newest)) {
-				newest = s
-			}
-		}
-		want = projectOf(newest)
-	}
-	for _, p := range a.projects {
-		if p.ProjectID == want {
-			return p.ProjectID
-		}
-	}
-	return wire.DefaultProjectID
-}
-
-func (a *app) projectName(id string) string {
-	for _, p := range a.projects {
-		if p.ProjectID == id {
-			return p.Name
-		}
-	}
-	return wire.DefaultProjectName
-}
-
-// order is the home list: the current project's sessions, what needs you
-// first, then what is running, then the rest, each most recent first.
-// order is the sessions the home screen lists: the project's, or with
-// tab the archived ones. A search looks across every project, by name or ID.
-func (a *app) order() []wire.Session {
-	var out []wire.Session
-	list, project, q := a.sessions, a.projectID(), ""
-	if a.shelf {
-		list = a.archived
-	}
-	if a.filter != nil {
-		q = strings.TrimSpace(a.filter.Value())
-	}
-	for _, s := range list {
-		if q == "" && projectOf(s) != project {
-			continue
-		}
-		if q != "" && !Fuzzy(q, sessionName(s)) && !strings.HasPrefix(s.SessionID, q) {
-			continue
-		}
-		out = append(out, s)
-	}
-	if a.shelf {
-		sort.SliceStable(out, func(i, j int) bool { return out[i].ArchivedAt.After(out[j].ArchivedAt) })
-		return out
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		gi, gj := a.standing(out[i]).Group, a.standing(out[j]).Group
-		if gi != gj {
-			return gi < gj
-		}
-		return activityAt(out[i]).After(activityAt(out[j]))
-	})
-	return out
-}
-
-// elsewhere counts the sessions in other projects that need you.
-func (a *app) elsewhere() int {
-	n, project := 0, a.projectID()
-	for _, s := range a.sessions {
-		if projectOf(s) != project && a.standing(s).Group == api.NeedsYou {
-			n++
-		}
-	}
-	return n
-}
-
-func (a *app) count(g api.Group) int {
-	n, project := 0, a.projectID()
-	for _, s := range a.sessions {
-		if projectOf(s) == project && a.standing(s).Group == g {
-			n++
-		}
-	}
-	return n
-}
-
-// countAll counts the sessions of every project in a group.
-func (a *app) countAll(g api.Group) int {
-	n := 0
-	for _, s := range a.sessions {
-		if a.standing(s).Group == g {
-			n++
-		}
-	}
-	return n
-}
-
-func sessionName(s wire.Session) string {
-	if strings.TrimSpace(s.Name) != "" {
-		return s.Name
-	}
-	return "Untitled session"
-}
-
-// ---------------------------------------------------------------- prefs
-
-// setPrefs changes the preferences as they are on disk (the commands may
-// have changed them since), and keeps the result.
-func (a *app) setPrefs(change func(p *prefs.Prefs)) {
-	next, err := prefs.Update(change)
-	if err != nil {
-		change(&a.prefs) // not saved, but in effect while the app runs
-		return
-	}
-	if t := os.Getenv("BARAD_THEME"); t == "night" || t == "paper" {
-		next.Theme = a.prefs.Theme
-	}
-	a.prefs = next
-}
-
-// markRead records that you have seen these sessions' newest turns.
-func (a *app) markRead(list []wire.Session) {
-	a.setPrefs(func(p *prefs.Prefs) { p.Read(list) })
-}
-
-// showProject makes the home screen list a project's sessions.
-func (a *app) showProject(id string) {
-	a.setPrefs(func(p *prefs.Prefs) { p.Project = id })
-	a.sel = ""
-}
-
-func (a *app) cycleWork() {
-	a.setPrefs(func(p *prefs.Prefs) { p.Work = (p.Work + 1) % 3 })
-}
-
-func (a *app) toggleTheme() {
-	theme := map[string]string{"night": "paper", "paper": "night"}[a.prefs.Theme]
-	a.setPrefs(func(p *prefs.Prefs) { p.Theme = theme })
-	a.prefs.Theme = theme // even when BARAD_THEME chose the first
-	applyTheme(a.prefs.Theme)
-	clear(a.md)
-}
-
-// ---------------------------------------------------------------- program status (OSC 7501)
-
-// report tells a terminal that shows program status (rex) what each session
-// is doing, sending only what changed.
-func (a *app) report() tea.Cmd {
-	var b strings.Builder
-	for _, s := range a.sessions {
-		st := a.standing(s)
-		r := ansi.ProgramStatus{ID: "barad/" + s.SessionID, App: "barad", Title: sessionName(s), State: ansi.ProgramStateIdle, Message: st.Word}
-		switch st.Word {
-		case "working", "waking":
-			r.State = ansi.ProgramStateWorking
-		case "failed":
-			r.State = ansi.ProgramStateError
-		case "ready":
-			r.State = ansi.ProgramStateDone
-		}
-		seq := ansi.SetProgramStatus(r)
-		if a.reported[s.SessionID] != seq {
-			a.reported[s.SessionID] = seq
-			b.WriteString(seq)
-		}
-	}
-	if b.Len() == 0 {
-		return nil
-	}
-	return tea.Raw(b.String())
-}
-
-// ---------------------------------------------------------------- the cover
-
-// mastRows is how tall the landscape is, by the window's height.
-func (a *app) mastRows() int {
-	switch {
-	case a.h >= 44:
-		return 9
-	case a.h >= 30:
-		return 6
-	}
-	return 0
-}
-
-// drawMast starts drawing the landscape off the update loop when the window
-// or theme has changed.
-func (a *app) drawMast() tea.Cmd {
-	key := fmt.Sprintf("%s/%dx%d", a.prefs.Theme, a.w, a.mastRows())
-	if a.frame < 3 || a.mastRows() == 0 || key == a.mastKey || a.mastBusy {
-		return nil
-	}
-	a.mastBusy = true
-	theme, w, rows, g := a.prefs.Theme, a.w, a.mastRows(), a.gfx
-	return func() tea.Msg {
-		p := landscape(theme, w, rows, g)
-		p.Lines(w, g) // lay it out (and queue its upload) here, not in View
-		return mastMsg{key, p}
-	}
+	return prefix + hex.EncodeToString(b)
 }

@@ -81,17 +81,17 @@ func contains(t *testing.T, out string, want ...string) {
 
 func TestProjectsFromMakingToDeleting(t *testing.T) {
 	b := newBarad(t)
-	contains(t, b.ok("projects"), "NAME", "Acme", "Claude Max · claude-opus-5 · high", "acme/web", "Ops", "chosen per session")
+	contains(t, b.ok("projects"), "NAME", "Acme", "claude / claude-opus-5 / high", "acme/web", "Ops", "chosen per session")
 
-	contains(t, b.ok("projects", "new", "Payments", "--provider", "openai", "--effort", "high", "--repo", "acme/api", "--repo", "acme/web"), "Made Payments")
+	contains(t, b.ok("projects", "new", "Payments", "--agent", "codex", "--effort", "high", "--size", "xl", "--repo", "acme/api", "--repo", "acme/web"), "Made Payments")
 	p := b.project("Payments")
-	if p.Agent == nil || p.Agent.ProviderResourceID != "prov_openai" || p.Agent.Model != "gpt-5.5" || p.Agent.ReasoningEffort != "high" ||
+	if p.Agent == nil || p.Agent.Agent != "codex" || p.Agent.Model != "gpt-5.5" || p.Agent.ReasoningEffort != "high" || p.Agent.Size != "xl" ||
 		len(p.Repositories) != 2 || p.Repositories[0] != (wire.ProjectRepository{SourceID: "src_1", Repository: "acme/api"}) {
 		t.Fatalf("made %+v", p)
 	}
-	b.fails("takes reasoning effort", "projects", "new", "X", "--provider", "openai", "--effort", "turbo")
+	b.fails("takes reasoning effort", "projects", "new", "X", "--agent", "codex", "--effort", "turbo")
 	b.fails("none of your Git sources reaches", "projects", "new", "X", "--repo", "acme/secret")
-	b.fails("--model and --effort need --provider", "projects", "new", "X", "--effort", "high")
+	b.fails("--model, --effort and --size need --agent", "projects", "new", "X", "--effort", "high")
 
 	b.ok("projects", "edit", "payments", "--name", "Billing", "--remove-repo", "acme/web", "--add-repo", "acme/infra", "--effort", "low")
 	p = b.project("Billing")
@@ -151,18 +151,25 @@ func TestStartingWorkingWithAndEndingSessions(t *testing.T) {
 		t.Fatal("the task was not sent")
 	}
 
-	// Named outright, at a branch.
-	out := b.ok("sessions", "new", "--provider", "openai", "--repo", "acme/api@release", "--repo", "acme/infra", "--json")
+	// Named outright, at a branch, with custom v2 harness + fast mode + size.
+	out := b.ok("sessions", "new", "--agent", "codex", "--fast", "--size", "xl", "--repo", "acme/api@release", "--repo", "acme/infra", "--json")
 	var started wire.Session
 	if err := json.Unmarshal([]byte(out), &started); err != nil {
 		t.Fatalf("not JSON: %v\n%s", err, out)
 	}
 	s = b.f.List[len(b.f.List)-1]
 	repos, _ := s.Created["repositories"].([]any)
-	if started.Model != "gpt-5.5" || len(repos) != 2 || repos[0].(map[string]any)["requested_ref"] != "release" {
+	if started.Agent != "codex" || started.Model != "gpt-5.5" || !started.FastMode || started.Size != "xl" || len(repos) != 2 || repos[0].(map[string]any)["requested_ref"] != "release" {
 		t.Fatalf("started %+v from %+v", started, s.Created)
 	}
-	b.fails("has no agent", "sessions", "new", "--project", "ops")
+	// Project without default agent still defaults cleanly to claude in v2.
+	contains(t, b.ok("sessions", "new", "--project", "ops"), "Started")
+
+	// Continue a legacy session into v2.
+	contains(t, b.ok("sessions", "continue", "search", "--agent", "grok", "--name", "Migrated v2"), "Continued into Migrated v2")
+
+	// Non-interactive `barad shell SESSION -- CMD...` passes flags through `--`.
+	contains(t, b.ok("shell", "checkout", "--", "uname", "-a"), "fake-cmd-output")
 
 	// A name, or a random one.
 	contains(t, b.ok("sessions", "new", "--project", "acme", "--name", "  Billing spike  "), "Started Billing spike")

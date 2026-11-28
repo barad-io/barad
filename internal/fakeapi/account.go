@@ -16,10 +16,30 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	jinn "usejinn.com/go"
 
 	"github.com/barad-io/barad/wire"
 )
+
+const (
+	termFrameInput  byte = 1
+	termFrameOutput byte = 2
+	termFrameResize byte = 3
+	termFrameExit   byte = 4
+)
+
+func encodeTermFrame(kind byte, data []byte) []byte {
+	out := make([]byte, 1+len(data))
+	out[0] = kind
+	copy(out[1:], data)
+	return out
+}
+
+func decodeTermFrame(frame []byte) (byte, []byte, error) {
+	if len(frame) == 0 {
+		return 0, nil, fmt.Errorf("empty frame")
+	}
+	return frame[0], frame[1:], nil
+}
 
 // The account's routes, as the fake keeps them: provider connections,
 // source control, billing, and a session's files and terminal.
@@ -391,35 +411,41 @@ func (f *API) relay(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 	ctx := r.Context()
 	send := func(kind byte, data []byte) {
-		_ = conn.Write(ctx, websocket.MessageBinary, jinn.EncodeTerminalFrame(kind, data))
+		_ = conn.Write(ctx, websocket.MessageBinary, encodeTermFrame(kind, data))
 	}
-	send(jinn.FrameOutput, []byte("you@workspace:~$ "))
+	send(termFrameOutput, []byte("you@workspace:~$ "))
 	var line []byte
 	for {
 		_, frame, err := conn.Read(ctx)
 		if err != nil {
 			return
 		}
-		kind, data, err := jinn.DecodeTerminalFrame(frame)
+		kind, data, err := decodeTermFrame(frame)
 		if err != nil {
 			return
 		}
 		switch kind {
-		case jinn.FrameResize:
-			send(jinn.FrameOutput, fmt.Appendf(nil, "[%dx%d]", binary.BigEndian.Uint16(data[2:]), binary.BigEndian.Uint16(data)))
-		case jinn.FrameInput:
+		case termFrameResize:
+			send(termFrameOutput, fmt.Appendf(nil, "[%dx%d]", binary.BigEndian.Uint16(data[2:]), binary.BigEndian.Uint16(data)))
+		case termFrameInput:
 			for _, c := range data {
 				if c != '\r' && c != '\n' {
 					line = append(line, c)
-					send(jinn.FrameOutput, []byte{c})
+					send(termFrameOutput, []byte{c})
 					continue
 				}
-				if string(line) == "exit" {
-					send(jinn.FrameOutput, []byte("\r\nlogout\r\n"))
-					send(jinn.FrameExit, []byte{0, 0, 0, 0})
+				cmd := string(line)
+				if cmd == "exit" || strings.Contains(cmd, "; exit ") || strings.HasSuffix(cmd, "; exit") {
+					if strings.Contains(cmd, "__BARAD_BEGIN_") {
+						// Support non-interactive RunCommand in tests.
+						send(termFrameOutput, []byte("\r\nfake-cmd-output\r\n"))
+					} else {
+						send(termFrameOutput, []byte("\r\nlogout\r\n"))
+					}
+					send(termFrameExit, []byte{0, 0, 0, 0})
 					return
 				}
-				send(jinn.FrameOutput, fmt.Appendf(nil, "\r\nyou said %s\r\nyou@workspace:~$ ", line))
+				send(termFrameOutput, fmt.Appendf(nil, "\r\nyou said %s\r\nyou@workspace:~$ ", line))
 				line = line[:0]
 			}
 		}

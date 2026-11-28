@@ -11,10 +11,9 @@ const (
 	Resting
 )
 
-// Standing is a session's state as the web app's sidebar derives it: one
-// word, and the group it files under.
+// Standing is a session's state: one short phrase, and the group it files under.
 type Standing struct {
-	Word  string // failed, working, waking, ready, asleep, idle or archived
+	Word  string // failed, sign-in required, working, waking, ready, asleep, idle or archived
 	Group Group
 }
 
@@ -23,13 +22,16 @@ type Standing struct {
 func StandingOf(s wire.Session, read string, held bool) Standing {
 	held = held || s.PendingTurn
 	asleep := s.MachineStatus == wire.MachineStatusDehydrated || s.MachineStatus == wire.MachineStatusDehydrating
+	archived := !s.ArchivedAt.IsZero() || s.MachineStatus == wire.MachineStatusArchived || s.MachineStatus == wire.MachineStatusArchiving
 	switch {
-	case !s.ArchivedAt.IsZero():
+	case archived:
 		return Standing{"archived", Resting}
 	case s.MachineStatus == wire.MachineStatusBroken:
 		return Standing{"failed", NeedsYou}
 	case s.CurrentTurnID != "":
 		return Standing{"working", Running}
+	case s.AuthRequired():
+		return Standing{"sign-in required", NeedsYou}
 	case s.MachineStatus == wire.MachineStatusHydrating:
 		return Standing{"waking", Running}
 	case s.MachineStatus == wire.MachineStatusDehydrated && s.PendingTurn:
