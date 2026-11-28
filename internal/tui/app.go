@@ -42,29 +42,37 @@ type app struct {
 	farewell      string
 
 	// Account state.
-	sessions     []wire.Session
-	archived     []wire.Session
-	listed       bool
-	listing      bool
-	relist       bool
-	projects     []wire.Project
-	agents       []wire.AgentSpec
-	sizes        []wire.MachineSize
-	repos        []api.Repository
-	reposLoaded  bool
-	sessionRepos map[string][]wire.SessionGitRepository
-	envs         map[string]*wire.EnvironmentView
-	github       *wire.GitHubAccount
-	identity     *wire.GitSettings
-	usage        *wire.UsageReport
-	workspace    *wire.WorkspaceUsage
-	balance      *wire.BillingAccount
-	history      []wire.BillingEntry
-	usageDays    int
-	usageTab     int
-	wsFiles      map[string][]string
-	online       bool
-	status       statusTracker
+	sessions            []wire.Session
+	archived            []wire.Session
+	listed              bool
+	listing             bool
+	relist              bool
+	projects            []wire.Project
+	projectsLoaded      bool
+	projectsLoading     bool
+	agents              []wire.AgentSpec
+	agentsLoading       bool
+	sizes               []wire.MachineSize
+	repos               []api.Repository
+	reposLoaded         bool
+	reposLoading        bool
+	reposErr            string
+	sessionRepos        map[string][]wire.SessionGitRepository
+	sessionReposLoaded  map[string]bool
+	sessionReposLoading map[string]bool
+	envs                map[string]*wire.EnvironmentView
+	envLoading          map[string]bool
+	github              *wire.GitHubAccount
+	identity            *wire.GitSettings
+	usage               *wire.UsageReport
+	workspace           *wire.WorkspaceUsage
+	balance             *wire.BillingAccount
+	history             []wire.BillingEntry
+	usageDays           int
+	usageTab            int
+	wsFiles             map[string][]string
+	online              bool
+	status              statusTracker
 
 	// Active session + primary-buffer scrollback state.
 	conv              *conversation
@@ -103,16 +111,19 @@ func Run(client *api.Client, opts Options) error {
 
 func newApp(client *api.Client, opts Options) *app {
 	a := &app{
-		api:          client,
-		opts:         opts,
-		w:            100,
-		h:            30,
-		now:          time.Now(),
-		prefs:        prefs.Load(),
-		sessionRepos: map[string][]wire.SessionGitRepository{},
-		envs:         map[string]*wire.EnvironmentView{},
-		wsFiles:      map[string][]string{},
-		usageDays:    30,
+		api:                 client,
+		opts:                opts,
+		w:                   100,
+		h:                   30,
+		now:                 time.Now(),
+		prefs:               prefs.Load(),
+		sessionRepos:        map[string][]wire.SessionGitRepository{},
+		sessionReposLoaded:  map[string]bool{},
+		sessionReposLoading: map[string]bool{},
+		envs:                map[string]*wire.EnvironmentView{},
+		envLoading:          map[string]bool{},
+		wsFiles:             map[string][]string{},
+		usageDays:           30,
 	}
 	applyTheme(resolveTheme(a.prefs.Theme, nil))
 	if opts.SessionQuery == "" && !opts.Resume {
@@ -542,6 +553,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, a.list()
 
 	case agentsMsg:
+		a.agentsLoading = false
 		if msg.err == nil && msg.res != nil {
 			a.agents = msg.res.Agents
 			a.sizes = msg.res.Sizes
@@ -552,8 +564,10 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case projectsMsg:
+		a.projectsLoading = false
 		if msg.err == nil {
 			a.projects = msg.projects
+			a.projectsLoaded = true
 			if lo, ok := a.ov.(*listOverlay); ok && lo.title == "Projects" {
 				a.ov = a.buildProjectsOverlay()
 			}
@@ -561,24 +575,33 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case reposMsg:
-		if msg.err == nil {
+		a.reposLoading = false
+		if msg.err != nil {
+			a.reposErr = msg.err.Error()
+		} else {
 			a.repos = msg.repos
 			a.reposLoaded = true
-			if lo, ok := a.ov.(*listOverlay); ok && strings.HasPrefix(lo.title, "Git repositories") && a.conv != nil {
-				parent := lo.parent
-				next := a.buildReposOverlay(a.conv.session)
-				next.parent = parent
-				a.ov = next
-			}
+			a.reposErr = ""
+		}
+		if lo, ok := a.ov.(*listOverlay); ok && strings.HasPrefix(lo.title, "Git repositories") && a.conv != nil {
+			parent := lo.parent
+			next := a.buildReposOverlay(a.conv.session)
+			next.parent = parent
+			a.ov = next
 		}
 		return a, nil
 
 	case sessionReposMsg:
+		a.sessionReposLoading[msg.id] = false
 		if msg.err == nil {
 			a.sessionRepos[msg.id] = msg.repos
+			a.sessionReposLoaded[msg.id] = true
 			if lo, ok := a.ov.(*listOverlay); ok && a.conv != nil && a.conv.id == msg.id {
 				if strings.HasPrefix(lo.title, "Session settings") {
-					a.ov = a.buildSettingsOverlay(a.conv.session)
+					sel := lo.sel
+					next := a.buildSettingsOverlay(a.conv.session)
+					next.sel = min(sel, max(0, len(next.items)-1))
+					a.ov = next
 				} else if strings.HasPrefix(lo.title, "Git repositories") {
 					parent := lo.parent
 					next := a.buildReposOverlay(a.conv.session)
@@ -590,7 +613,11 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case envLoadedMsg:
+		a.envLoading[msg.key] = false
 		if msg.err != nil {
+			if lo, ok := a.ov.(*listOverlay); ok {
+				lo.loading = ""
+			}
 			a.flash(msg.err.Error(), true)
 			return a, nil
 		}
@@ -600,7 +627,10 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if lo, ok := a.ov.(*listOverlay); ok {
 			if strings.HasPrefix(lo.title, "Session settings") && a.conv != nil {
-				a.ov = a.buildSettingsOverlay(a.conv.session)
+				sel := lo.sel
+				next := a.buildSettingsOverlay(a.conv.session)
+				next.sel = min(sel, max(0, len(next.items)-1))
+				a.ov = next
 			} else if strings.HasPrefix(lo.title, "Session env") || strings.HasPrefix(lo.title, "Project env") {
 				kind, id, _ := strings.Cut(msg.key, "/")
 				parent := lo.parent
@@ -636,6 +666,9 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case filePreviewMsg:
+		if lo, ok := a.ov.(*listOverlay); ok {
+			lo.loading = ""
+		}
 		if msg.err != nil {
 			a.flash(msg.err.Error(), true)
 			return a, nil
@@ -711,6 +744,9 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Println(line)
 
 	case doneMsg:
+		if lo, ok := a.ov.(*listOverlay); ok {
+			lo.loading = ""
+		}
 		if msg.err != nil {
 			a.flash(msg.err.Error(), true)
 			return a, nil
@@ -915,6 +951,12 @@ func (a *app) View() tea.View {
 
 	// 1. Live active/unflushed exchange (streaming text, active tools, spinner).
 	if a.conv != nil {
+		if !a.conv.initialized {
+			sections = append(sections, "", Line{S("  "+Spinner[a.frame%len(Spinner)]+" Loading conversation…", SMuted)}.Paint(nil, 0))
+		}
+		if a.conv.loadingOlder {
+			sections = append(sections, "", Line{S("  "+Spinner[a.frame%len(Spinner)]+" Loading earlier history…", SMuted)}.Paint(nil, 0))
+		}
 		exs := a.conv.exchanges()
 		start := min(a.flushed, len(exs))
 		for i := start; i < len(exs); i++ {
@@ -1274,28 +1316,50 @@ func (a *app) loadOlder() tea.Cmd {
 }
 
 func (a *app) loadAgents() tea.Cmd {
+	if a.agentsLoading {
+		return nil
+	}
+	a.agentsLoading = true
 	return call(a.api.Agents, func(res *wire.AgentsResponse, err error) tea.Msg { return agentsMsg{res, err} })
 }
 
 func (a *app) loadProjects() tea.Cmd {
+	if a.projectsLoading {
+		return nil
+	}
+	a.projectsLoading = true
 	return call(a.api.Projects, func(ps []wire.Project, err error) tea.Msg { return projectsMsg{ps, err} })
 }
 
 func (a *app) loadRepos() tea.Cmd {
+	if a.reposLoading {
+		return nil
+	}
+	a.reposLoading = true
+	a.reposErr = ""
 	return call(a.api.Repositories, func(rs []api.Repository, err error) tea.Msg { return reposMsg{rs, err} })
 }
 
 func (a *app) loadSessionRepos(id string) tea.Cmd {
+	if a.sessionReposLoading[id] {
+		return nil
+	}
+	a.sessionReposLoading[id] = true
 	return call(func(ctx context.Context) ([]wire.SessionGitRepository, error) {
 		return a.api.SessionRepositories(ctx, id)
 	}, func(rs []wire.SessionGitRepository, err error) tea.Msg { return sessionReposMsg{id, rs, err} })
 }
 
 func (a *app) loadEnv(owner api.EnvironmentOwner) tea.Cmd {
+	key := owner.Kind + "/" + owner.ID
+	if a.envLoading[key] {
+		return nil
+	}
+	a.envLoading[key] = true
 	return call(func(ctx context.Context) (*wire.EnvironmentView, error) {
 		return a.api.Environment(ctx, owner)
 	}, func(v *wire.EnvironmentView, err error) tea.Msg {
-		return envLoadedMsg{key: owner.Kind + "/" + owner.ID, view: v, err: err}
+		return envLoadedMsg{key: key, view: v, err: err}
 	})
 }
 

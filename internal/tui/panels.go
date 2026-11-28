@@ -28,6 +28,7 @@ import (
 type listOverlay struct {
 	title    string
 	hint     string
+	loading  string
 	items    []listItem
 	sel      int
 	parent   *listOverlay
@@ -39,10 +40,11 @@ type listOverlay struct {
 }
 
 type listItem struct {
-	label  string
-	value  string
-	danger bool
-	run    func(a *app) tea.Cmd
+	label   string
+	value   string
+	valueFn func(a *app) string
+	danger  bool
+	run     func(a *app) tea.Cmd
 }
 
 type inputPrompt struct {
@@ -189,8 +191,11 @@ func (o *listOverlay) View(a *app, w, maxH int) []Line {
 	if o.headerFn != nil {
 		out = append(out, o.headerFn(a, w)...)
 	}
+	if o.loading != "" {
+		out = append(out, Line{S("  "+Spinner[a.frame%len(Spinner)]+" "+o.loading, SMuted)})
+	}
 	if len(o.items) == 0 {
-		if o.headerFn == nil {
+		if o.headerFn == nil && o.loading == "" {
 			out = append(out, Line{S("  (empty)", SFaint)})
 		}
 	} else {
@@ -214,9 +219,13 @@ func (o *listOverlay) View(a *app, w, maxH int) []Line {
 				}
 			}
 			left := Line{S(pref, SAccent), S(it.label, st)}
-			if it.value != "" {
+			val := it.value
+			if it.valueFn != nil {
+				val = it.valueFn(a)
+			}
+			if val != "" {
 				valW := max(8, w-left.Width()-3)
-				right := Line{S(ansi.Truncate(it.value, valW, "…"), SFaint)}
+				right := Line{S(ansi.Truncate(val, valW, "…"), SFaint)}
 				out = append(out, spread(left, right, w))
 			} else {
 				out = append(out, left)
@@ -249,11 +258,7 @@ func (a *app) buildSettingsOverlay(s wire.Session) *listOverlay {
 			break
 		}
 	}
-	repoCount := fmt.Sprintf("%d connected", len(a.sessionRepos[s.SessionID]))
-	envCount := "—"
-	if ev := a.envs["sessions/"+s.SessionID]; ev != nil {
-		envCount = fmt.Sprintf("%d vars", len(ev.Variables))
-	}
+	envKey := "sessions/" + s.SessionID
 
 	ov := &listOverlay{
 		title: "Session settings · " + sessionTitle(s),
@@ -312,7 +317,16 @@ func (a *app) buildSettingsOverlay(s wire.Session) *listOverlay {
 			return nil
 		}},
 		listItem{label: "Move to project", value: projName, run: func(a *app) tea.Cmd {
-			sub := ov.push(&listOverlay{title: "Move to project", hint: "Enter move · Esc back"})
+			sub := ov.push(&listOverlay{
+				title: "Move to project",
+				hint:  "Enter move · Esc back",
+				headerFn: func(a *app, w int) []Line {
+					if !a.projectsLoaded && a.projectsLoading {
+						return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading projects…", SMuted)}}
+					}
+					return nil
+				},
+			})
 			ps := append([]wire.Project{{ProjectID: wire.DefaultProjectID, Name: wire.DefaultProjectName}}, a.projects...)
 			seen := map[string]bool{}
 			for _, p := range ps {
@@ -335,16 +349,36 @@ func (a *app) buildSettingsOverlay(s wire.Session) *listOverlay {
 				}})
 			}
 			a.ov = sub
-			return nil
-		}},
-		listItem{label: "Git repositories", value: repoCount, run: func(a *app) tea.Cmd {
-			a.ov = ov.push(a.buildReposOverlay(s))
-			if !a.reposLoaded {
-				return a.loadRepos()
+			if !a.projectsLoaded {
+				return a.loadProjects()
 			}
 			return nil
 		}},
-		listItem{label: "Environment & secrets", value: envCount, run: func(a *app) tea.Cmd {
+		listItem{label: "Git repositories", valueFn: func(a *app) string {
+			if !a.sessionReposLoaded[s.SessionID] && a.sessionReposLoading[s.SessionID] {
+				return Spinner[a.frame%len(Spinner)] + " loading…"
+			}
+			return fmt.Sprintf("%d connected", len(a.sessionRepos[s.SessionID]))
+		}, run: func(a *app) tea.Cmd {
+			a.ov = ov.push(a.buildReposOverlay(s))
+			var cmds []tea.Cmd
+			if !a.reposLoaded {
+				cmds = append(cmds, a.loadRepos())
+			}
+			if !a.sessionReposLoaded[s.SessionID] {
+				cmds = append(cmds, a.loadSessionRepos(s.SessionID))
+			}
+			return tea.Batch(cmds...)
+		}},
+		listItem{label: "Environment & secrets", valueFn: func(a *app) string {
+			if ev := a.envs[envKey]; ev != nil {
+				return fmt.Sprintf("%d vars", len(ev.Variables))
+			}
+			if a.envLoading[envKey] {
+				return Spinner[a.frame%len(Spinner)] + " loading…"
+			}
+			return "—"
+		}, run: func(a *app) tea.Cmd {
 			owner := api.EnvironmentOwner{Kind: "sessions", ID: s.SessionID}
 			a.ov = ov.push(a.buildEnvOverlay(owner, "Session env · "+sessionTitle(s)))
 			return a.loadEnv(owner)
@@ -358,6 +392,7 @@ func (a *app) buildSettingsOverlay(s wire.Session) *listOverlay {
 			})
 		}},
 		listItem{label: "Publish share link", value: "read-only page", run: func(a *app) tea.Cmd {
+			ov.loading = "Publishing share link…"
 			return call(func(ctx context.Context) (*api.Share, error) {
 				return a.api.Share(ctx, s.SessionID, "")
 			}, func(sh *api.Share, err error) tea.Msg {
@@ -400,12 +435,28 @@ func (a *app) buildSettingsOverlay(s wire.Session) *listOverlay {
 }
 
 func (a *app) buildReposOverlay(s wire.Session) *listOverlay {
-	sub := &listOverlay{title: "Git repositories · " + sessionTitle(s), hint: "Enter add/remove · Esc back"}
+	sub := &listOverlay{
+		title: "Git repositories · " + sessionTitle(s),
+		hint:  "Enter add/remove · Esc back",
+		headerFn: func(a *app, w int) []Line {
+			if a.reposLoading || a.sessionReposLoading[s.SessionID] {
+				return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading GitHub repositories…", SMuted)}}
+			}
+			if a.reposErr != "" {
+				return []Line{{S("  ✕ Could not load repositories: "+a.reposErr, SDanger)}}
+			}
+			if a.reposLoaded && len(a.sessionRepos[s.SessionID]) == 0 && len(a.repos) == 0 {
+				return []Line{{S("  No GitHub repositories connected. Connect via barad git login.", SFaint)}}
+			}
+			return nil
+		},
+	}
 	have := map[string]wire.SessionGitRepository{}
 	for _, r := range a.sessionRepos[s.SessionID] {
 		have[strings.ToLower(r.CanonicalPath)] = r
 		repo := r
 		sub.items = append(sub.items, listItem{label: "✓ " + r.CanonicalPath, value: "Enter to remove", run: func(a *app) tea.Cmd {
+			sub.loading = "Removing " + repo.CanonicalPath + "…"
 			return call(func(ctx context.Context) (struct{}, error) {
 				return struct{}{}, a.api.RemoveRepository(ctx, s.SessionID, repo)
 			}, func(_ struct{}, err error) tea.Msg {
@@ -419,6 +470,7 @@ func (a *app) buildReposOverlay(s wire.Session) *listOverlay {
 		}
 		repo := r
 		sub.items = append(sub.items, listItem{label: "+ " + r.FullName, value: "Enter to grant", run: func(a *app) tea.Cmd {
+			sub.loading = "Granting " + repo.FullName + "…"
 			return call(func(ctx context.Context) (struct{}, error) {
 				return struct{}{}, a.api.AddRepository(ctx, s.SessionID, repo.SourceID, repo.FullName)
 			}, func(_ struct{}, err error) tea.Msg {
@@ -431,7 +483,16 @@ func (a *app) buildReposOverlay(s wire.Session) *listOverlay {
 
 func (a *app) buildEnvOverlay(owner api.EnvironmentOwner, title string) *listOverlay {
 	key := owner.Kind + "/" + owner.ID
-	sub := &listOverlay{title: title, hint: "Enter to edit/remove · Esc back"}
+	sub := &listOverlay{
+		title: title,
+		hint:  "Enter to edit/remove · Esc back",
+		headerFn: func(a *app, w int) []Line {
+			if a.envLoading[key] {
+				return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading variables…", SMuted)}}
+			}
+			return nil
+		},
+	}
 	ev := a.envs[key]
 	sub.items = append(sub.items,
 		listItem{label: "+ Add variable (KEY=VALUE)", run: func(a *app) tea.Cmd {
@@ -443,6 +504,7 @@ func (a *app) buildEnvOverlay(owner api.EnvironmentOwner, title string) *listOve
 						a.flash("Use NAME=VALUE format", true)
 						return nil
 					}
+					sub.loading = "Saving variables…"
 					return a.mutateEnv(owner, []wire.EnvironmentVariable{{Name: strings.TrimSpace(name), Value: v}}, nil)
 				},
 			}
@@ -457,6 +519,7 @@ func (a *app) buildEnvOverlay(owner api.EnvironmentOwner, title string) *listOve
 						a.flash("Use NAME=VALUE format", true)
 						return nil
 					}
+					sub.loading = "Saving variables…"
 					return a.mutateEnv(owner, []wire.EnvironmentVariable{{Name: strings.TrimSpace(name), Value: v, Secret: true}}, nil)
 				},
 			}
@@ -473,7 +536,10 @@ func (a *app) buildEnvOverlay(owner api.EnvironmentOwner, title string) *listOve
 			sub.items = append(sub.items, listItem{label: vr.Name, value: val + " · Enter removes", danger: true, run: func(a *app) tea.Cmd {
 				sub.confirm = &confirmPrompt{
 					question: "Remove variable " + vr.Name + "?",
-					run:      func(a *app) tea.Cmd { return a.mutateEnv(owner, nil, []string{vr.Name}) },
+					run: func(a *app) tea.Cmd {
+						sub.loading = "Removing " + vr.Name + "…"
+						return a.mutateEnv(owner, nil, []string{vr.Name})
+					},
 				}
 				return nil
 			}})
@@ -510,7 +576,11 @@ func (a *app) openFilesOverlay(dir string) tea.Cmd {
 	if dir == "" {
 		dir = "."
 	}
-	ov := &listOverlay{title: "Files · /workspace/" + strings.TrimPrefix(dir, "."), hint: "Loading…"}
+	disp := "/workspace"
+	if dir != "." {
+		disp = "/workspace/" + strings.TrimPrefix(dir, "/")
+	}
+	ov := &listOverlay{title: "Files · " + disp, loading: "Loading " + disp + "…", hint: "Esc cancel"}
 	a.ov = ov
 	return a.fetchFiles(a.conv.id, dir, true)
 }
@@ -542,7 +612,12 @@ func (a *app) buildFilesOverlay(sessionID, dir string, entries []wire.FileEntry)
 	}
 	if dir != "" && dir != "." {
 		parent := path.Dir(dir)
+		nextDisp := "/workspace"
+		if parent != "" && parent != "." {
+			nextDisp = "/workspace/" + strings.TrimPrefix(parent, "/")
+		}
 		ov.items = append(ov.items, listItem{label: "../", value: "parent directory", run: func(a *app) tea.Cmd {
+			ov.loading = "Loading " + nextDisp + "…"
 			return a.fetchFiles(sessionID, parent, true)
 		}})
 	}
@@ -560,10 +635,12 @@ func (a *app) buildFilesOverlay(sessionID, dir string, entries []wire.FileEntry)
 		}
 		if entry.Type == "directory" {
 			ov.items = append(ov.items, listItem{label: entry.Name + "/", value: "dir", run: func(a *app) tea.Cmd {
+				ov.loading = "Loading /workspace/" + full + "…"
 				return a.fetchFiles(sessionID, full, true)
 			}})
 		} else {
 			ov.items = append(ov.items, listItem{label: entry.Name, value: fmt.Sprintf("%d B", entry.Size), run: func(a *app) tea.Cmd {
+				ov.loading = "Reading " + full + "…"
 				return call(func(ctx context.Context) (string, error) {
 					out, err := a.api.Command(ctx, sessionID, randomID("cmd_", 8), "fs_read", map[string]any{"path": full, "offset": 0, "length": 32768})
 					if err != nil {
@@ -668,7 +745,16 @@ func (a *app) openProjectsOverlay() tea.Cmd {
 }
 
 func (a *app) buildProjectsOverlay() *listOverlay {
-	ov := &listOverlay{title: "Projects", hint: "Enter manage · Esc close"}
+	ov := &listOverlay{
+		title: "Projects",
+		hint:  "Enter manage · Esc close",
+		headerFn: func(a *app, w int) []Line {
+			if !a.projectsLoaded && a.projectsLoading {
+				return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading projects…", SMuted)}}
+			}
+			return nil
+		},
+	}
 	ov.items = append(ov.items, listItem{label: "+ New project", run: func(a *app) tea.Cmd {
 		ov.input = &inputPrompt{
 			label: "New project name:",
@@ -889,7 +975,12 @@ func (a *app) buildBillingOverlay() *listOverlay {
 			}
 			return nil
 		}},
-		listItem{label: "View billing history", value: fmt.Sprintf("%d entries", len(a.history)), run: func(a *app) tea.Cmd {
+		listItem{label: "View billing history", valueFn: func(a *app) string {
+			if a.balance == nil {
+				return Spinner[a.frame%len(Spinner)] + " loading…"
+			}
+			return fmt.Sprintf("%d entries", len(a.history))
+		}, run: func(a *app) tea.Cmd {
 			var lines []Line
 			for _, e := range a.history {
 				lines = append(lines, Line{
@@ -926,19 +1017,6 @@ func (a *app) openAccountOverlay() tea.Cmd {
 }
 
 func (a *app) buildAccountOverlay() *listOverlay {
-	ghState := "loading…"
-	if a.github != nil {
-		if a.github.SignedIn {
-			ghState = "signed in as " + a.github.Login
-		} else {
-			ghState = "signed out"
-		}
-	}
-	idState := "loading…"
-	if a.identity != nil {
-		author, _ := api.Identity(*a.identity)
-		idState = author
-	}
 	enterMode := "Enter sends (Shift/Alt+Enter newline)"
 	if a.prefs.Newline {
 		enterMode = "Enter newline (Alt+Enter sends)"
@@ -973,7 +1051,15 @@ func (a *app) buildAccountOverlay() *listOverlay {
 				a.ov = a.buildAccountOverlay()
 				return nil
 			}},
-			{label: "GitHub", value: ghState, run: func(a *app) tea.Cmd {
+			{label: "GitHub", valueFn: func(a *app) string {
+				if a.github == nil {
+					return Spinner[a.frame%len(Spinner)] + " loading…"
+				}
+				if a.github.SignedIn {
+					return "signed in as " + a.github.Login
+				}
+				return "signed out"
+			}, run: func(a *app) tea.Cmd {
 				return call(func(ctx context.Context) (*wire.GitHubLink, error) {
 					return a.api.GitHubSignIn(ctx)
 				}, func(l *wire.GitHubLink, err error) tea.Msg {
@@ -984,7 +1070,13 @@ func (a *app) buildAccountOverlay() *listOverlay {
 					return doneMsg{say: "Opened GitHub sign-in: " + l.URL}
 				})
 			}},
-			{label: "Git commit identity", value: idState, run: func(a *app) tea.Cmd {
+			{label: "Git commit identity", valueFn: func(a *app) string {
+				if a.identity == nil {
+					return Spinner[a.frame%len(Spinner)] + " loading…"
+				}
+				author, _ := api.Identity(*a.identity)
+				return author
+			}, run: func(a *app) tea.Cmd {
 				a.flash("Edit with: barad git identity --name … --email …", false)
 				return nil
 			}},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -110,7 +111,20 @@ func (p *pickerOverlay) filtered(a *app) []wire.Session {
 
 func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 	rows := p.filtered(a)
-	total := len(rows) + 1 // row 0..len-1 are sessions, last row is "+ New session"
+	var unreadRows []wire.Session
+	for _, s := range rows {
+		if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+			unreadRows = append(unreadRows, s)
+		}
+	}
+	hasMarkAll := len(unreadRows) > 0
+	newIdx := len(rows)
+	markAllIdx := -1
+	total := len(rows) + 1 // sessions + "+ New session"
+	if hasMarkAll {
+		markAllIdx = total
+		total++
+	}
 	if !p.preselected && len(rows) > 0 {
 		p.preselected = true
 		target := a.prefs.LastSession
@@ -144,6 +158,15 @@ func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
+	markAllRead := func() tea.Cmd {
+		if len(unreadRows) == 0 {
+			a.flash("Everything here is already read", false)
+			return nil
+		}
+		a.prefs, _ = prefs.Update(func(pr *prefs.Prefs) { pr.Read(unreadRows) })
+		a.flash("Marked all sessions read", false)
+		return nil
+	}
 
 	switch k.String() {
 	case "esc":
@@ -164,27 +187,10 @@ func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	case "ctrl+n":
 		return a.openNewSession("")
-	case "space":
-		// When not typing a filter query, Space toggles read/unread on the highlighted session.
-		if strings.TrimSpace(p.filter.Value()) == "" && p.sel < len(rows) {
-			return toggleRead()
-		}
 	case "ctrl+r":
 		return toggleRead()
 	case "alt+r":
-		var unread []wire.Session
-		for _, s := range rows {
-			if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
-				unread = append(unread, s)
-			}
-		}
-		if len(unread) == 0 {
-			a.flash("Everything here is already read", false)
-			return nil
-		}
-		a.prefs, _ = prefs.Update(func(pr *prefs.Prefs) { pr.Read(unread) })
-		a.flash("Marked all sessions read", false)
-		return nil
+		return markAllRead()
 	case "up", "ctrl+k":
 		if p.sel > 0 {
 			p.sel--
@@ -196,8 +202,11 @@ func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	case "enter":
-		if p.sel == len(rows) {
+		if p.sel == newIdx {
 			return a.openNewSession("")
+		}
+		if hasMarkAll && p.sel == markAllIdx {
+			return markAllRead()
 		}
 		chosen := rows[p.sel]
 		a.ov = nil
@@ -218,6 +227,19 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 	}
 	isArchived := tabs[p.projectIdx].id == "__archived__"
 	rows := p.filtered(a)
+	unreadCount := 0
+	for _, s := range rows {
+		if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+			unreadCount++
+		}
+	}
+	newIdx := len(rows)
+	markAllIdx := -1
+	total := len(rows) + 1
+	if unreadCount > 0 {
+		markAllIdx = total
+		total++
+	}
 	if !p.preselected && len(rows) > 0 {
 		p.preselected = true
 		target := a.prefs.LastSession
@@ -231,7 +253,6 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 			}
 		}
 	}
-	total := len(rows) + 1
 	if p.sel >= total {
 		p.sel = max(0, total-1)
 	}
@@ -251,9 +272,9 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 	}
 	out = append(out, tabLine)
 
-	ph := "Filter sessions… (Space read/unread · Alt+R read all · Tab project)"
+	ph := "Filter sessions… (Ctrl+R read/unread · Tab project · Ctrl+N new)"
 	if w < 72 {
-		ph = "Filter… (Space read · Tab project)"
+		ph = "Filter… (Ctrl+R read · Tab project)"
 	}
 	ed := p.filter.Lines(max(12, w-4), 1, SText, ph, true)
 	out = append(out, append(Line{S("/ ", SAccent)}, ed[0]...))
@@ -266,7 +287,7 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 	// Build display rows with explicit section headers so sort order is obvious.
 	type dispRow struct {
 		header string
-		selIdx int // -1 for header, 0..len(rows)-1 for session, len(rows) for "+ New session"
+		selIdx int // -1 for header, 0..len(rows)-1 for session, newIdx for "+ New session", markAllIdx for "Mark all read"
 	}
 	var disp []dispRow
 	groupName := func(g api.Group) string {
@@ -293,7 +314,10 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		}
 		disp = append(disp, dispRow{selIdx: i})
 	}
-	disp = append(disp, dispRow{selIdx: len(rows)})
+	disp = append(disp, dispRow{selIdx: newIdx})
+	if markAllIdx >= 0 {
+		disp = append(disp, dispRow{selIdx: markAllIdx})
+	}
 
 	// Find display row matching p.sel and keep it scrolled into view.
 	selDisp := 0
@@ -324,12 +348,24 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		if selected {
 			prefix = "▸ "
 		}
-		if d.selIdx == len(rows) {
+		if d.selIdx == newIdx {
 			st := SAccent
 			if selected {
 				st = SAccent.Bold(true)
 			}
 			out = append(out, Line{S(prefix, st), S("+ New session", st)})
+			continue
+		}
+		if markAllIdx >= 0 && d.selIdx == markAllIdx {
+			st := SMuted
+			if selected {
+				st = SText.Bold(true)
+			}
+			label := "✓ Mark all read"
+			if unreadCount > 1 {
+				label = "✓ Mark all read (" + strconv.Itoa(unreadCount) + ")"
+			}
+			out = append(out, Line{S(prefix, SAccent), S(label, st)})
 			continue
 		}
 		s := rows[d.selIdx]
@@ -371,11 +407,9 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		out = append(out, spread(left, right, w))
 	}
 
-	hint := "  Enter attach · Space toggle read · Alt+R mark all read · Ctrl+N new · Esc close"
-	if strings.TrimSpace(p.filter.Value()) != "" {
-		hint = "  Enter attach · Ctrl+R toggle read · Tab project · Esc close"
-	} else if w < 82 {
-		hint = "  Enter attach · Space read/unread · Tab project · Ctrl+N new"
+	hint := "  Enter attach · Ctrl+R toggle read · Tab project · Ctrl+N new · Esc close"
+	if w < 78 {
+		hint = "  Enter attach · Ctrl+R read · Tab project · Ctrl+N new"
 	}
 	out = append(out, Line{S(ansi.Truncate(hint, w, "…"), SFaint)})
 	return out
@@ -649,6 +683,9 @@ func (n *newSessionOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		case 7:
 			n.pickingRepo = true
 			n.repoSel = 0
+			if !a.reposLoaded && !a.reposLoading {
+				return a.loadRepos()
+			}
 		case 9:
 			return n.submit(a)
 		default:
@@ -750,10 +787,20 @@ func (n *newSessionOverlay) submit(a *app) tea.Cmd {
 }
 
 func (n *newSessionOverlay) View(a *app, w, maxH int) []Line {
+	if a.agentsLoading && len(a.agents) == 0 {
+		return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading harnesses & models…", SMuted)}}
+	}
 	if n.pickingRepo {
 		var out []Line
 		out = append(out, Line{S("Select GitHub repositories (Space toggle · Enter done)", SMuted)})
-		if len(a.repos) == 0 {
+		switch {
+		case a.reposLoading:
+			out = append(out, Line{S("  "+Spinner[a.frame%len(Spinner)]+" Loading GitHub repositories…", SMuted)})
+			return out
+		case a.reposErr != "":
+			out = append(out, Line{S("  ✕ Could not load repositories: "+a.reposErr, SDanger)})
+			return out
+		case len(a.repos) == 0:
 			out = append(out, Line{S("  No GitHub repositories connected. Connect via barad git login.", SFaint)})
 			return out
 		}
@@ -812,9 +859,16 @@ func (n *newSessionOverlay) View(a *app, w, maxH int) []Line {
 		}
 	}
 	sort.Strings(repoNames)
-	repoVal := "none"
+	repoVal := "none (Enter to pick)"
 	if len(repoNames) > 0 {
-		repoVal = strings.Join(repoNames, ", ")
+		repoVal = strings.Join(repoNames, ", ") + " (Enter to pick)"
+	}
+	if a.reposLoading {
+		if len(repoNames) > 0 {
+			repoVal = strings.Join(repoNames, ", ") + " · " + Spinner[a.frame%len(Spinner)] + " loading repos…"
+		} else {
+			repoVal = Spinner[a.frame%len(Spinner)] + " loading repositories…"
+		}
 	}
 	nameVal := strings.TrimSpace(n.name.Value())
 	if nameVal == "" {
@@ -857,7 +911,7 @@ func (n *newSessionOverlay) View(a *app, w, maxH int) []Line {
 	}
 	out = append(out, row(5, "Size", "◂ "+sizeVal+" ▸", false, nil))
 	out = append(out, row(6, "Name", nameVal, n.editingText && n.field == 6, &n.name))
-	out = append(out, row(7, "Repos", repoVal+" (Enter to pick)", false, nil))
+	out = append(out, row(7, "Repos", repoVal, false, nil))
 	out = append(out, row(8, "Prompt", promptVal, n.editingText && n.field == 8, &n.prompt))
 
 	btnSt := SAccent
@@ -1058,12 +1112,18 @@ func (m *modelOverlay) save(a *app) tea.Cmd {
 }
 
 func (m *modelOverlay) View(a *app, w, maxH int) []Line {
+	if a.agentsLoading && len(a.agents) == 0 {
+		return []Line{{S("  "+Spinner[a.frame%len(Spinner)]+" Loading models…", SMuted)}}
+	}
 	ag := m.spec(a)
 	isCodex := ag.ID == "codex"
 	efforts := m.effortsFor(ag, m.modelID)
 	turnActive := a.conv != nil && a.conv.session.CurrentTurnID != ""
 
 	var out []Line
+	if m.saving {
+		out = append(out, Line{S("  "+Spinner[a.frame%len(Spinner)]+" Saving model settings…", SAgent)})
+	}
 	if turnActive {
 		out = append(out, Line{S("⚠ Turn active — model switching is locked until the turn ends", SWarn)})
 	}

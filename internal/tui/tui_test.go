@@ -84,6 +84,8 @@ func press(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl}
 	case "ctrl+n":
 		return tea.KeyPressMsg{Code: 'n', Mod: tea.ModCtrl}
+	case "ctrl+r":
+		return tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl}
 	case "ctrl+c":
 		return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
 	}
@@ -273,7 +275,7 @@ func TestAuthGateBannerAndQueuedPrompt(t *testing.T) {
 	}
 }
 
-func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
+func TestPickerGroupsCtrlRReadToggleAndDefaultModelDisplay(t *testing.T) {
 	a, _ := setupApp(t, Options{})
 	// Inject a discovered model on agy ("gemini-4-neon") with DefaultModel="default".
 	a.agents = append(a.agents[:3], wire.AgentSpec{
@@ -290,7 +292,7 @@ func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
 		t.Fatalf("picker missing explicit group headers:\n%s", pickerView)
 	}
 
-	// 2. Pressing Space with empty filter toggles read/unread on the selected session.
+	// 2. Pressing Space types a space into the filter box (does NOT toggle read/unread).
 	p := a.ov.(*pickerOverlay)
 	rows := p.filtered(a)
 	p.sel = len(rows) - 1 // pick a RESTING session with a finished turn
@@ -299,10 +301,15 @@ func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
 		t.Fatalf("expected %s to start read", target.SessionID)
 	}
 	_, _ = a.Update(press("space"))
-	if !api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
-		t.Fatalf("expected Space to mark %s unread", target.SessionID)
+	if p.filter.Value() != " " {
+		t.Fatalf("expected Space to insert into filter, got %q", p.filter.Value())
 	}
-	// Mark it read again with Space.
+	if api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
+		t.Fatalf("Space must not toggle read/unread on %s", target.SessionID)
+	}
+	_, _ = a.Update(press("backspace"))
+
+	// 3. Ctrl+R toggles read/unread on the highlighted session (and works while filtering too).
 	rows = p.filtered(a)
 	for i, s := range rows {
 		if s.SessionID == target.SessionID {
@@ -310,17 +317,44 @@ func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
 			break
 		}
 	}
-	_, _ = a.Update(press("space"))
+	_, _ = a.Update(press("ctrl+r"))
+	if !api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
+		t.Fatalf("expected Ctrl+R to mark %s unread", target.SessionID)
+	}
+	// Mark-all-read row appears when unread sessions exist and marks them read on Enter.
+	pickerView = ansi.Strip(a.View().Content)
+	if !strings.Contains(pickerView, "✓ Mark all read") {
+		t.Fatalf("expected '✓ Mark all read' action row when unread sessions exist:\n%s", pickerView)
+	}
+	// Toggle it back read with Ctrl+R.
+	rows = p.filtered(a)
+	for i, s := range rows {
+		if s.SessionID == target.SessionID {
+			p.sel = i
+			break
+		}
+	}
+	_, _ = a.Update(press("ctrl+r"))
 	if api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
-		t.Fatalf("expected second Space to mark %s read again", target.SessionID)
+		t.Fatalf("expected second Ctrl+R to mark %s read again", target.SessionID)
+	}
+	// Mark all unread sessions read via the "✓ Mark all read" row.
+	rows = p.filtered(a)
+	p.sel = len(rows) + 1 // "+ New session" is len(rows), "✓ Mark all read" is len(rows)+1
+	_, _ = a.Update(press("enter"))
+	for _, s := range rows {
+		if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+			t.Fatalf("expected '✓ Mark all read' to mark %s read", s.SessionID)
+		}
 	}
 
-	// 3. Default model displays actual resolved model name in parentheses.
+	// 4. Default model displays actual resolved model name in parentheses.
 	a.ov = nil
 	a.toast = ""
 	a.conv = newConversation(wire.Session{
 		SessionID: "ses_agy", Name: "Agy test", Agent: "agy", RuntimeVersion: 2, Model: "default", ReasoningEffort: "high", MachineStatus: wire.MachineStatusHydrated,
 	})
+	a.conv.initialized = true
 	footer := ansi.Strip(a.View().Content)
 	if !strings.Contains(footer, "agy/default (Gemini 4 Neon)/high") {
 		t.Fatalf("footer did not show resolved default model:\n%s", footer)
@@ -335,5 +369,70 @@ func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
 	modelView := ansi.Strip(a.View().Content)
 	if !strings.Contains(modelView, "CLI Default (Gemini 4 Neon)") {
 		t.Fatalf("/model did not show resolved default model in parens:\n%s", modelView)
+	}
+}
+
+func TestLoadingIndicators(t *testing.T) {
+	a, _ := setupApp(t, Options{SessionQuery: "checkout"})
+
+	// 1. /new repo picker shows loading indicator while repos are fetching (NOT "No GitHub repositories connected").
+	_ = a.openNewSession("")
+	ns := a.ov.(*newSessionOverlay)
+	if !a.reposLoading {
+		t.Fatal("expected openNewSession to start reposLoading")
+	}
+	ns.pickingRepo = true
+	repoView := ansi.Strip(a.View().Content)
+	if !strings.Contains(repoView, "Loading GitHub repositories…") {
+		t.Fatalf("expected repo loading indicator in /new:\n%s", repoView)
+	}
+	if strings.Contains(repoView, "No GitHub repositories connected") {
+		t.Fatalf("must not show empty-repos message while still loading:\n%s", repoView)
+	}
+
+	// 2. /settings -> Git repositories shows loading indicator while fetching.
+	_ = a.openSettingsOverlay()
+	settingsView := ansi.Strip(a.View().Content)
+	if !strings.Contains(settingsView, "loading…") {
+		t.Fatalf("expected loading indicator in /settings while repos/env load:\n%s", settingsView)
+	}
+	a.ov = a.buildReposOverlay(a.conv.session)
+	settingsRepoView := ansi.Strip(a.View().Content)
+	if !strings.Contains(settingsRepoView, "Loading GitHub repositories…") {
+		t.Fatalf("expected repo loading indicator in /settings -> Git repositories:\n%s", settingsRepoView)
+	}
+
+	// 3. /files shows animated loading message while fetching (NOT "(empty)").
+	_ = a.openFilesOverlay(".")
+	filesView := ansi.Strip(a.View().Content)
+	if !strings.Contains(filesView, "Loading /workspace…") {
+		t.Fatalf("expected /files loading indicator:\n%s", filesView)
+	}
+	if strings.Contains(filesView, "(empty)") {
+		t.Fatalf("/files must not show (empty) while loading:\n%s", filesView)
+	}
+
+	// 4. /model shows loading indicator when agents are still loading and when saving.
+	a.agents = nil
+	a.agentsLoading = true
+	_ = a.openModelOverlay()
+	modelLoadingView := ansi.Strip(a.View().Content)
+	if !strings.Contains(modelLoadingView, "Loading models…") {
+		t.Fatalf("expected /model loading indicator:\n%s", modelLoadingView)
+	}
+	a.agentsLoading = false
+	mo := a.ov.(*modelOverlay)
+	mo.saving = true
+	modelSavingView := ansi.Strip(a.View().Content)
+	if !strings.Contains(modelSavingView, "Saving model settings…") {
+		t.Fatalf("expected /model saving indicator:\n%s", modelSavingView)
+	}
+
+	// 5. Initial session sync shows "Loading conversation…" before first sync completes.
+	a.ov = nil
+	a.conv.initialized = false
+	syncView := ansi.Strip(a.View().Content)
+	if !strings.Contains(syncView, "Loading conversation…") {
+		t.Fatalf("expected initial conversation loading indicator:\n%s", syncView)
 	}
 }
