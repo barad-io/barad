@@ -918,22 +918,22 @@ func (a *app) View() tea.View {
 		exs := a.conv.exchanges()
 		start := min(a.flushed, len(exs))
 		for i := start; i < len(exs); i++ {
-			rendered := renderExchange(a.conv, exs[i], w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)
-			sections = append(sections, rendered...)
-			if i < len(exs)-1 {
+			if i > 0 || a.flushed > 0 || a.headerPrinted {
 				sections = append(sections, "")
 			}
+			rendered := renderExchange(a.conv, exs[i], w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)
+			sections = append(sections, rendered...)
 		}
 		// Auth Gate / legacy notices.
 		if a.conv.session.AuthRequired() {
-			sections = append(sections, Line{
+			sections = append(sections, "", Line{
 				S("⚠ ", SWarn.Bold(true)),
 				S("Sign-in required for "+harnessLabel(a.conv.session.HarnessID())+" — run ", SWarn),
 				S("/login", SAccent.Bold(true)),
 				S(" to authenticate and run queued prompts", SWarn),
 			}.Paint(nil, 0))
 		} else if !a.conv.session.IsV2() {
-			sections = append(sections, Line{
+			sections = append(sections, "", Line{
 				S("ℹ ", SAgent),
 				S("Legacy read-only session — run ", SMuted),
 				S("/continue", SAccent.Bold(true)),
@@ -945,6 +945,12 @@ func (a *app) View() tea.View {
 	// 2. Uniform post-turn queued prompt banner.
 	for _, ql := range a.renderQueuedBanner(w) {
 		sections = append(sections, ql.Paint(nil, 0))
+	}
+
+	// Ensure exactly one clean empty line between the transcript and the
+	// overlay/composer region whenever attached to a session.
+	if a.conv != nil && (len(sections) == 0 || sections[len(sections)-1] != "") {
+		sections = append(sections, "")
 	}
 
 	// 3. On-demand overlay (invisible until invoked).
@@ -995,22 +1001,21 @@ func (a *app) flushCommitted() tea.Cmd {
 			S("── ", Fg(BorderDefault)),
 			S(mark+" ", Fg(mc)),
 			S(sessionTitle(s), SText.Bold(true)),
-			S(" · "+harnessLabel(s.HarnessID())+"/"+s.Model, SMuted),
+			S(" · "+harnessLabel(s.HarnessID())+"/"+a.displayModel(s), SMuted),
 			S(" ──", Fg(BorderDefault)),
 		}
 		lines = append(lines, "", head.Paint(nil, 0))
 		if a.conv.hasOlder {
 			lines = append(lines, Line{S("  (earlier history available — run /tools and press o to load)", SFaint)}.Paint(nil, 0))
 		}
-		lines = append(lines, "")
 	}
 
 	exs := a.conv.exchanges()
 	w := max(a.w, 32)
 	for a.flushed < len(exs) && !exs[a.flushed].moving {
+		lines = append(lines, "")
 		rendered := renderExchange(a.conv, exs[a.flushed], w, a.prefs.Work, a.frame, a.now, a.cancelRequestedOn)
 		lines = append(lines, rendered...)
-		lines = append(lines, "")
 		a.flushed++
 	}
 	if len(lines) == 0 {

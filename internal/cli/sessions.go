@@ -117,6 +117,20 @@ var sessionsShow = command{
 			effort = "—"
 		}
 		modelLabel := s.Model
+		if modelLabel == "" || strings.EqualFold(modelLabel, "default") {
+			modelLabel = "default"
+			if cat, err := c.api.Agents(c.ctx); err == nil {
+				hid := s.HarnessID()
+				for _, ag := range cat.Agents {
+					if strings.EqualFold(ag.ID, hid) {
+						if resolved := resolvedDefaultModelName(ag); resolved != "" {
+							modelLabel = "default (" + resolved + ")"
+						}
+						break
+					}
+				}
+			}
+		}
 		if s.FastMode {
 			modelLabel += " (fast)"
 		}

@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/barad-io/barad/internal/api"
+	"github.com/barad-io/barad/internal/prefs"
 	"github.com/barad-io/barad/wire"
 )
 
@@ -127,6 +128,23 @@ func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		p.sel = max(0, total-1)
 	}
 
+	toggleRead := func() tea.Cmd {
+		if p.sel < 0 || p.sel >= len(rows) {
+			return nil
+		}
+		s := rows[p.sel]
+		if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+			a.prefs, _ = prefs.Update(func(pr *prefs.Prefs) { pr.Read([]wire.Session{s}) })
+			a.flash("Marked "+sessionTitle(s)+" read", false)
+		} else if s.LatestTerminalTurnID != "" {
+			a.prefs, _ = prefs.Update(func(pr *prefs.Prefs) { pr.Unread(s.SessionID) })
+			a.flash("Marked "+sessionTitle(s)+" unread", false)
+		} else {
+			a.flash("No finished reply to mark read/unread yet", false)
+		}
+		return nil
+	}
+
 	switch k.String() {
 	case "esc":
 		if a.conv != nil {
@@ -146,6 +164,27 @@ func (p *pickerOverlay) Key(a *app, k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	case "ctrl+n":
 		return a.openNewSession("")
+	case "space":
+		// When not typing a filter query, Space toggles read/unread on the highlighted session.
+		if strings.TrimSpace(p.filter.Value()) == "" && p.sel < len(rows) {
+			return toggleRead()
+		}
+	case "ctrl+r":
+		return toggleRead()
+	case "alt+r":
+		var unread []wire.Session
+		for _, s := range rows {
+			if api.Unread(s, a.prefs.Reviewed[s.SessionID]) {
+				unread = append(unread, s)
+			}
+		}
+		if len(unread) == 0 {
+			a.flash("Everything here is already read", false)
+			return nil
+		}
+		a.prefs, _ = prefs.Update(func(pr *prefs.Prefs) { pr.Read(unread) })
+		a.flash("Marked all sessions read", false)
+		return nil
 	case "up", "ctrl+k":
 		if p.sel > 0 {
 			p.sel--
@@ -177,6 +216,7 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 	if p.projectIdx >= len(tabs) {
 		p.projectIdx = 0
 	}
+	isArchived := tabs[p.projectIdx].id == "__archived__"
 	rows := p.filtered(a)
 	if !p.preselected && len(rows) > 0 {
 		p.preselected = true
@@ -197,7 +237,7 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 	}
 
 	var out []Line
-	// Filter input + project tab indicator.
+	// Project filter tabs.
 	var tabLine Line
 	for i, t := range tabs {
 		if i > 0 {
@@ -210,7 +250,12 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		tabLine = append(tabLine, S(t.label, st))
 	}
 	out = append(out, tabLine)
-	ed := p.filter.Lines(max(12, w-4), 1, SText, "Filter sessions… (Tab project · Ctrl+N new · Enter attach)", true)
+
+	ph := "Filter sessions… (Space read/unread · Alt+R read all · Tab project)"
+	if w < 72 {
+		ph = "Filter… (Space read · Tab project)"
+	}
+	ed := p.filter.Lines(max(12, w-4), 1, SText, ph, true)
 	out = append(out, append(Line{S("/ ", SAccent)}, ed[0]...))
 
 	if !a.listed {
@@ -218,19 +263,68 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		return out
 	}
 
-	listH := max(3, maxH-3)
-	start := 0
-	if p.sel >= listH {
-		start = p.sel - listH + 1
+	// Build display rows with explicit section headers so sort order is obvious.
+	type dispRow struct {
+		header string
+		selIdx int // -1 for header, 0..len(rows)-1 for session, len(rows) for "+ New session"
 	}
-	end := min(total, start+listH)
-	for i := start; i < end; i++ {
-		selected := i == p.sel
+	var disp []dispRow
+	groupName := func(g api.Group) string {
+		switch g {
+		case api.NeedsYou:
+			return "NEEDS YOU · unread, sign-in, or failed"
+		case api.Running:
+			return "RUNNING · active or waking"
+		default:
+			return "RESTING · recent first"
+		}
+	}
+	lastGroup := api.Group(-1)
+	if isArchived && len(rows) > 0 {
+		disp = append(disp, dispRow{header: "ARCHIVED · newest first", selIdx: -1})
+	}
+	for i, s := range rows {
+		if !isArchived {
+			g := api.StandingOf(s, a.prefs.Reviewed[s.SessionID], false).Group
+			if g != lastGroup {
+				lastGroup = g
+				disp = append(disp, dispRow{header: groupName(g), selIdx: -1})
+			}
+		}
+		disp = append(disp, dispRow{selIdx: i})
+	}
+	disp = append(disp, dispRow{selIdx: len(rows)})
+
+	// Find display row matching p.sel and keep it scrolled into view.
+	selDisp := 0
+	for i, d := range disp {
+		if d.selIdx == p.sel {
+			selDisp = i
+			break
+		}
+	}
+	listH := max(3, maxH-4)
+	start := 0
+	if selDisp >= listH {
+		start = selDisp - listH + 1
+	}
+	// If the row immediately above start is the header for our first visible item, include it when possible.
+	if start > 0 && disp[start-1].selIdx == -1 && selDisp-start < listH-1 {
+		start--
+	}
+	end := min(len(disp), start+listH)
+
+	for _, d := range disp[start:end] {
+		if d.selIdx == -1 {
+			out = append(out, Line{S("  "+d.header, SFaint)})
+			continue
+		}
+		selected := d.selIdx == p.sel
 		prefix := "  "
 		if selected {
 			prefix = "▸ "
 		}
-		if i == len(rows) {
+		if d.selIdx == len(rows) {
 			st := SAccent
 			if selected {
 				st = SAccent.Bold(true)
@@ -238,7 +332,7 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 			out = append(out, Line{S(prefix, st), S("+ New session", st)})
 			continue
 		}
-		s := rows[i]
+		s := rows[d.selIdx]
 		standing := api.StandingOf(s, a.prefs.Reviewed[s.SessionID], false)
 		unread := api.Unread(s, a.prefs.Reviewed[s.SessionID])
 
@@ -276,6 +370,14 @@ func (p *pickerOverlay) View(a *app, w, maxH int) []Line {
 		left := Line{S(prefix, SAccent), dot, S(ansi.Truncate(sessionTitle(s), leftW, "…"), nameSt)}
 		out = append(out, spread(left, right, w))
 	}
+
+	hint := "  Enter attach · Space toggle read · Alt+R mark all read · Ctrl+N new · Esc close"
+	if strings.TrimSpace(p.filter.Value()) != "" {
+		hint = "  Enter attach · Ctrl+R toggle read · Tab project · Esc close"
+	} else if w < 82 {
+		hint = "  Enter attach · Space read/unread · Tab project · Ctrl+N new"
+	}
+	out = append(out, Line{S(ansi.Truncate(hint, w, "…"), SFaint)})
 	return out
 }
 
@@ -684,7 +786,7 @@ func (n *newSessionOverlay) View(a *app, w, maxH int) []Line {
 	}
 	ag := n.currentAgent(a)
 	ms := n.currentModel(a)
-	modelVal := ms.Label
+	modelVal := formatModelOptionLabel(ag, ms)
 	if n.modelIdx == len(ag.Models) {
 		if n.editCustom {
 			ed := n.customModel.Lines(max(12, w-18), 1, SText, "model-id…", true)
@@ -978,7 +1080,12 @@ func (m *modelOverlay) View(a *app, w, maxH int) []Line {
 		if ms.ID == m.modelID {
 			cur = "  ✓"
 		}
-		out = append(out, Line{S(pref, SAccent), S(ms.Label, st), S(" ("+ms.ID+")", SFaint), S(cur, SOk)})
+		row := Line{S(pref, SAccent), S(formatModelOptionLabel(ag, ms), st)}
+		if !strings.EqualFold(ms.ID, "default") && !strings.EqualFold(ms.Label, ms.ID) {
+			row = append(row, S(" ("+ms.ID+")", SFaint))
+		}
+		row = append(row, S(cur, SOk))
+		out = append(out, row)
 		idx++
 	}
 	// Custom model row
@@ -1041,4 +1148,68 @@ func projectOfSession(s wire.Session) string {
 		return wire.DefaultProjectID
 	}
 	return s.ProjectID
+}
+
+// resolvedDefaultModel returns the concrete default model name for a harness
+// from GET /agents when available (either a non-"default" DefaultModel or the
+// first concrete live-discovered model in Models).
+func resolvedDefaultModel(ag wire.AgentSpec) string {
+	if dm := strings.TrimSpace(ag.DefaultModel); dm != "" && !strings.EqualFold(dm, "default") {
+		for _, m := range ag.Models {
+			if m.ID == dm {
+				if m.Label != "" {
+					return m.Label
+				}
+				return m.ID
+			}
+		}
+		return dm
+	}
+	for _, m := range ag.Models {
+		id := strings.ToLower(strings.TrimSpace(m.ID))
+		if id == "" || id == "default" || id == "opus" || id == "sonnet" || id == "haiku" || id == "fable" {
+			continue
+		}
+		if m.Label != "" {
+			return m.Label
+		}
+		return m.ID
+	}
+	return ""
+}
+
+// formatModelOptionLabel renders a catalog model option, annotating "default"
+// with the actual resolved model name in parentheses when known
+// (e.g. "CLI Default (gemini-4-neon)").
+func formatModelOptionLabel(ag wire.AgentSpec, ms wire.AgentModelSpec) string {
+	lbl := strings.TrimSpace(ms.Label)
+	if lbl == "" {
+		lbl = ms.ID
+	}
+	if strings.EqualFold(ms.ID, "default") {
+		if resolved := resolvedDefaultModel(ag); resolved != "" {
+			return lbl + " (" + resolved + ")"
+		}
+	}
+	return lbl
+}
+
+// displayModel formats a session's model for headers and status footers,
+// showing "default (<resolved>)" when using the harness default and the actual
+// model name is known from GET /agents.
+func (a *app) displayModel(s wire.Session) string {
+	m := strings.TrimSpace(s.Model)
+	if m != "" && !strings.EqualFold(m, "default") {
+		return m
+	}
+	hid := s.HarnessID()
+	for _, ag := range a.agents {
+		if strings.EqualFold(ag.ID, hid) {
+			if resolved := resolvedDefaultModel(ag); resolved != "" {
+				return "default (" + resolved + ")"
+			}
+			break
+		}
+	}
+	return "default"
 }

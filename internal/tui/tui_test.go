@@ -272,3 +272,68 @@ func TestAuthGateBannerAndQueuedPrompt(t *testing.T) {
 		t.Fatalf("expected footer sign-in required state:\n%s", plain)
 	}
 }
+
+func TestPickerGroupsSpaceReadToggleAndDefaultModelDisplay(t *testing.T) {
+	a, _ := setupApp(t, Options{})
+	// Inject a discovered model on agy ("gemini-4-neon") with DefaultModel="default".
+	a.agents = append(a.agents[:3], wire.AgentSpec{
+		ID: "agy", Label: "Antigravity", DefaultModel: "default",
+		Models: []wire.AgentModelSpec{
+			{ID: "default", Label: "CLI Default", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "high"}, DefaultEffort: "high"},
+			{ID: "gemini-4-neon", Label: "Gemini 4 Neon", SupportsReasoningEffort: true, Efforts: []wire.ReasoningEffort{"low", "high"}, DefaultEffort: "high"},
+		},
+	})
+
+	// 1. Picker shows explicit group headers so sort order is obvious.
+	pickerView := ansi.Strip(a.View().Content)
+	if !strings.Contains(pickerView, "NEEDS YOU") || !strings.Contains(pickerView, "RUNNING") || !strings.Contains(pickerView, "RESTING") {
+		t.Fatalf("picker missing explicit group headers:\n%s", pickerView)
+	}
+
+	// 2. Pressing Space with empty filter toggles read/unread on the selected session.
+	p := a.ov.(*pickerOverlay)
+	rows := p.filtered(a)
+	p.sel = len(rows) - 1 // pick a RESTING session with a finished turn
+	target := rows[p.sel]
+	if api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
+		t.Fatalf("expected %s to start read", target.SessionID)
+	}
+	_, _ = a.Update(press("space"))
+	if !api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
+		t.Fatalf("expected Space to mark %s unread", target.SessionID)
+	}
+	// Mark it read again with Space.
+	rows = p.filtered(a)
+	for i, s := range rows {
+		if s.SessionID == target.SessionID {
+			p.sel = i
+			break
+		}
+	}
+	_, _ = a.Update(press("space"))
+	if api.Unread(target, a.prefs.Reviewed[target.SessionID]) {
+		t.Fatalf("expected second Space to mark %s read again", target.SessionID)
+	}
+
+	// 3. Default model displays actual resolved model name in parentheses.
+	a.ov = nil
+	a.toast = ""
+	a.conv = newConversation(wire.Session{
+		SessionID: "ses_agy", Name: "Agy test", Agent: "agy", RuntimeVersion: 2, Model: "default", ReasoningEffort: "high", MachineStatus: wire.MachineStatusHydrated,
+	})
+	footer := ansi.Strip(a.View().Content)
+	if !strings.Contains(footer, "agy/default (Gemini 4 Neon)/high") {
+		t.Fatalf("footer did not show resolved default model:\n%s", footer)
+	}
+	// Verify single empty line between transcript and composer divider.
+	lines := strings.Split(footer, "\n")
+	if len(lines) < 3 || lines[0] != "" || !strings.HasPrefix(lines[1], "────") {
+		t.Fatalf("expected single empty line above composer divider, got lines=%q", lines)
+	}
+	// Verify /model shows "CLI Default (Gemini 4 Neon)".
+	a.openModelOverlay()
+	modelView := ansi.Strip(a.View().Content)
+	if !strings.Contains(modelView, "CLI Default (Gemini 4 Neon)") {
+		t.Fatalf("/model did not show resolved default model in parens:\n%s", modelView)
+	}
+}

@@ -328,10 +328,7 @@ func (a *app) renderFooter(w int) Line {
 
 	// Build harness / model / effort (+ fast) string.
 	harness := harnessLabel(s.HarnessID())
-	modelStr := s.Model
-	if modelStr == "" || modelStr == "default" {
-		modelStr = "default"
-	}
+	modelStr := a.displayModel(s)
 	spec := harness + "/" + modelStr
 	if s.ReasoningEffort != "" {
 		spec += "/" + string(s.ReasoningEffort)

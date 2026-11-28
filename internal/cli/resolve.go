@@ -237,3 +237,28 @@ func joinEfforts(es []wire.ReasoningEffort) string {
 	}
 	return strings.Join(s, ", ")
 }
+
+func resolvedDefaultModelName(ag wire.AgentSpec) string {
+	if dm := strings.TrimSpace(ag.DefaultModel); dm != "" && !strings.EqualFold(dm, "default") {
+		for _, m := range ag.Models {
+			if m.ID == dm {
+				if m.Label != "" {
+					return m.Label
+				}
+				return m.ID
+			}
+		}
+		return dm
+	}
+	for _, m := range ag.Models {
+		id := strings.ToLower(strings.TrimSpace(m.ID))
+		if id == "" || id == "default" || id == "opus" || id == "sonnet" || id == "haiku" || id == "fable" {
+			continue
+		}
+		if m.Label != "" {
+			return m.Label
+		}
+		return m.ID
+	}
+	return ""
+}
